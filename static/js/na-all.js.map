@@ -1,0 +1,3 @@
+{
+    "sources": ["./newauth.js", "./authenticate.js", "./setupuser.js", "./securePage.js", "./orgPage.js", "./publicPage.js", "./boxImage.js", "./p2p.js", "./dots-ui.js"]
+}
