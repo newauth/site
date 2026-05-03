@@ -1,0 +1,13924 @@
+
+// Storage adapter that works with localStorage or DB storage
+//console.log = () => {};
+
+class SeededRandom {
+    constructor(seed) {
+        // ✅ CRITICAL: Use proper LCG parameters (uniform distribution)
+        this.a = 1664525;
+        this.c = 1013904223;
+        this.m = Math.pow(2, 32);
+        this.seed = seed % this.m;
+    }
+    
+    // ✅ PROPER UNIFORM RANDOM (0 to 1)
+    random() {
+        this.seed = (this.a * this.seed + this.c) % this.m;
+        return this.seed / this.m;
+    }
+    
+    // ✅ SAME INTERFACE (no breaking changes)
+    randomBetween(min, max) {
+        return min + this.random() * (max - min);
+    }
+}
+
+
+class StorageAdapter {
+
+	constructor() {
+
+		this.storagePrefix = 'schema_app_';
+
+	}
+
+
+
+	async get(key) {
+
+	
+
+			const value = localStorage.getItem(this.storagePrefix + key);
+
+			return value ? { key: key, value: value } : null;
+
+	
+	}
+
+
+
+	async set(key, value) {
+
+	
+
+			localStorage.setItem(this.storagePrefix + key, value);
+
+			return { key: key, value: value };
+
+		
+
+	}
+
+}
+
+
+class DatabaseService {
+
+	constructor(apiBaseUrl, useLocalStorage) {
+
+		this.apiBaseUrl = apiBaseUrl || '/api';
+
+		this.storage = new StorageAdapter();
+
+		this.useLocalStorage = true; // Set to FALSE when using real API
+		
+		this.useLocalStorage = (useLocalStorage === undefined) ? true : Boolean(useLocalStorage);
+
+//		this.initStorage();
+
+		this._getAppSchemasPromise = null;
+		this._appDataPromises = new Map();
+
+	}
+
+
+
+	async initStorage() {
+	  try {
+	    if (this.useLocalStorage) {
+	      // ----- localStorage branch -----
+	      const [rawSchemas, rawEntities] = await Promise.all([
+	        this.storage.get('app_schemas'),
+	        this.storage.get('native_entities')
+	      ]);
+	      if (!rawSchemas) {
+	        await this.storage.set('app_schemas', JSON.stringify(this.getDefaultAppSchemas()));
+	      }
+	      if (!rawEntities) {
+	        await this.storage.set('native_entities', JSON.stringify(this.getDefaultNativeEntities()));
+	      }
+	    } else {
+	      // ----- server branch -----
+	      const [schemas, entities] = await Promise.all([
+	        this.getAppSchemas(),
+	        this.getNativeEntities()
+	      ]);
+	      if (!schemas || schemas.length === 0) {
+	        for (const s of this.getDefaultAppSchemas()) await this.saveAppSchema(s);
+	      }
+	      if (!entities || Object.keys(entities).length === 0) {
+	        const defs = this.getDefaultNativeEntities();
+	        for (const [key, ent] of Object.entries(defs)) await this.saveNativeEntity(key, ent);
+	      }
+		  
+		  this.nativeEntities = entities;
+		  console.log('[initStorage] Stored nativeentities in db this.nativeEntities: ' , this.nativeEntities);
+	    }
+	  } catch (err) {
+	    console.error('Storage initialization error:', err);
+	  }
+	}
+	
+	
+	generateUUID() {
+		// Simple UUID v4 generator
+		return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+			const r = Math.random() * 16 | 0;
+			const v = c === 'x' ? r : (r & 0x3 | 0x8);
+			return v.toString(16);
+		});
+	}
+
+	hashUUID(uuid) {
+	    // ✅ CRITICAL FIX: Guard against non-string/undefined inputs
+	    if (typeof uuid !== 'string' || uuid.length === 0) {
+	        console.warn('[hashUUID] Invalid input (expected UUID string):', uuid);
+	        return ''; // Safe fallback - won't match anything, but won't crash
+	    }
+	    
+	    // ✅ OPTIMIZATION: Skip hashing if already hashed (no dashes)
+	    if (!uuid.includes('-')) {
+	        // Already a hashed ID - return as-is
+	        return uuid;
+	    }
+	    
+	    // Original hashing logic (only runs on actual UUIDs)
+	    const FNV_OFFSET = BigInt("0xcbf29ce484222325");
+	    const FNV_PRIME  = BigInt("0x100000001b3");
+	    
+	    let hash = FNV_OFFSET;
+	    for (let i = 0; i < uuid.length; i++) {
+	        hash ^= BigInt(uuid.charCodeAt(i));
+	        hash *= FNV_PRIME;
+	    }
+	    hash &= BigInt("0xffffffffffffffff");
+	    return hash.toString(36).toLowerCase();
+	}
+
+
+
+	createCustomSchema(id, name, description, hierarchy, fieldMappings) {
+
+		const entityConfigs = {};
+
+
+
+		hierarchy.forEach(function(entityType, index) {
+
+			const nextEntity = index < hierarchy.length - 1 ? hierarchy[index + 1] : null;
+
+			const childrenField = nextEntity ? nextEntity + 's' : null;
+
+
+
+			const mapping = fieldMappings[entityType] || {
+
+				labelField: entityType + '_name',
+
+				idField: entityType + '_id'
+
+			};
+
+
+
+			// Build the base config
+
+			entityConfigs[entityType] = {
+
+				labelField: mapping.labelField,
+
+				idField: mapping.idField,
+
+				childEntity: nextEntity,
+
+				childrenField: childrenField
+
+			};
+
+
+
+			// Add sort configuration if provided in fieldMappings
+
+			if (mapping.sortConfig) {
+
+				entityConfigs[entityType].sortConfig = mapping.sortConfig;
+
+			} else if (childrenField) {
+
+				// Only add sort config for entities that have children
+
+				// For count type, no aggregate function needed
+
+				entityConfigs[entityType].sortConfig = {
+
+					type: mapping.sortType || 'count'
+
+				};
+
+
+
+				// Only add aggregate fields if explicitly specified
+
+				if (mapping.sortType === 'aggregate' && mapping.aggregateField) {
+
+					entityConfigs[entityType].sortConfig.aggregateField = mapping.aggregateField;
+
+					entityConfigs[entityType].sortConfig.aggregateFunction = mapping.aggregateFunction || 'sum';
+
+				}
+
+			}
+
+		});
+
+
+
+		return {
+
+			id: id,
+
+			name: name,
+
+			description: description,
+
+			hierarchy: hierarchy,
+
+			entityConfigs: entityConfigs
+
+		};
+
+	}
+
+	getDefaultAppSchemas() {
+	    return [this.createCustomSchema(
+	        'custsupport',
+	        'Customer Support',
+	        'Customer support workflow management',
+	        ['organization', 'customer', 'concern'],
+	        {
+	            organization: {
+	                labelField: 'name',        // ✅ Changed from 'orgname' to 'name'
+	                idField: 'ID',
+	                childEntity: 'customer',
+	                childrenField: 'customers',
+					disallowShareButton: true,
+	                sortConfig: {
+	                    type: 'count'  // Tenant dots sized by number of customers
+	                }
+	            },
+	            customer: {
+	                labelField: 'name',        // ✅ Changed from 'orgname' to 'name'
+	                idField: 'ID',
+	                childEntity: 'concern',
+	                childrenField: 'concerns',
+	                sortConfig: {
+	                    type: 'aggregate',
+	                    aggregateField: 'count',
+	                    aggregateFunction: 'sum'
+	                }
+	            },
+	            concern: {
+	                labelField: 'name',        // ✅ Changed from 'concerntype' to 'name'
+	                idField: 'ID',
+	                childEntity: null,
+	                childrenField: null
+	                // No sortConfig - concerns are leaf nodes
+	            }
+	        }
+	    )];
+	}
+	
+	getDefaultNativeEntities() {
+	    return {
+	        tenant: {
+	            name: 'Tenant',
+	            description: 'Top-level organization',
+	            fields: [
+	                // ✅ BASE ENTITY FIELDS (mandatory)
+	                { name: 'ID', label: 'Organization ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'displayID', label: 'Display ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'name', label: 'Organization Name', type: 'text', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	                { name: 'dotLabel', label: 'Dot Label', type: 'text', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	                
+	                // ✅ EXISTING CUSTOM FIELDS
+	                { name: 'contactemail', label: 'Contact Email', type: 'email', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	                
+	                // ✅ ADDITIONAL OPTIONAL FIELDS
+	                { name: 'image', label: 'Logo/Image URL', type: 'url', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	                { name: 'website', label: 'Website URL', type: 'url', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	                
+	                // ✅ SYSTEM FIELDS
+	                { name: 'hashed', label: 'Use Hashed URL', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'count', label: 'Count (for aggregation)', type: 'number', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	                { name: 'timestamp', label: 'Timestamp', type: 'number', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'hidden', label: 'Hidden', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                // ✅ PERMISSION & METADATA FIELDS
+	                { name: 'writeAccess', label: 'Write Access', type: 'select', mandatory: false, writePermission: 'root', dataSource: 'manual', 
+	                  options: ['owner', 'parent', 'ancestor', 'any'] },
+	                { name: 'readAccess', label: 'Read Access', type: 'select', mandatory: false, writePermission: 'root', dataSource: 'manual',
+	                  options: ['owner', 'parent', 'ancestor', 'any'] }
+	            ]
+	        },
+	        customer: {
+	            name: 'Customer',
+	            description: 'Sub-organization',
+	            fields: [
+	                // ✅ BASE ENTITY FIELDS (mandatory)
+	                { name: 'ID', label: 'Sub-Organization ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'displayID', label: 'Display ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'name', label: 'Name', type: 'text', mandatory: true, writePermission: 'parent', dataSource: 'manual' },
+	                { name: 'dotLabel', label: 'Dot Label', type: 'text', mandatory: true, writePermission: 'parent', dataSource: 'manual' },
+	                
+	                // ✅ EXISTING CUSTOM FIELDS  
+	                { name: 'contactemail', label: 'Contact Email', type: 'email', mandatory: true, writePermission: 'parent', dataSource: 'manual' },
+	                
+	                // ✅ ADDITIONAL OPTIONAL FIELDS
+	                { name: 'image', label: 'Logo/Image URL', type: 'url', mandatory: false, writePermission: 'parent', dataSource: 'manual' },
+	                { name: 'website', label: 'Website URL', type: 'url', mandatory: false, writePermission: 'parent', dataSource: 'manual' },
+	                
+	                // ✅ SYSTEM FIELDS
+	                { name: 'timestamp', label: 'Timestamp', type: 'number', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'hidden', label: 'Hidden', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'hashed', label: 'Use Hashed URL', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                
+	                // ✅ PERMISSION & METADATA FIELDS  
+	                { name: 'writeAccess', label: 'Write Access', type: 'select', mandatory: false, writePermission: 'parent', dataSource: 'manual',
+	                  options: ['owner', 'parent', 'ancestor', 'any'] },
+	                { name: 'readAccess', label: 'Read Access', type: 'select', mandatory: false, writePermission: 'parent', dataSource: 'manual',
+	                  options: ['owner', 'parent', 'ancestor', 'any'] }
+	            ]
+	        },
+	        concern: {
+	            name: 'Concern',
+	            description: 'Customer concern',
+	            fields: [
+	                // ✅ BASE ENTITY FIELDS (mandatory)
+	                { name: 'ID', label: 'Concern ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'displayID', label: 'Display ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'name', label: 'Concern', type: 'text', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	                { name: 'dotLabel', label: 'Dot Label', type: 'text', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	                
+	                // ✅ EXISTING CUSTOM FIELDS
+	                { name: 'description', label: 'Concern details', type: 'textarea', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	                { name: 'status', label: 'Status', type: 'select', mandatory: false, writePermission: 'ancestor', dataSource: 'manual', options: ['Open', 'In Progress', 'Resolved', 'Closed'] },
+	                
+	                // ✅ ADDITIONAL OPTIONAL FIELDS
+	                { name: 'image', label: 'Image URL', type: 'url', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	                { name: 'website', label: 'Reference URL', type: 'url', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	                
+	                // ✅ SYSTEM FIELDS
+	                { name: 'timestamp', label: 'Timestamp', type: 'number', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'hidden', label: 'Hidden', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	                { name: 'hashed', label: 'Use Hashed data', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+					{ name: 'convid', label: 'Conversation ID', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+						                
+	                // ✅ PERMISSION & METADATA FIELDS
+	                { name: 'writeAccess', label: 'Write Access', type: 'select', mandatory: false, writePermission: 'ancestor', dataSource: 'manual',
+	                  options: ['owner', 'parent', 'ancestor', 'any'] },
+	                { name: 'readAccess', label: 'Read Access', type: 'select', mandatory: false, writePermission: 'ancestor', dataSource: 'manual',
+	                  options: ['owner', 'parent', 'ancestor', 'any'] }
+	            ]
+	        }
+	    };
+	}
+
+	// API INTEGRATION POINT #1
+	
+
+	
+	_invalidateSchemasCache() {
+	    this._getAppSchemasPromise = null;
+	}
+	
+	async getAppSchemas() {
+
+		if (this.useLocalStorage) {
+
+			const result = await this.storage.get('app_schemas');
+
+			return result ? JSON.parse(result.value) : this.getDefaultAppSchemas();
+
+		}
+
+		if (!this._getAppSchemasPromise) {
+		    this._getAppSchemasPromise = fetch(this.apiBaseUrl + "/appschemas")
+		        .then(r => { if (!r.ok) throw new Error("schemas"); return r.json(); });
+		}
+	    return this._getAppSchemasPromise;
+
+	}
+
+
+
+	// API INTEGRATION POINT #2
+
+	async saveAppSchema(schema) {
+
+		if (this.useLocalStorage) {
+
+			const schemas = await this.getAppSchemas();
+
+			const index = schemas.findIndex(function(s) { return s.id === schema.id; });
+
+			index >= 0 ? schemas[index] = schema : schemas.push(schema);
+
+			await this.storage.set('app_schemas', JSON.stringify(schemas));
+
+			return true;
+
+		}
+
+		const res = await fetch(this.apiBaseUrl + "/saveappschemas", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(schema)
+		});
+		if (!res.ok) throw new Error("Failed to save schema");
+		this._invalidateSchemasCache();
+		return true;
+
+	}
+
+
+
+	// API INTEGRATION POINT #3
+
+	async deleteAppSchema(id) {
+
+		if (this.useLocalStorage) {
+
+			const schemas = await this.getAppSchemas();
+
+			await this.storage.set('app_schemas', JSON.stringify(schemas.filter(function(s) { return s.id !== id; })));
+
+			return true;
+
+		}
+
+		const res = await fetch(this.apiBaseUrl + "/removeappschema/" + encodeURIComponent(id), {
+			method: "DELETE"
+		});
+		if (!res.ok) throw new Error("Failed to delete schema");
+		this._invalidateSchemasCache();
+		return true;
+
+	}
+
+
+
+	// API INTEGRATION POINT #4
+
+	async getNativeEntities() {
+		
+		//console.log('=== GET NATIVE ENTITIES CALLED ===');
+		 //  console.log('Call stack:', new Error().stack);
+		 //  console.log('=== END CALL STACK ===');
+		   
+
+		if (this.useLocalStorage) {
+
+			const result = await this.storage.get('native_entities');
+
+			return result ? JSON.parse(result.value) : this.getDefaultNativeEntities();
+
+		}
+
+		const res = await fetch(this.apiBaseUrl + "/getnativeentities");
+		if (!res.ok) throw new Error("Failed to fetch native entities");
+		return await res.json();
+
+	}
+
+
+
+	// API INTEGRATION POINT #5
+
+	async saveNativeEntity(entityKey, entity) {
+
+		if (this.useLocalStorage) {
+
+			const entities = await this.getNativeEntities();
+
+			entities[entityKey] = entity;
+
+			await this.storage.set('native_entities', JSON.stringify(entities));
+
+			return true;
+
+		}
+
+		const res = await fetch(this.apiBaseUrl + "/savenativeentity/" + encodeURIComponent(entityKey), {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(entity)
+		});
+		if (!res.ok) throw new Error("Failed to save native entity");
+		return true;
+
+	}
+
+
+
+	// API INTEGRATION POINT #6
+
+	async deleteNativeEntity(entityKey) {
+
+		if (this.useLocalStorage) {
+
+			const entities = await this.getNativeEntities();
+
+			delete entities[entityKey];
+
+			await this.storage.set('native_entities', JSON.stringify(entities));
+
+			return true;
+
+		}
+
+		const res = await fetch(this.apiBaseUrl + "/removenativeentity/" + encodeURIComponent(entityKey), {
+			method: "DELETE"
+		});
+		if (!res.ok) throw new Error("Failed to delete native entity");
+		return true;
+
+	}
+
+	// API INTEGRATION POINT #7
+
+	
+	_invalidateAppDataCache(appId) {
+	    this._appDataPromises.delete(appId);
+	}
+	
+
+	async getAppData(appId, forcePath = null, options = {}) {
+		console.log('[CCC getAppData] called from:', new Error().stack.split('\n')[2]);
+	    if (this.useLocalStorage) {
+	        const res = await this.storage.get('app_data_' + appId);
+	        return res ? JSON.parse(res.value) : { items: [] };
+	    }
+
+	    // Create cache key that includes forcePath
+	    const cacheKey = forcePath ? `${appId}_${forcePath.join('/')}` : appId;
+		
+		if (options.bypassCache) {
+	        console.log(`[getAppData] Bypassing cache for key: ${cacheKey}`);
+	        this._appDataPromises.delete(cacheKey); // Force fresh fetch
+	    }
+		    
+	    if (!this._appDataPromises.has(cacheKey)) {
+	        let url;
+	        
+	        console.log('[getAppData] isowner: ', isowner);
+	        console.log('[getAppData] forcePath: ', forcePath);
+	        
+	        if (forcePath !== null) {
+	            // Use forced path instead of URL context
+	            if (forcePath.length === 0) {
+	                // Full hierarchy - no path
+	                url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}`;
+	                console.log('[getAppData] Forced full hierarchy fetch');
+	            } else if (forcePath.length === 1) {
+	                // Tenant level
+	                url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/${encodeURIComponent(forcePath[0])}`;
+	                console.log('[getAppData] Forced tenant fetch:', forcePath[0]);
+	            } else if (forcePath.length >= 2) {
+	                // Subtenant level
+	                url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/${encodeURIComponent(forcePath[0])}/${encodeURIComponent(forcePath[1])}`;
+	                console.log('[getAppData] Forced subtenant fetch:', forcePath[1]);
+	            }
+	        }
+	        // ---- Original logic for when forcePath is null ----
+	        else {
+	            const urlInfo = window.app.parseUrlForDataFetch();
+	            
+	            // NEW LOGIC: If owner and at root app URL → fetch ALL tenants
+	            if (
+	                typeof isowner !== 'undefined' &&
+	                isowner &&
+	                urlInfo &&
+	                !urlInfo.tenantId &&
+	                !urlInfo.subtenantId
+	            ) {
+	                // Fetch full data for owner at root
+	                url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}`;
+	                console.log('[getAppData] Owner at root — fetching ALL tenants');
+	            }
+	            // Subtenant view: 3-segment URL (from direct URL)
+	            else if (urlInfo && urlInfo.subtenantId) {
+	                url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/${encodeURIComponent(urlInfo.tenantId)}/${encodeURIComponent(urlInfo.subtenantId)}`;
+	                console.log('[getAppData] Fetching subtenant data from URL:', urlInfo.subtenantId);
+	            }
+	            // Tenant view: 2-segment URL (from direct URL)
+	            else if (urlInfo && urlInfo.tenantId) {
+	                url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/${encodeURIComponent(urlInfo.tenantId)}`;
+	                console.log('[getAppData] Fetching tenant data from URL:', urlInfo.tenantId);
+	            }
+	            // Check saved context from lastViewedContexts (for returning users)
+	            else {
+	                const savedContext = app.getLastViewedContext(appId);
+	                if (savedContext && savedContext.pathIds && savedContext.pathIds.length > 0) {
+	                    // Use saved context - convert to hashed IDs if needed
+	                    const pathIds = savedContext.pathIds.map(id => {
+	                        // If it's a real UUID, hash it for server
+	                        if (id.includes('-')) {
+	                            return this.hashUUID(id);
+	                        }
+	                        // If it's already hashed, use as-is
+	                        return id;
+	                    });
+	                    
+	                    if (pathIds.length === 1) {
+	                        // Tenant level context
+	                        url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/${encodeURIComponent(pathIds[0])}`;
+	                        console.log('[getAppData] Fetching tenant data from saved context:', pathIds[0]);
+	                    } else if (pathIds.length >= 2) {
+	                        // Subtenant level context
+	                        url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/${encodeURIComponent(pathIds[0])}/${encodeURIComponent(pathIds[1])}`;
+	                        console.log('[getAppData] Fetching subtenant data from saved context:', pathIds[1]);
+	                    } else {
+	                        // Fallback to root
+	                        url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}`;
+	                        console.log('[getAppData] Fallback to root from saved context');
+	                    }
+	                }
+	                // Final fallback
+	                else {
+	                    url = `${this.apiBaseUrl}/getappdata/${encodeURIComponent(appId)}/system`;
+	                    console.log('[getAppData] Fallback to system tenant');
+	                }
+	            }
+	        }
+			
+			if (options.bypassCache) {
+	            const cacheBuster = `_cb=${Date.now()}`;
+	            url = url.includes('?') ? `${url}&${cacheBuster}` : `${url}?${cacheBuster}`;
+	            console.log(`[getAppData] Cache-buster URL: ${url}`);
+	        }
+
+	        const p = fetch(url)
+	            .then(async res => {
+	                if (res.status === 404) return { items: [] };
+	                if (!res.ok) {
+	                    console.error(`getAppData ${appId} → ${res.status}`);
+	                    return { items: [] };
+	                }
+	                const text = await res.text();
+	                if (!text || text === '""' || text === '{}') return { items: [] };
+	                try {
+	                    const parsed = JSON.parse(text);
+						
+						console.log('[TTT getAppData] raw response:', JSON.stringify(parsed).substring(0, 300));
+	                    if (!parsed || typeof parsed !== 'object') return { items: [] };
+	                    if (!Array.isArray(parsed.items)) parsed.items = [];
+	                    return parsed;
+	                } catch (e) {
+	                    console.error('JSON parse fail', e, text);
+	                    return { items: [] };
+	                }
+	            })
+	            .catch(err => {
+	                console.error('Network error in getAppData', err);
+	                return { items: [] };
+	            });
+
+	        this._appDataPromises.set(cacheKey, p);
+	    }
+
+	    return this._appDataPromises.get(cacheKey);
+	}
+	// API INTEGRATION POINT #8
+
+	async saveAppData(appId, data) {
+		
+		// console.log('App Data being sent:', JSON.stringify(data, null, 2));
+		// console.log('Metadata being sent:', data.metaData);
+		
+		console.log('[DB] saveAppData – useLocalStorage?', this.useLocalStorage);
+
+		if (this.useLocalStorage) {
+
+			await this.storage.set('app_data_' + appId, JSON.stringify(data));
+
+			return true;
+
+		}
+
+		console.log('=== SENDING TO SERVER ===');
+		const res = await fetch(this.apiBaseUrl + "/saveappdata/" + encodeURIComponent(appId), {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(data)
+		});
+		if (!res.ok) throw new Error("Failed to save app data");
+		this._invalidateAppDataCache(appId);
+		
+		console.log('[DB] saveAppData – complete');
+		return true;
+
+	}
+	
+	async saveEntityData(entityPath, entityData, isUpdate = false) {
+	    const appId = entityPath.split('/')[1]; // apps/custsupport/... → custsupport
+	    
+	    const payload = {
+	        data: entityData,
+	        metadata: {
+	            path: entityPath,
+	            isUpdate: isUpdate
+	        }
+	    };
+
+		console.log('[TTT saveEntityData] payload data:', JSON.stringify(payload.data).substring(0, 300));
+	    const res = await fetch(
+	        `${this.apiBaseUrl}/saveentity/${encodeURIComponent(appId)}`,
+	        {
+	            method: 'PUT',
+	            headers: { 'Content-Type': 'application/json' },
+	            body: JSON.stringify(payload)
+	        }
+	    );
+
+	    if (!res.ok) throw new Error('Failed to save entity');
+	    this._invalidateAppDataCache();
+	    return true;
+	}
+	
+	
+
+	// In db.saveEntitiesBatch — remove showNotification, just return progress info
+	async saveEntitiesBatch(entities, onProgress) {
+	    const appId = entities[0].path.split('/')[1];
+	    const chunks = [];
+	    for (let i = 0; i < entities.length; i += 100) {
+	        chunks.push(entities.slice(i, i + 100));
+	    }
+
+	    for (let i = 0; i < chunks.length; i++) {
+	        // ✅ Call progress callback instead of showNotification
+	        if (onProgress) onProgress(i + 1, chunks.length);
+	        
+	        const res = await fetch(
+	            `${this.apiBaseUrl}/saveentities/${encodeURIComponent(appId)}`,
+	            {
+	                method: 'PUT',
+	                headers: { 'Content-Type': 'application/json' },
+	                body: JSON.stringify({ entities: chunks[i] })
+	            }
+	        );
+	        if (!res.ok) throw new Error(`Batch ${i + 1} failed`);
+	    }
+
+	    this._invalidateAppDataCache();
+	    return true;
+	}
+	
+
+
+}
+
+
+
+
+
+// Main Orchestrator Class
+
+class SchemaOrchestrator {
+	
+	// Add setter to track changes
+	set currentPath(value) {
+	    console.log('=== currentPath SET ===');
+	    console.log('[currentPath] New value:', value);
+	    console.log('[currentPath]Stack trace:', new Error().stack);
+	    this._currentPath = value;
+	}
+
+	get currentPath() {
+	    return this._currentPath;
+	}
+
+	constructor(config) {
+
+		this._currentPath = [];
+		config = config || {};
+
+		this.db = new DatabaseService(config.apiBaseUrl, config.useLocalStorage);
+
+		this.currentApp = null;
+
+		this.currentPath = [];
+
+		this.data = { items: [] };
+
+		this.centerZoneRadius = 100;
+
+		this.dotColors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#f9ca24', '#6c5ce7', '#fd79a8'];
+
+	
+		// In constructor
+		this.searchTerm = '';
+		this.searchResults = null; // Will store search results structure
+		
+		// ✅ VERSION POLLING STATE
+	   this.versionPollInterval = null;
+	   this.lastKnownTimestamp = 0;
+	   this.isPollingActive = false;
+	   
+	   this.pollingSessionToken = null;
+	   
+	   // In constructor or init:
+	   this._isFirstRender = true;
+	   this._dotPage = 0;
+	   this._dotPageSize = 30;
+	   this._dotPageItemCount = 0;
+	   
+
+		this.init();
+
+	}
+	
+	isOwner() {
+	        return this.isOwnerUser;
+	    }
+
+
+		
+		_createGuestModeBanner() {
+		    // ✅ CHECK IF USER DISMISSED IT BEFORE
+		    const dismissed = localStorage.getItem('guestModeBannerDismissed');
+		    if (dismissed === 'true') {
+		        console.log('[GuestMode] Banner dismissed by user - not showing');
+		        return;
+		    }
+		    
+		    const banner = document.createElement('div');
+		    banner.className = 'guest-mode-banner';
+			banner.innerHTML = `
+			    <div class="guest-mode-banner-content">
+			        <div class="guest-mode-banner-text">
+			            <h4>Guest Mode:</h4> You're using this app without a newauth account. A newauth account provides
+			            <ul>
+			                <li aria-label="Personal digital vault for your data"><strong>Personal digital vault</strong> for your data. </li>
+							<li aria-label="Login without passwords or tokens"><strong>Login</strong> just by clicking on images. </li>
+			                <li aria-label="One click access to all your .apps"><strong>One-click access</strong> to all .apps</li>
+			                <li aria-label="Custom .apps for your workflows"><strong>Build custom .apps</strong> for your workflows</li>
+			            </ul>
+			            <a href="/welcome?action=create" style="color: white; text-decoration: underline; font-weight: 600;">Create account</a>
+			        </div>
+			        <button class="guest-mode-banner-close" aria-label="Close guest mode banner">×</button>
+			    </div>
+			`;
+		    
+		    document.body.appendChild(banner);
+		    
+		    // ✅ HOVER EXPAND/CONTRACT
+		    banner.addEventListener('mouseenter', () => {
+		        banner.classList.add('expanded');
+		    });
+		    
+		    banner.addEventListener('mouseleave', (e) => {
+		        if (!banner.contains(e.relatedTarget)) {
+		            banner.classList.remove('expanded');
+		        }
+		    });
+		    
+		    // ✅ CLICK TOGGLE
+		    banner.addEventListener('click', (e) => {
+		        if (e.target.classList.contains('guest-mode-banner-close')) {
+		            e.stopPropagation();
+		            this._showDismissDialog(banner); // Show modal dialog
+		        } else {
+		            banner.classList.toggle('expanded');
+		        }
+		    });
+		    
+		    // ✅ CLICK OUTSIDE TO COLLAPSE
+		    document.addEventListener('click', (e) => {
+		        if (!banner.contains(e.target) && banner.classList.contains('expanded')) {
+		            banner.classList.remove('expanded');
+		        }
+		    });
+		    
+		    // ✅ ESC KEY TO COLLAPSE
+		    document.addEventListener('keydown', (e) => {
+		        if (e.key === 'Escape' && banner.classList.contains('expanded')) {
+		            banner.classList.remove('expanded');
+		        }
+		    });
+		    
+		    console.log('[GuestMode] Banner initialized');
+		}
+
+		_showDismissDialog(banner) {
+		    // Create modal overlay
+		    const overlay = document.createElement('div');
+		    overlay.className = 'guest-mode-modal-overlay';
+		    overlay.setAttribute('aria-modal', 'true');
+		    overlay.setAttribute('role', 'dialog');
+		    overlay.setAttribute('aria-labelledby', 'guest-mode-modal-title');
+			
+			overlay.innerHTML = `
+			    <div class="guest-mode-modal" role="document">
+			        <button class="guest-mode-modal-close" aria-label="Close dialog">
+			            <span class="sr-only">Close</span>
+			            ×
+			        </button>
+			        
+			        <h3 id="guest-mode-modal-title">Guest Mode Benefits</h3>
+					<div style="text-align: center; margin: 16px 0;">
+					    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin: 0 auto;">
+					        <circle cx="12" cy="12" r="10" stroke="#dc2626" stroke-width="2" fill="none"/>
+					        <path d="M12 8V12M12 16H12.01" stroke="#dc2626" stroke-width="2" stroke-linecap="round"/>
+					    </svg>
+					</div>
+			        
+			        <p><strong>What you're missing in guest mode:</strong></p>
+			        <ul>
+			            <li>Personal digital vault for your data</li>
+			            <li>One-click access to all .apps</li>
+			            <li>Ability to build custom .apps</li>
+			        </ul>
+			        
+			        <p>Would you like to:</p>
+			        
+			        <div class="guest-mode-modal-buttons">
+			            <button class="guest-mode-modal-btn-secondary" id="guest-mode-dismiss-btn">
+			                Please dismiss this banner, I am OK with using the app in guest mode
+			            </button>
+			            <button class="guest-mode-modal-btn-primary" id="guest-mode-create-account-btn">
+			                I will create the free account now
+			            </button>
+			        </div>
+			    </div>
+			`;
+		    
+		    document.body.appendChild(overlay);
+		    
+		    // ✅ CRITICAL FIX: Use querySelector (NOT getElementById on overlay)
+		    const modal = overlay.querySelector('.guest-mode-modal');
+		    const closeBtn = overlay.querySelector('.guest-mode-modal-close');
+		    const dismissBtn = overlay.querySelector('#guest-mode-dismiss-btn');
+		    const createAccountBtn = overlay.querySelector('#guest-mode-create-account-btn');
+		    
+		    // ✅ STORE FOCUS FOR RESTORATION
+		    const previousActiveElement = document.activeElement;
+		    
+		    // ✅ FOCUS TRAPPING
+		    const focusableElements = modal.querySelectorAll(
+		        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+		    );
+		    const firstFocusable = focusableElements[0];
+		    const lastFocusable = focusableElements[focusableElements.length - 1];
+		    
+		    // Focus first element
+		    setTimeout(() => firstFocusable?.focus(), 100);
+		    
+		    // Trap focus
+		    const trapFocus = (e) => {
+		        if (e.key === 'Tab') {
+		            if (e.shiftKey && document.activeElement === firstFocusable) {
+		                e.preventDefault();
+		                lastFocusable.focus();
+		            } else if (!e.shiftKey && document.activeElement === lastFocusable) {
+		                e.preventDefault();
+		                firstFocusable.focus();
+		            }
+		        }
+		    };
+		    
+		    overlay.addEventListener('keydown', trapFocus);
+		    
+		    // ✅ CLOSE FUNCTION (centralized cleanup)
+		    const closeDialog = () => {
+		        // Remove event listeners first
+		        document.removeEventListener('keydown', handleEsc);
+		        overlay.removeEventListener('keydown', trapFocus);
+		        closeBtn.removeEventListener('click', closeDialog);
+		        dismissBtn.removeEventListener('click', handleDismiss);
+		        createAccountBtn.removeEventListener('click', handleCreateAccount);
+		        overlay.removeEventListener('click', handleOverlayClick);
+		        
+		        // Remove from DOM
+		        if (overlay.parentNode) {
+		            document.body.removeChild(overlay);
+		        }
+		        
+		        // Restore focus
+		        setTimeout(() => previousActiveElement?.focus(), 0);
+		    };
+		    
+		    // ✅ CLOSE HANDLERS
+		    const handleEsc = (e) => {
+		        if (e.key === 'Escape') closeDialog();
+		    };
+		    
+		    const handleOverlayClick = (e) => {
+		        if (e.target === overlay) closeDialog();
+		    };
+		    
+		    const handleDismiss = () => {
+		        localStorage.setItem('guestModeBannerDismissed', 'true');
+		        banner.style.display = 'none';
+		        closeDialog();
+		        console.log('[GuestMode] Banner dismissed permanently');
+		    };
+		    
+		    const handleCreateAccount = () => {
+		        closeDialog();
+		        window.location.href = '/signup';
+		    };
+		    
+		    // ✅ ATTACH EVENT LISTENERS
+		    document.addEventListener('keydown', handleEsc);
+		    overlay.addEventListener('click', handleOverlayClick);
+		    closeBtn.addEventListener('click', closeDialog);
+		    dismissBtn.addEventListener('click', handleDismiss);
+		    createAccountBtn.addEventListener('click', handleCreateAccount);
+		    
+		    console.log('[GuestMode] Dismiss dialog opened');
+		}
+
+
+		async init() {
+		    console.log('[init] START');
+		    
+		    await this.db.initStorage();
+
+		    // ✅ Load native entities
+		    try {
+		        this.nativeEntities = this.db.nativeEntities || this.db.getDefaultNativeEntities();
+		    } catch (error) {
+		        console.error('[init] Failed to load native entities:', error);
+		        this.nativeEntities = this.getDefaultNativeEntities();
+		    }
+
+		    try {
+		        const urlInfo = this.parseUrlForDataFetch();
+
+		        // ✅ No URL - show app selector for owner, empty for non-owner
+		        if (!urlInfo || !urlInfo.appId) {
+		            if (isowner) {
+		                await this.loadAppSelector();
+		            }
+		            return;
+		        }
+
+		        console.log('[init] Parsed URL:', urlInfo);
+
+		        // ✅ Select app if needed
+		        if (this.currentApp?.id !== urlInfo.appId) {
+		            await this.selectApp(urlInfo.appId);
+					console.log('[init] currentApp after selectApp:', this.currentApp?.id);
+		        }
+
+		        const pathDepth = urlInfo.pathIds?.length || 0;
+		        console.log('[init] pathDepth:', pathDepth, 'pathIds:', urlInfo.pathIds);
+
+		        // ✅ ROOT LEVEL (no path)
+		        if (pathDepth === 0) {
+		            await this.loadAppSelector();
+
+		            if (isowner) {
+		                // Owner sees all tenants
+		                this.data = await this.db.getAppData(this.currentApp.id);
+		                this.currentPath = [];
+		            } else {
+		                // Non-owner redirects to saved context
+		                const savedContexts = this.getLastViewedContext(urlInfo.appId);
+		                const savedContext = savedContexts?.[0];
+
+		                if (savedContext?.path?.length > 0) {
+		                    this.currentPath = savedContext.path.map((id, i) => ({
+		                        id: id,
+		                        displayID: id.includes('-') ? this.db.hashUUID(id) : id,
+		                        shortName: id.substring(0, 8),
+		                        entityType: this.currentApp.hierarchy[i]
+		                    })).filter(p => p.entityType);
+
+		                    const newUrl = this.getAppUrl(this.currentPath);
+		                    window.history.replaceState({ path: this.currentPath }, '', newUrl);
+
+		                    const pathContext = this.currentPath.map(p => p.displayID);
+		                    this.data = await this.db.getAppData(this.currentApp.id, pathContext,
+							    { bypassCache: true } );
+		                } else {
+		                    this.data = { items: [] };
+		                    this.currentPath = [];
+		                }
+		            }
+		        }
+
+		        // ✅ DEPTH 1 - Tenant/Seller/Org level
+		        else if (pathDepth === 1) {
+		            const targetId = urlInfo.pathIds[0];
+
+		            // ✅ Access validation for non-owners
+		            if (!isowner) {
+		                const hasRealUuid = this.isRealUuid(targetId);
+		                if (!hasRealUuid) {
+		                    const savedContexts = this.getLastViewedContext(urlInfo.appId);
+		                    const savedContext = savedContexts?.[0];
+		                    let canAccess = false;
+
+		                    if (savedContext) {
+		                        const savedId = savedContext.path[0];
+		                        if (savedId === targetId) {
+		                            canAccess = true;
+		                        } else if (savedId.includes('-')) {
+		                            canAccess = this.db.hashUUID(savedId) === targetId;
+		                        }
+		                    }
+
+		                    if (!canAccess) {
+		                        this.showNotification('Access restricted: You cannot view this tenant.', 'error');
+		                        return;
+		                    }
+		                }
+		            }
+
+		            await this.loadAppSelector();
+
+		            // ✅ Fetch specific entity - distributed storage always returns exactly this entity
+		            this.data = await this.db.getAppData(this.currentApp.id, [targetId]	,
+					    { bypassCache: true } );
+					
+					console.log('[TTT init] this.data after fetch:', JSON.stringify(this.data).substring(0, 300));
+
+		            // ✅ items[0] is always the entity we requested
+		            const entityType = this.currentApp.hierarchy[0];
+		            const foundItem = this.data.items?.[0];
+
+		            this.currentPath = foundItem ? [{
+		                id: foundItem.ID,
+		                displayID: foundItem.displayID,
+		                shortName: this.getShortName(foundItem, entityType),
+		                entityType: entityType
+		            }] : [{
+		                id: targetId,
+		                displayID: targetId,
+		                shortName: targetId.substring(0, 8),
+		                entityType: entityType
+		            }];
+
+		            console.log('[init] currentPath set:', this.currentPath);
+		        }
+
+				// ✅ DEEP LINKS (depth >= 2)
+				else {
+				    await this.handleIncomingDeepLink();
+				    
+				    // ✅ Fetch data for the deepest entity in path
+				    if (this.currentPath.length > 0) {
+				        const pathContext = this.currentPath.map(p => p.displayID);
+				        this.data = await this.db.getAppData(
+				            this.currentApp.id, 
+				            pathContext,
+				            { bypassCache: true }
+				        );
+				        console.log('[init] deep link data fetched, items:', this.data?.items?.length);
+				    }
+				}
+
+		        // ✅ Save context if applicable
+		        if (urlInfo?.appId && urlInfo?.pathIds?.length > 0) {
+		            this.saveContextIfApplicable(urlInfo.appId, urlInfo.pathIds);
+		        }
+
+		        // ✅ Update path names then render
+		        this.updateCurrentPathWithRealNames();
+		        this._contextBarFlipped = false;
+
+		        if (this.currentApp) {
+		            this.render();
+		            this.updateBreadcrumb();
+		        }
+
+		    } finally {
+		        try {
+		            this.setupEventListeners();
+		            this.setupPopstateHandler();
+		            this.setupSearch();
+
+		            if (!userloggedin) {
+		                this._createGuestModeBanner();
+		            }
+
+		            if (typeof this.maybeEtsySync === 'function') {
+		                await this.maybeEtsySync();
+		            }
+		        } catch (setupError) {
+		            console.error('[init] CRITICAL: Event setup failed:', setupError);
+		            this.showNotification('UI controls disabled. Refresh page.', 'error');
+		        }
+		    }
+
+		    console.log('[init] COMPLETE - Final currentPath:', this.currentPath);
+		}
+		
+		updateCurrentPathWithRealNames() { 
+			
+			console.log('[updateCurrentPath] ENTRY CHECK:',  {
+			        hasItems: !!this.data?.items,
+			        itemsLength: this.data?.items?.length,
+			        pathLength: this.currentPath?.length,
+			        hasApp: !!this.currentApp
+			    });
+				
+	//			console.log('[updateCurrentPath] raw items[0]:', JSON.stringify(this.data.items[0]).substring(0, 300));
+			
+		    // ✅ CRITICAL FIX: Guard against undefined/empty data
+		    if (!this.data?.items || this.data.items.length === 0 || this.currentPath.length === 0 || !this.currentApp) {
+		        console.log('[updateCurrentPathWithRealNames] No data or path - skipping');
+		        return;
+		    }
+		    
+		    console.log('🔍 updateCurrentPath START');
+		    console.log('  Data items:', this.data.items.map(i => ({ entityType: i.entityType, ID: i.ID, displayID: i.displayID, name: i.name, displayname: i.displayname  })));
+		    console.log('  Current path:', this.currentPath.map(p => ({ id: p.id, displayID: p.displayID, shortName: p.shortName,entityType: p.entityType  })));
+		    
+		    // ✅ CRITICAL FIX: Guard firstDataItem access
+		    const firstDataItem = this.data.items[0];
+		    const firstPathItem = this.currentPath[0];
+		    
+		    if (!firstDataItem || !firstPathItem) {
+		        console.warn('[updateCurrentPathWithRealNames] Missing first items - skipping');
+		        return;
+		    }
+		    
+		    // ✅ DETECT PARTIAL DATA (Browser 2)
+		    const isPartialData = (
+		        firstDataItem.entityType !== firstPathItem.entityType ||
+		        (firstDataItem.displayID && firstPathItem.displayID && firstDataItem.displayID !== firstPathItem.displayID)
+		    );
+		    
+			console.log('[updateCurrentPath] isPartialData:', isPartialData);
+			console.log('[updateCurrentPath] data.items[0]:', {
+			    ID: this.data.items[0]?.ID,
+			    displayID: this.data.items[0]?.displayID,
+			    entityType: this.data.items[0]?.entityType
+			});
+		    console.log('  Is partial data:', isPartialData);
+		    
+		    let currentItems = this.data.items;
+		    let updates = 0;
+		    let startIndex = 0;
+		    
+		    // ✅ SKIP LEVELS THAT DON'T EXIST IN PARTIAL DATA
+		    if (isPartialData) {
+		        console.log('  ⚠️ Partial data detected - finding matching start level');
+		        
+		        // Find which path level matches the first data item
+		        for (let i = 0; i < this.currentPath.length; i++) {
+		            const pathItem = this.currentPath[i];
+		            
+		            // ✅ CRITICAL FIX: Safe pathItem ID extraction with guards
+		            const pathItemId = pathItem?.id || pathItem?.displayID || '';
+		            const pathItemDisplayId = pathItem?.displayID || pathItemId;
+		            
+		            // ✅ CRITICAL FIX: Handle tenant data structure safely
+		            const firstDataItemId = firstDataItem?.ID || 
+		                                   (firstDataItem?.displayname ? firstDataItem.displayname.split('/').pop() : '') ||
+		                                   firstDataItem?.displayID || '';
+		            
+		            const matches = (
+		                firstDataItem.displayID === pathItemDisplayId ||
+		                firstDataItemId === pathItemId ||
+		                // Guarded hashed match check
+		                (pathItemId && !pathItemId.includes('-') && 
+		                 firstDataItemId?.includes('-') && 
+		                 this.db.hashUUID(firstDataItemId) === pathItemId)
+		            );
+		            
+		            if (matches) {
+		                startIndex = i;
+		                console.log(`  ✅ Found match at path level ${i}:`, {pathItem: pathItemDisplayId, dataItem: firstDataItemId   });
+		                break;
+		            }
+		        }
+		    }
+		    
+		    // ✅ PROCESS PATH FROM START INDEX
+		    for (let i = startIndex; i < this.currentPath.length; i++) {
+		        const pathItem = this.currentPath[i];
+		        const entityType = this.currentApp.hierarchy[i];
+		        
+		        if (!entityType) {
+		            console.warn(`⚠️ No entityType at level ${i}`);
+		            break;
+		        }
+		        
+		        console.log(`\n🔍 Level ${i} (${entityType}):`);
+		        console.log(`  Path item:`, { id: pathItem?.id, displayID: pathItem?.displayID });
+		        
+		        // ✅ CRITICAL FIX: Safe pathItem ID extraction
+		        const pathItemId = pathItem?.id || pathItem?.displayID || '';
+		        const pathItemDisplayId = pathItem?.displayID || pathItemId;
+		        
+		        console.log(`  Searching in ${currentItems.length} items`);
+		        
+		        // ✅ CRITICAL FIX: Enhanced matching with tenant data support and guards
+		        const foundItem = currentItems.find(item => {
+		            if (!item) return false;
+		            
+		            // Match by displayID (most reliable)
+		            if (item.displayID === pathItemDisplayId) return true;
+		            if (item.ID === pathItemId) return true;
+		            
+		            // Handle hashed ID matching (guarded)
+		            if (pathItemId && !pathItemId.includes('-') && item.ID?.includes('-')) {
+		                const hashedRealId = this.db.hashUUID(item.ID);
+		                if (hashedRealId === pathItemId) return true;
+		            }
+		            
+		            // ✅ HANDLE TENANT DATA STRUCTURE (displayname field)
+		            if (item.displayname) {
+		                const parts = item.displayname.split('/');
+		                const tenantIdFromDisplayname = parts[parts.length - 1];
+		                if (tenantIdFromDisplayname === pathItemId || tenantIdFromDisplayname === pathItemDisplayId) {
+		                    return true;
+		                }
+		            }
+		            
+		            return false;
+		        });
+		        
+		        if (foundItem) {
+		            const newName = this.getShortName(foundItem, entityType);
+		            console.log(`  Name from getShortName: "${newName}"`);
+		            
+		            if (newName && newName !== 'Unnamed') {
+		                this.currentPath[i].shortName = newName;
+		                updates++;
+		                console.log(`  ✅ UPDATED shortName to: "${newName}"`);
+		            } else {
+		                console.log(`  ⚠️ No valid name found`);
+		            }
+		            
+		            // Navigate to children for next level
+		            const config = this.currentApp.entityConfigs[entityType];
+		            if (config?.childrenField) {
+		                currentItems = foundItem[config.childrenField] || [];
+		                console.log(`  → Navigating to children via "${config.childrenField}"`);
+		                console.log(`  → Next level will search in ${currentItems.length} items`);
+		            } else {
+		                console.log(`  ⚠️ No childrenField for ${entityType}`);
+		                currentItems = [];
+		            }
+		        } else {
+		            console.error(`❌ NO MATCH at level ${i}`);
+		            console.error(`  Path item:`, pathItem);
+		            console.error(`  Available items:`, currentItems.map(item => ({ ID: item.ID,    displayID: item.displayID, displayname: item.displayname,name: item.name })));
+		            currentItems = []; // Prevent deeper levels from matching
+		        }
+		    }
+		    
+		    console.log(`\n✅ updateCurrentPath COMPLETE: ${updates}/${this.currentPath.length - startIndex} names resolved`);
+		    console.log('Final currentPath:', this.currentPath.map(p => ({ id: p.id?.substring(0,8) || 'N/A', name: p.shortName  })));
+		}
+		
+		showCreateTenantOption() {
+		    console.log('showCreateTenantOption called!');
+		    
+		    const container = document.getElementById('canvas-area');
+		    if (container) {
+		        const appName = this.currentApp?.name || 'the app';
+				const entity = this.currentApp?.hierarchy[0] || '';
+		        
+		        container.innerHTML = `
+		            <div style="
+		                position: absolute;
+		                top: 50%;
+		                left: 50%;
+		                transform: translate(-50%, -50%);
+		                text-align: left;
+		                padding: 30px;
+		                background: white;
+		                border-radius: 12px;
+		                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+		                max-width: 400px;
+		                width: 90%;
+		                z-index: 1000;
+		            ">
+		                <p style="margin: 0 0 20px 0; color: #333; font-size: 24px;">
+		                   <strong> Welcome to .apps <br>${appName} </strong>
+		                </p>
+		                
+		                <p style="margin: 0 0 16px 0; color: #666; font-size: 16px;">
+		                    You do not have a .apps ${appName} account.
+		                </p>
+		                
+		                <p style="margin: 0 0 25px 0; color: #666; font-size: 14px;">
+		                    If you have a newauth account, you can access all your .apps (including ${appName}) by <a href="/newauth/login" style="color: #667eea; text-decoration: none;">
+					                Logging in
+					            </a>.
+		                </p>
+		                
+		                <p style="margin: 0 0 25px 0; color: #666; font-size: 14px; font-weight: 500;">
+		                    Click below to create a ${appName} account now:
+		                </p>
+		                
+		                <button 
+		                    onclick="window.app.openAddDialog()" 
+		                    class="btn btn-primary"
+		                    style="
+		                        background: #667eea;
+		                        color: white;
+		                        border: none;
+		                        padding: 12px 24px;
+		                        border-radius: 6px;
+		                        font-size: 16px;
+		                        cursor: pointer;
+		                        transition: background 0.2s;
+		                        width: 100%;
+		                    "
+		                    onmouseover="this.style.background='#5a6fd8'"
+		                    onmouseout="this.style.background='#667eea'"
+		                >
+		                    Create guest account
+		                </button>
+		            </div>
+		        `;
+		        console.log('Create tenant panel displayed');
+		    } else {
+		        console.error('Canvas area not found!');
+		    }
+	    
+		    // Also update the watermark separately
+		    this.updateWatermark();
+		}
+		
+		getShortName(item, entityType) {
+		    if (!item || !entityType) {
+		        return 'Unnamed';
+		    }
+		    
+			// try common fields
+		    if (item.name) return item.name;
+		    if (item.title) return item.title;
+			if (item.text) return item.text;
+			
+			// Get the entity configuration
+			const config = this.currentApp?.entityConfigs?.[entityType];
+			if (config && config.labelField) {
+			    // Return the label field value, or fallback to displayID/ID
+			    return item[config.labelField] || item.displayID || item.ID || 'Unnamed';
+			}
+		    
+		    // Final fallback
+		    return item.displayID || item.ID || 'Unnamed';
+		}
+		
+		// ✅ REPLACE ENTIRE METHOD - Works with NEW context structure
+		hasSavedContextForApp(appId) {
+		    if (!appId) return false;
+		    
+		    try {
+		        // ✅ NEW FORMAT: Check savedContexts_{appId} array
+		        const contexts = JSON.parse(
+		            localStorage.getItem(`savedContexts_${appId}`) || '[]'
+		        );
+		        
+		        // Return true if ANY context exists for this app
+		        return Array.isArray(contexts) && contexts.length > 0;
+		    } catch (e) {
+		        console.error('[hasSavedContextForApp] Parse error for app:', appId, e);
+		        return false;
+		    }
+		}
+	
+	
+		canEditField(fieldConfig, context) {
+		    const isDataOwner = this.isDataOwner(); // Browser 1 user
+		    
+		    // Data owners (Browser 1) can always edit everything
+		    if (isDataOwner) {
+		        return true;
+		    }
+		    
+		    // Browser 2 users - check permissions based on their access level
+		    switch (fieldConfig.writePermission) {
+		        case 'any':
+		            return true; // Anyone can edit
+		            
+		        case 'parent':
+		            // Can edit if we're at the direct parent level
+		            return this.hasParentAccess();
+		            
+		        case 'ancestor':
+		            // Can edit if we have ancestor access (created this entity or are above it)
+		            return this.hasAncestorAccess();
+		            
+		        case 'owner':
+		            // Only app owner (rarely used)
+		            return false;
+		            
+		        case 'system':
+		            return false; // Never editable
+		            
+		        default:
+		            return false;
+		    }
+		}
+
+		// Check if current user has parent-level access
+		hasParentAccess() {
+		    // Browser 2 users have parent access if they're viewing at the level 
+		    // directly above where this entity would be created
+		    const creatingAtDepth = this.currentPath.length;
+		    const maxAllowedDepth = this.getMaxAllowedDepth();
+		    
+		    // If we're at the maximum depth we can access, we can create children
+		    return creatingAtDepth === maxAllowedDepth;
+		}
+
+		// Check if current user has ancestor access  
+		hasAncestorAccess() {
+		    // Browser 2 users have ancestor access only if they created this specific entity
+		    // OR if they have access to an ancestor level
+		    
+		    // For creation: Browser 2 never has ancestor access (they didn't create ancestors)
+		    // For editing: Check if this specific entity was created by current user
+		    
+		    const isCreating = !this.editingExistingItem; // You'll need to track this
+		    if (isCreating) {
+		        return false; // Browser 2 can't create with ancestor permission
+		    }
+		    
+		    // For editing existing items, check if user has ancestor relationship
+		    return this.checkAncestorRelationship();
+		}
+
+		// Get maximum depth Browser 2 user can access
+		getMaxAllowedDepth() {
+		    const savedContext = this.getLastViewedContext(this.currentApp.id);
+		    if (!savedContext || !savedContext.pathIds) {
+		        return 0;
+		    }
+		    return savedContext.pathIds.length;
+		}
+
+		// Check if current user has ancestor relationship to specific entity
+		checkAncestorRelationship() {
+		    // This would check if the current user's context path is a prefix 
+		    // of the entity's path, indicating ancestor relationship
+		    const entityPath = this.entityBeingEdited?.path || [];
+		    const userContextPath = this.currentPath.map(item => item.id);
+		    
+		    // User is ancestor if their path is a prefix of entity path
+		    if (userContextPath.length === 0) return false;
+		    
+		    for (let i = 0; i < userContextPath.length; i++) {
+		        if (entityPath[i] !== userContextPath[i]) {
+		            return false;
+		        }
+		    }
+		    return true;
+		}
+	
+		// ✅ ADD THESE METHODS TO YOUR CLASS (NO MIGRATION LOGIC)
+
+		// Get ALL contexts for an app (array of context objects)
+		getLastViewedContext(appId) {
+		    try {
+		        return JSON.parse(localStorage.getItem(`savedContexts_${appId}`) || '[]');
+		    } catch (e) {
+		        console.error('[Context] Parse error:', e);
+		        return [];
+		    }
+		}
+
+		
+		isDataOwner() {
+		    console.log('[isDataOwner] Checking ownership...');
+		    
+		    const urlInfo = this.parseUrlForDataFetch();
+		    if (!urlInfo || !urlInfo.appId) return false;
+		    
+		    // ✅ Get current root entity ID from URL path (first segment)
+		    const currentRootId = urlInfo.pathIds?.[0];
+		    if (!currentRootId) return false; // Not at tenant level or deeper
+		    
+		    // ✅ Get ALL saved contexts for this app (array of contexts)
+		    const savedContexts = this.getLastViewedContext(urlInfo.appId);
+		    if (!savedContexts || !Array.isArray(savedContexts) || savedContexts.length === 0) {
+		        return false;
+		    }
+		    
+		    // ✅ Normalize current root ID (UUID → hash, or keep as-is)
+		    const currentNormalized = this.isRealUuid(currentRootId) 
+		        ? this.db.hashUUID(currentRootId) 
+		        : currentRootId;
+		    
+		    // ✅ Check if ANY context grants owner access for this root entity
+		    return savedContexts.some(ctx => {
+		        // Skip invalid contexts
+		        if (!ctx?.path?.[0] || !ctx.isOwnerAccess) return false;
+		        
+		        // Normalize context's root ID
+		        const ctxRootId = ctx.path[0];
+		        const ctxNormalized = this.isRealUuid(ctxRootId) 
+		            ? this.db.hashUUID(ctxRootId) 
+		            : ctxRootId;
+		        
+		        // Match if normalized IDs are equal
+		        return currentNormalized === ctxNormalized;
+		    });
+		}
+	
+	// ✅ HELPER: Detect real UUID (not hashed ID)
+	isRealUuid(id) {
+	    if (!id) return false;
+	    // Standard UUID format: 8-4-4-4-12 hex digits
+	    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+	}
+	
+	// ✅ ADD THIS NEW METHOD (handles context saving for ANY depth)
+	saveContextIfApplicable(appId, pathIds) {
+	    if (!appId || !pathIds?.length) return;
+	    
+	    // Detect real UUID in FIRST path segment (root entity)
+	    const hasRealUuidInUrl = this.isRealUuid(pathIds[0]);
+	    const currentRootId = pathIds[0];
+	    const currentNormalized = this.isRealUuid(currentRootId) 
+	        ? this.db.hashUUID(currentRootId) 
+	        : currentRootId;
+	    
+	    // Get existing contexts
+	    const existingContexts = JSON.parse(
+	        localStorage.getItem(`savedContexts_${appId}`) || '[]'
+	    );
+	    
+	    // Check for existing owner context for this root entity
+	    const existingOwnerContext = existingContexts.find(ctx => {
+	        const ctxRoot = ctx.path[0];
+	        const ctxNormalized = this.isRealUuid(ctxRoot) 
+	            ? this.db.hashUUID(ctxRoot) 
+	            : ctxRoot;
+	        return ctxNormalized === currentNormalized && ctx.isOwnerAccess;
+	    });
+	    
+	    // Save ONLY if: no existing owner context AND (non-owner OR real UUID detected)
+	    const shouldSave = !existingOwnerContext && (!isowner || hasRealUuidInUrl);
+	    
+	    if (shouldSave) {
+	        const newContext = {
+	            path: pathIds,
+	            timestamp: Date.now(),
+	            isOwnerAccess: hasRealUuidInUrl
+	        };
+	        
+	        const updated = [newContext, ...existingContexts.slice(0, 9)];
+	        localStorage.setItem(`savedContexts_${appId}`, JSON.stringify(updated));
+	        
+	        console.log('[Context] ✅ SAVED:', {appId, path: pathIds, isOwnerAccess: hasRealUuidInUrl, total: updated.length });
+	    } else if (existingOwnerContext) {
+	        console.log('[Context] ℹ️ SKIPPED - owner context exists');
+	    }
+	}
+	
+	async handleIncomingDeepLink() {
+	    const urlInfo = this.parseUrlForDataFetch();
+	    
+	    if (!urlInfo || !urlInfo.appId) {
+	        return;
+	    }
+	    
+	    if (this.currentApp?.id !== urlInfo.appId) {
+	        await this.selectApp(urlInfo.appId);
+	    }
+	    
+	    const pathDepth = urlInfo.pathIds?.length || 0;
+	    
+	    // ✅ DETECT REAL UUID IN URL (critical for owner access)
+	    const hasRealUuidInUrl = pathDepth >= 1 && this.isRealUuid(urlInfo.pathIds[0]);
+	    if (hasRealUuidInUrl) {
+	        console.log('[DeepLink] 🔑 REAL UUID DETECTED - Granting owner-like access');
+	    }
+	    
+	    console.log('[DeepLink] Path depth:', pathDepth);
+	    console.log('[DeepLink] isDataOwner():', this.isDataOwner());
+	    console.log('[DeepLink] isowner:', isowner);
+	    console.log('[DeepLink] Real UUID in URL:', hasRealUuidInUrl);
+	    
+	    // ✅ DETERMINE DATA STRATEGY
+	    let finalData = this.data;
+	    const shouldLoadFullData = (pathDepth >= 2 && this.isDataOwner()) || hasRealUuidInUrl;
+	    
+	    if (shouldLoadFullData) {
+	        console.log('[DeepLink] Loading FULL data (owner or real UUID detected)');
+	        try {
+	            const tenantId = urlInfo.pathIds[0]; // Use first path ID (real UUID or hashed)
+	            const fullData = await this.db.getAppData(this.currentApp.id, [tenantId]);
+	            
+	            if (fullData?.items?.length > 0) {
+	                finalData = fullData;
+	                console.log('[DeepLink] Full data loaded successfully');
+	            } else {
+	                console.warn('[DeepLink] Full data empty, using partial data');
+	            }
+	        } catch (error) {
+	            console.error('[DeepLink] Failed to load full data:', error);
+	        }
+	    }
+	    
+	    // ✅ BUILD PATH WITH FINAL DATA
+	    this.data = finalData;
+	    this.currentPath = [];
+
+	    if (shouldLoadFullData && finalData?.items?.length > 0) {
+	        let currentItems = finalData.items;
+	        let pathBuiltSuccessfully = true;
+	        
+	        for (let i = 0; i < pathDepth; i++) {
+	            const urlId = urlInfo.pathIds[i];
+	            const entityType = this.currentApp.hierarchy[i];
+	            
+	            if (!entityType || !currentItems) {
+	                pathBuiltSuccessfully = false;
+	                break;
+	            }
+	            
+	            // ✅ MATCH BY REAL UUID WHEN APPLICABLE
+	            const foundItem = currentItems.find(item => {
+	                if (this.isRealUuid(urlId)) {
+	                    return item.ID === urlId; // Match real UUID directly
+	                }
+	                // Standard matching for hashed IDs
+	                return item.displayID === urlId || 
+	                       (!urlId.includes('-') && item.ID.includes('-') && this.db.hashUUID(item.ID) === urlId);
+	            });
+	            
+	            if (foundItem) {
+	                this.currentPath.push({
+	                    id: foundItem.ID,
+	                    displayID: foundItem.displayID,
+	                    shortName: this.getShortName(foundItem, entityType),
+	                    entityType: entityType
+	                });
+	                
+	                const config = this.currentApp.entityConfigs[entityType];
+	                currentItems = (config?.childrenField && foundItem[config.childrenField]) || [];
+	            } else {
+	                pathBuiltSuccessfully = false;
+	                break;
+	            }
+	        }
+	        
+	        if (!pathBuiltSuccessfully) {
+	            console.warn('[DeepLink] Full data path building failed, falling back to URL path');
+	            this.currentPath = urlInfo.pathIds.map((urlId, i) => {
+	                const entityType = this.currentApp.hierarchy[i];
+	                if (!entityType) return null;
+	                return {
+	                    id: urlId,
+	                    displayID: urlId,
+	                    shortName: urlId.substring(0, 8),
+	                    entityType: entityType
+	                };
+	            }).filter(Boolean);
+	        }
+	    } else {
+	        // Build path from URL info (partial data)
+	        this.currentPath = urlInfo.pathIds.map((urlId, i) => {
+	            const entityType = this.currentApp.hierarchy[i];
+	            if (!entityType) return null;
+	            
+	            // Use real name if available at final level
+	            let shortName = urlId.substring(0, 8);
+	            if (i === pathDepth - 1 && finalData?.items?.[0]) {
+	                shortName = this.getShortName(finalData.items[0], entityType);
+	            }
+	            
+	            return {
+	                id: urlId,
+	                displayID: urlId,
+	                shortName: shortName,
+	                entityType: entityType
+	            };
+	        }).filter(Boolean);
+	    }
+	    
+	    console.log('[DeepLink] Path built successfully');
+	}
+	
+	/**
+	 * Get the viewing context for UI decisions
+	 */
+	getViewingContext() {
+	    const urlInfo = this.parseUrlForDataFetch();
+	    
+	    // ✅ CRITICAL FIX: Check if saved context grants owner access
+	    let hasContextOwnerAccess = false;
+	    
+	    // Only check context if NOT app owner (app owner always has full access)
+	    if (!isowner && this.currentApp?.id && urlInfo?.appId === this.currentApp.id) {
+	        const savedContexts = this.getLastViewedContext(this.currentApp.id);
+	        const currentRootId = urlInfo?.tenantId || urlInfo?.pathIds?.[0];
+	        
+	        if (currentRootId && savedContexts?.length > 0) {
+	            // Normalize current root ID (UUID → hash, or keep as-is)
+	            const currentNormalized = this.isRealUuid(currentRootId) 
+	                ? this.db.hashUUID(currentRootId) 
+	                : currentRootId;
+	            
+	            // Check if ANY context grants owner access for this tenant
+	            hasContextOwnerAccess = savedContexts.some(ctx => {
+	                const ctxRoot = ctx.path[0];
+	                const ctxNormalized = this.isRealUuid(ctxRoot) 
+	                    ? this.db.hashUUID(ctxRoot) 
+	                    : ctxRoot;
+	                return ctxNormalized === currentNormalized && ctx.isOwnerAccess;
+	            });
+	        }
+	    }
+	    
+	    // ✅ Determine final owner status (app owner OR context owner)
+	    const isOwnerAccess = isowner || hasContextOwnerAccess;
+	    
+	    return {
+	        isAppOwner: isOwnerAccess,      // ✅ TRUE if context grants owner access
+	        isLinkUser: !isOwnerAccess,     // ✅ FALSE if context grants owner access
+	        isTenantView: urlInfo?.tenantId != null && !urlInfo?.subtenantId,
+	        isSubtenantView: urlInfo?.subtenantId != null,
+	        tenantId: urlInfo?.tenantId,
+	        subtenantId: urlInfo?.subtenantId
+	    };
+	}
+
+
+	// Add this method to your SchemaOrchestrator class
+	updateWatermark() {
+	    const watermark = document.getElementById('watermark');
+	    if (!watermark) return;
+	    
+	    const isAtRoot = (this.currentPath.length === 0);
+	    const isMobile = window.innerWidth <= 768;
+	    const isTablet = window.innerWidth <= 1024 && window.innerWidth > 768;
+	    
+	    // Clear existing content and cleanup previous hover handlers
+	    watermark.innerHTML = '';
+	    this.cleanupWatermarkHover();
+	    
+	    if (!this.currentApp) {
+	        watermark.style.display = 'none';
+	        return;
+	    }
+	    
+	    watermark.style.display = 'block';
+	    
+	    // Get responsive font sizes
+	    const getFontSizes = () => {
+	        if (isMobile) {
+	            return { base: 12, increment: 6, max: 48 };
+	        } else if (isTablet) {
+	            return { base: 16, increment: 8, max: 64 };
+	        } else {
+	            return { base: 20, increment: 10, max: 80 };
+	        }
+	    };
+	    
+	    const sizes = getFontSizes();
+	    
+	    // ✅ MOBILE-SPECIFIC POSITIONING
+	    let watermarkPositionStyle = `
+	        position: absolute;
+	        top: 50%;
+	        left: 50%;
+	        transform: translate(-50%, -50%);
+	        text-align: left;
+	        pointer-events: none;
+	        opacity: 0.15;
+	        z-index: 1;
+	        width: 100%;
+	        padding: 0 20px;
+	        box-sizing: border-box;
+	    `;
+	    
+		if (isMobile) {
+		    const breadcrumb = document.getElementById('breadcrumb');
+		    const topOffset = breadcrumb ? (breadcrumb.offsetHeight + 20) : 100;
+		    watermarkPositionStyle = `
+		        position: absolute;
+		        top: ${topOffset}px;
+		        left: 50%;
+		        transform: translateX(-50%);
+		        text-align: center;
+		        pointer-events: none;
+		        opacity: 0.15;
+		        z-index: 1;
+		        width: 100%;
+		        padding: 0 20px;
+		        box-sizing: border-box;
+		    `;
+		}
+	    
+	    if (isAtRoot) {
+	        // Root level: App name + "items" (generic term)
+	        const entityName = this.currentApp.hierarchy[0] || 'items';
+	        const displayName = ''; //this.getEntityDisplayName(entityName) || entityName;
+	        
+	        watermark.innerHTML = `
+	            <div style="${watermarkPositionStyle}">
+	                <div style="
+	                    font-size: ${sizes.base + 4}px;
+	                    font-weight: 300;
+	                    color: #666;
+	                    margin-bottom: 8px;
+	                    letter-spacing: 1px;
+	                    line-height: 1.2;
+	                ">${this.currentApp.name}</div>
+	                <div style="
+	                    font-size: ${sizes.max}px;
+	                    font-weight: 700;
+	                    color: #999;
+	                    text-transform: uppercase;
+	                    letter-spacing: 2px;
+	                    line-height: 1.1;
+	                ">${displayName}</div>
+	            </div>
+	        `;
+	    } else {
+	        // Dynamic hierarchy levels with smart capping
+	        const pathLength = this.currentPath.length;
+	        let hierarchyItems = [];
+	        
+	        // Always show app name
+	        hierarchyItems.push({
+	            text: this.currentApp.name,
+	            level: 0,
+	            isFocus: false
+	        });
+	        
+	        if (pathLength <= 4) {
+	            // Show all levels (max 5 total including app)
+	            for (let i = 0; i < pathLength; i++) {
+	                const pathItem = this.currentPath[i];
+	                const entityType = this.currentApp.hierarchy[i] || `level_${i + 1}`;
+	                const displayName = pathItem.shortName || pathItem.displayID || 
+	                                  this.getEntityDisplayName(entityType) || entityType;
+	                
+	                hierarchyItems.push({
+	                    text: displayName,
+	                    level: i + 1,
+	                    isFocus: (i === pathLength - 1),
+	                    id: pathItem.id,
+	                    entityType: entityType
+	                });
+	            }
+	        } else {
+	            // Deep hierarchy (>4 levels): Show app + ... + last 3 levels
+	            hierarchyItems.push({
+	                text: '...',
+	                level: 1,
+	                isFocus: false,
+	                isEllipsis: true
+	            });
+	            
+	            // Show last 3 levels (second-to-last, last-1, focus)
+	            const startIdx = pathLength - 3;
+	            for (let i = startIdx; i < pathLength; i++) {
+	                const pathItem = this.currentPath[i];
+	                const entityType = this.currentApp.hierarchy[i] || `level_${i + 1}`;
+	                const displayName = pathItem.shortName || pathItem.displayID || 
+	                                  this.getEntityDisplayName(entityType) || entityType;
+	                
+	                hierarchyItems.push({
+	                    text: displayName,
+	                    level: i + 1,
+	                    isFocus: (i === pathLength - 1),
+	                    id: pathItem.id,
+	                    entityType: entityType
+	                });
+	            }
+	        }
+	        
+	        // Calculate font sizes with dramatic scaling
+	        let html = `<div style="${watermarkPositionStyle}">`;
+	        
+	        hierarchyItems.forEach((item, index) => {
+	            let fontSize;
+	            if (item.isFocus) {
+	                fontSize = sizes.max;
+	            } else {
+	                // Scale down based on distance from focus
+	                const distanceFromEnd = hierarchyItems.length - 1 - index;
+	                fontSize = Math.max(sizes.base, sizes.max - (distanceFromEnd * sizes.increment));
+	            }
+	            
+	            const fontWeight = item.isFocus ? 800 : (300 + (index * 100));
+	            const colorBrightness = item.isEllipsis ? 180 : (200 - (index * 20));
+	            const color = item.isFocus ? '#bbb' : `rgb(${colorBrightness}, ${colorBrightness}, ${colorBrightness})`;
+	            const letterSpacing = item.isFocus ? '3px' : (item.isEllipsis ? '2px' : '1px');
+	            const textTransform = item.isFocus ? 'uppercase' : 'none';
+	            const marginBottom = item.isFocus ? '0' : '6px';
+	            const maxWidth = item.isFocus ? '90%' : '80%';
+	            
+	            // Truncate long names on mobile
+	            const overflowStyle = isMobile ? 'overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' : '';
+	            
+	            // Only focused items should have pointer events for hover
+	            const pointerEvents = item.isFocus ? 'pointer-events: auto; cursor: default;' : '';
+				
+				// ✅ DETERMINE IF THIS IS THE LAST/FOCUSED ITEM
+				const isLastItem = item.isFocus; // or however you determine the last item
+				    
+			    // Add animation class if it's the last item
+			    const animationClass = isLastItem ? 'watermark-last-item' : '';
+            
+				// In updateWatermark(), for the focused item div:
+				html += `
+				    <div class='${animationClass}' style="
+				        font-size: ${fontSize}px;
+				        font-weight: ${fontWeight};
+				        color: ${color};
+				        margin-bottom: ${marginBottom};
+				        letter-spacing: ${letterSpacing};
+				        line-height: 1.2;
+				        max-width: ${maxWidth};
+				        margin-left: auto;
+				        margin-right: auto;
+				        text-transform: ${textTransform};
+				        ${overflowStyle}
+				        pointer-events: none;  /* ← disable on the big container div */
+				    "
+				    ${item.isFocus ? `data-hover-entity="${item.id}" data-entity-type="${item.entityType}"` : ''}>
+				        ${item.isFocus ? `
+				            <span style="
+				                pointer-events: auto;
+				                cursor: default;
+				                display: inline-block;  /* shrinks to text width only */
+				            ">${item.text}</span>
+				        ` : item.text}
+				    </div>
+				`;
+				
+				if (item.isFocus) {
+				    const totalPages = Math.ceil((this._dotPageItemCount || 0) / (this._dotPageSize || 30));
+				    if (totalPages > 1) {
+				        const pageNum = (this._dotPage || 0) + 1;
+				        html += `
+				            <div style="
+				                font-size: ${Math.round(sizes.max * 0.35)}px;
+				                font-weight: 900;
+				                color: #888;
+				                letter-spacing: 3px;
+				                margin-top: 4px;
+				                margin-left: auto;
+				                margin-right: auto;
+				                max-width: 90%;
+				                opacity: 0.7;
+				                text-align: ${isMobile ? 'center' : 'left'};
+				                text-transform: none;
+				                line-height: 1.2;
+				            ">${pageNum} / ${totalPages}</div>
+				        `;
+				    }
+				}
+	        });
+	        
+	        html += '</div>';
+	        watermark.innerHTML = html;
+	        
+	        // ✅ SETUP HOVER FOR FOCUSED ENTITY
+	        this.setupWatermarkEntityHover(hierarchyItems);
+	    }
+		
+
+		// Handle window resize (existing code below)
+	    
+	    // Handle window resize
+	    const handleResize = () => {
+	        this.updateWatermark();
+	    };
+	    
+	    if (this.watermarkResizeHandler) {
+	        window.removeEventListener('resize', this.watermarkResizeHandler);
+	    }
+	    
+	    this.watermarkResizeHandler = handleResize;
+	    window.addEventListener('resize', this.watermarkResizeHandler);
+	}
+	
+	// ✅ NEW METHOD: Setup subtle hover for focused entity
+	setupWatermarkEntityHover(hierarchyItems) {
+	    const watermark = document.getElementById('watermark');
+	    if (!watermark) return;
+	    
+	    // Find the focused item (last item in hierarchy)
+	    const focusedItem = hierarchyItems[hierarchyItems.length - 1];
+	    if (!focusedItem || !focusedItem.isFocus) return;
+	    
+		const focusedDiv = watermark.querySelector(`[data-hover-entity="${focusedItem.id}"]`);
+		const focusedElement = focusedDiv?.querySelector('span') || focusedDiv;
+	    if (!focusedElement) return;
+	    
+	    let hoverCard = null;
+	    let hoverTimeout = null;
+	    
+		const showHoverCard = (e) => {
+		    if (hoverCard) return;
+
+		    const entityData = this.getEntityDataForPathItem(focusedItem);
+		    if (!entityData) return;
+
+		    // Get screen position of focused element
+		    const rect = focusedElement.getBoundingClientRect();
+		    const canvasEl = document.getElementById('canvas-area');
+		    const canvasRect = canvasEl?.getBoundingClientRect() || { top: 0, left: 0 };
+
+		    hoverCard = document.createElement('div');
+		    hoverCard.style.cssText = `
+		        position: fixed;
+		        top: ${rect.bottom + 8}px;
+		        left: ${rect.left}px;
+		        background: rgba(255, 255, 255, 0.97);
+		        backdrop-filter: blur(10px);
+		        border-radius: 6px;
+		        padding: 12px 16px;
+		        min-width: 220px;
+		        max-width: 320px;
+		        font-size: 14px;
+		        color: #222;
+		        pointer-events: none;
+		        opacity: 1;
+		    `;
+
+		    const entityDataHtml = this.formatEntityDataForHover(
+		        entityData, focusedItem.text, focusedItem.entityType
+		    );
+		    hoverCard.innerHTML = entityDataHtml;
+
+		    // Append to body — escapes the watermark opacity trap
+		    document.body.appendChild(hoverCard);
+		};
+	    
+	    const hideHoverCard = () => {
+	        if (hoverCard) {
+	            hoverCard.remove();
+	            hoverCard = null;
+	        }
+	        if (hoverTimeout) {
+	            clearTimeout(hoverTimeout);
+	            hoverTimeout = null;
+	        }
+	    };
+	    
+		const handleMouseMove = (e) => {
+		    if (!focusedElement.contains(e.target)) {
+		        hideHoverCard();
+		        return;
+		    }
+		    if (hoverCard) {
+		        const rect = focusedElement.getBoundingClientRect();
+		        hoverCard.style.top = `${rect.bottom + 8}px`;
+		        hoverCard.style.left = `${rect.left}px`;
+		    }
+		};
+	    
+	    focusedElement.addEventListener('mouseenter', (e) => {
+	        hoverTimeout = setTimeout(() => {
+	            showHoverCard(e);
+	        }, 300);
+	    });
+	    
+	    focusedElement.addEventListener('mousemove', handleMouseMove);
+	    focusedElement.addEventListener('mouseleave', hideHoverCard);
+	    
+	    // Store cleanup function
+	    this.watermarkHoverCleanup = hideHoverCard;
+	}
+
+	// ✅ NEW METHOD: Cleanup hover
+	cleanupWatermarkHover() {
+	    if (this.watermarkHoverCleanup) {
+	        this.watermarkHoverCleanup();
+	        this.watermarkHoverCleanup = null;
+	    }
+	}
+
+	// ✅ NEW METHOD: Get entity data for path item
+	getEntityDataForPathItem(pathItem) {
+	    try {
+	        let currentItems = this.data.items;
+	        
+	        // Navigate through the hierarchy to find the specific entity
+	        for (let i = 0; i < this.currentPath.length; i++) {
+	            const currentPathItem = this.currentPath[i];
+	            
+	            if (i === this.currentPath.length - 1) {
+	                // This is our target entity
+	                return currentItems.find(item => item.ID === currentPathItem.id) || null;
+	            } else {
+	                // Navigate to children
+	                const parent = currentItems.find(item => item.ID === currentPathItem.id);
+	                if (!parent) return null;
+	                
+	                const entityType = this.currentApp.hierarchy[i];
+	                const config = this.currentApp.entityConfigs[entityType];
+	                const childrenField = config?.childrenField;
+	                
+	                if (!childrenField || !parent[childrenField]) return null;
+	                currentItems = parent[childrenField];
+	            }
+	        }
+	        
+	        return null;
+	    } catch (error) {
+	        console.warn('Failed to get entity data for hover:', error);
+	        return null;
+	    }
+	}
+
+	// ✅ NEW METHOD: Format entity data for hover display (minimalist style)
+	formatEntityDataForHover(entityData, displayName, entityType) {
+	    if (!entityData) return '<div>No data available</div>';
+	    
+		let html = `<div style="font-weight: bold; margin-bottom: 6px; font-size: 15px; color: #222;">${displayName}</div>`;
+	    
+	    // Get entity configuration to know which fields to show
+	    const entityConfig = this.nativeEntities?.[entityType];
+	    
+	    if (entityConfig) {
+	        // Filter fields to show (skip system fields and empty values)
+	        const fieldsToShow = entityConfig.fields
+	            .filter(field => 
+	                field.writePermission !== 'system' && 
+	                field.name !== 'ID' && 
+	                field.name !== 'displayID' &&
+	                field.name !== 'dotLabel' &&
+	                field.name !== 'timestamp' &&
+	                field.name !== 'count' &&
+	                field.name !== 'hidden' &&
+	                field.name !== 'hashed' &&
+	                entityData[field.name] !== undefined &&
+	                entityData[field.name] !== null &&
+	                entityData[field.name] !== ''
+	            )
+	            .slice(0, 3); // Limit to 3 key fields
+	        
+	        if (fieldsToShow.length > 0) {
+	            fieldsToShow.forEach(field => {
+	                const value = entityData[field.name];
+	                if (value !== undefined && value !== null && value !== '') {
+	                    // Handle different field types
+	                    let displayValue = value;
+	                    if (field.type === 'checkbox') {
+	                        displayValue = value ? 'Yes' : 'No';
+	                    }
+	                    
+						html += `<div style="margin: 3px 0; font-size: 13px; color: #555;">
+						    <span style="font-weight: 500;">${field.label}:</span> 
+						    <span style="color: #333;">${displayValue}</span>
+						</div>`;
+	                }
+	            });
+	        } else {
+	            html += '<div style="font-size: 11px; color: #888; margin-top: 4px;">No additional data</div>';
+	        }
+	    }
+	    
+	    return html;
+	}
+	
+	// Helper method to get display name for entity types
+	getEntityDisplayName(entityType) {
+	    console.log('=== DEBUG getEntityDisplayName ===');
+	    console.log('Input entityType:', entityType);
+	    console.log('Current app:', this.currentApp?.id);
+	    
+	    // Check native entities
+	    console.log('Native entities available:', !!this.nativeEntities);
+	    if (this.nativeEntities) {
+	        console.log('Native entities keys:', Object.keys(this.nativeEntities));
+	        if (this.nativeEntities[entityType]) {
+	            console.log('Found native entity:', this.nativeEntities[entityType]);
+	            console.log('Native entity name:', this.nativeEntities[entityType].name);
+	            const displayName = this.nativeEntities[entityType].name;
+	            console.log('Returning native entity name:', displayName);
+	            console.log('=== END DEBUG ===');
+	            return displayName;
+	        } else {
+	            console.log(`Native entity "${entityType}" not found`);
+	        }
+	    } else {
+	        console.log('this.nativeEntities is undefined or null');
+	    }
+	    
+	    // Check app schema
+	    console.log('Checking app schema...');
+	    if (this.currentApp?.entityConfigs?.[entityType]) {
+	        const config = this.currentApp.entityConfigs[entityType];
+	        console.log('App schema config for', entityType, ':', config);
+	        console.log('App schema config.name:', config.name);
+	        const displayName = config.name || entityType;
+	        console.log('Returning app schema name:', displayName);
+	        console.log('=== END DEBUG ===');
+	        return displayName;
+	    } else {
+	        console.log('No app schema config found for', entityType);
+	    }
+	    
+	    // Fallback
+	    console.log('Returning fallback:', entityType);
+	    console.log('=== END DEBUG ===');
+	    return entityType;
+	}
+	
+	updatePageTitle() {
+	    if (this.currentApp) {
+	        document.title = '. apps - ' + this.currentApp.name;
+	    }
+	}
+	
+	parseUrlForDataFetch() {
+	    const path = window.location.pathname;
+	    const segments = path.split('/').filter(s => s);
+
+	    // ← NEW: handle /.appId/... format
+		if (segments[0]?.startsWith('.')) {
+		    // /.apps/agnts/... format — skip 'apps' segment
+		    const dotSegment = segments[0].substring(1); // 'apps'
+		    const appId = segments[1]; // 'agnts'
+		    const pathIds = segments.slice(2);
+		    return {
+		        appId,
+		        tenantId:    pathIds[0],
+		        subtenantId: pathIds[1],
+		        pathIds,
+		        shortUrl: true
+		    };
+		}
+
+	    // existing format: /t/apps/appId/...
+	    if (segments[0] !== 't' || segments[1] !== 'apps' || !segments[2]) {
+	        return null;
+	    }
+
+	    const idSegments = segments.slice(3);
+	    return {
+	        appId:       segments[2],
+	        tenantId:    idSegments[0],
+	        subtenantId: idSegments[1],
+	        pathIds:     idSegments
+	    };
+	}
+	
+	// Add these helper methods to the SchemaOrchestrator class
+
+	// Helper to hide/show app selector button
+	hideAppSelectorButton() {
+	    const btn = document.getElementById('app-selector-btn');
+	    if (btn) btn.style.display = 'none';
+	}
+
+	showAppSelectorButton() {
+	    const btn = document.getElementById('app-selector-btn');
+	    if (btn) btn.style.display = '';
+	}
+
+	// Helper to hide/show schema button
+	hideSchemaButton() {
+	    const btn = document.getElementById('schema-btn');
+	    if (btn) btn.style.display = 'none';
+	}
+
+	showSchemaButton() {
+	    const btn = document.getElementById('schema-btn');
+	    if (btn) btn.style.display = '';
+	}
+
+
+
+	// ===== FIXED SHARE POPUP METHODS =====
+
+	showSharePopup(buttonElement) {
+	    // Close any existing popup
+	    this.closeSharePopup();
+
+	    // Get current URL
+	    const currentUrl = window.location.href;
+
+	    // Get contextual guidance text
+	    const guidanceText = this.getShareGuidanceText();
+
+	    // Create popup
+	    const popup = document.createElement('div');
+	    popup.className = 'share-popup';
+		popup.style.display = 'block'; 
+
+	    popup.innerHTML = `
+	        <button class="share-close">&times;</button>
+	        <h4>Share this link</h4>
+	        <p>${guidanceText}</p>
+	        <input type="text" class="share-link-input" value="${currentUrl}" readonly>
+	        <div class="share-actions">
+	            <button class="share-action-btn email" data-action="email">
+	                <span>📧</span> Email
+	            </button>
+	            <button class="share-action-btn whatsapp" data-action="whatsapp">
+	                <span>💬</span> WhatsApp
+	            </button>
+	            <button class="share-action-btn telegram" data-action="telegram">
+	                <span>✈️</span> Telegram
+	            </button>
+	            <button class="share-action-btn copy" data-action="copy">
+	                <span>📋</span> Copy
+	            </button>
+	        </div>
+	    `;
+
+	    // Add to body
+	    document.body.appendChild(popup);
+	    this.currentSharePopup = popup;
+
+	    // Position popup near the button with edge detection
+	    this.positionSharePopup(buttonElement, popup);
+
+	    // Add event listeners
+	    popup.querySelector('.share-close').addEventListener('click', () => {
+	        this.closeSharePopup();
+	    });
+
+	    // Copy URL when clicking input
+	    const linkInput = popup.querySelector('.share-link-input');
+	    linkInput.addEventListener('click', () => {
+	        linkInput.select();
+	        this.copyToClipboard(currentUrl);
+	    });
+
+	    const actionButtons = popup.querySelectorAll('.share-action-btn');
+	    actionButtons.forEach(btn => {
+	        btn.addEventListener('click', (e) => {
+	            const action = e.currentTarget.dataset.action;
+	            this.handleShareAction(action, currentUrl);
+	        });
+	    });
+
+	    // Close popup when clicking outside
+	    setTimeout(() => {
+	        document.addEventListener('click', this.closeSharePopupOnClickOutside);
+	    }, 100);
+	}
+
+	// CRITICAL: Position the popup correctly
+	positionSharePopup(buttonElement, popup) {
+	    if (!buttonElement) return;
+
+	    const isMobile = window.innerWidth <= 768;
+
+	    if (isMobile) {
+	        // Mobile: Center on screen
+	        popup.style.position = 'fixed';
+	        popup.style.top = '50%';
+	        popup.style.left = '50%';
+	        popup.style.transform = 'translate(-50%, -50%)';
+	        popup.style.width = '90%';
+	        popup.style.maxWidth = '350px';
+	        
+	        // Add backdrop
+	        const backdrop = document.createElement('div');
+	        backdrop.className = 'share-popup-backdrop';
+	        backdrop.addEventListener('click', () => this.closeSharePopup());
+	        document.body.appendChild(backdrop);
+	        this.currentShareBackdrop = backdrop;
+	    } else {
+	        // Desktop: Position near button
+	        const buttonRect = buttonElement.getBoundingClientRect();
+	        const popupRect = popup.getBoundingClientRect();
+	        
+	        popup.style.position = 'fixed';
+			popup.style.transform = 'none';
+	        
+	        // Calculate initial position (below and to the left of button)
+	        let top = buttonRect.bottom + 8;
+	        let left = buttonRect.left;
+	        
+	        // Adjust if popup would go off right edge
+	        if (left + popupRect.width > window.innerWidth) {
+	            left = buttonRect.right - popupRect.width;
+	        }
+	        
+	        // Adjust if popup would go off bottom edge
+	        if (top + popupRect.height > window.innerHeight) {
+	            top = buttonRect.top - popupRect.height - 8;
+	        }
+	        
+	        // Ensure popup doesn't go off left edge
+	        if (left < 10) {
+	            left = 10;
+	        }
+	        
+	        // Ensure popup doesn't go off top edge
+	        if (top < 10) {
+	            top = 10;
+	        }
+	        
+	        popup.style.top = `${top}px`;
+	        popup.style.left = `${left}px`;
+	    }
+	}
+
+
+
+
+
+	// Copy to clipboard
+	copyToClipboard(text) {
+	    if (navigator.clipboard && navigator.clipboard.writeText) {
+	        navigator.clipboard.writeText(text).then(() => {
+	            this.showCopyFeedback();
+	        });
+	    } else {
+	        // Fallback for older browsers
+	        const textarea = document.createElement('textarea');
+	        textarea.value = text;
+	        textarea.style.position = 'fixed';
+	        textarea.style.opacity = '0';
+	        document.body.appendChild(textarea);
+	        textarea.select();
+	        document.execCommand('copy');
+	        document.body.removeChild(textarea);
+	        this.showCopyFeedback();
+	    }
+	}
+
+	// Show copy feedback
+	showCopyFeedback() {
+	    const copyBtn = this.currentSharePopup?.querySelector('.share-action-btn.copy');
+	    if (copyBtn) {
+	        const originalText = copyBtn.innerHTML;
+	        copyBtn.innerHTML = '<span>✓</span> Copied!';
+	        copyBtn.style.background = '#4CAF50';
+	        copyBtn.style.color = 'white';
+	        
+	        setTimeout(() => {
+	            copyBtn.innerHTML = originalText;
+	            copyBtn.style.background = '';
+	            copyBtn.style.color = '';
+	        }, 2000);
+	    }
+	}
+
+	// Get share message (customize as needed)
+	getShareMessage() {
+	    return 'Check this out!';
+	}
+
+
+	
+	copyShareLink() {
+		const url = this.getAppUrl(this.currentPath);
+
+	    navigator.clipboard.writeText(url).then(() => alert('Link copied:\n' + url));
+	}
+	
+
+
+
+	getShareGuidanceText() {
+	    const currentDepth = this.currentPath.length;
+		
+		console.log('[getShareGuidanceText] currentpath: ' + JSON.stringify(this.currentPath));
+	    
+	    if (currentDepth === 0) {
+	        return "This is your organization's main dashboard. Share this link with team members who need full access to manage all customers and concerns.";
+	    } else if (currentDepth === 1) {
+	        // Tenant level - sharing customer support function
+	        const tenantName = this.currentPath[0]?.shortName || 'your organization';
+	        return `Share this link with people in ${tenantName} who would be handling customer support functions. They'll be able to manage all customers and concerns for this organization.`;
+	    } else if (currentDepth === 2) {
+	        // Customer level - sharing with actual customers
+	        const customerName = this.currentPath[1]?.shortName || 'your customer';
+	        return `Share this link with ${customerName} or their team members who need to report and track support concerns. They'll only see their own concerns and won't have access to other customers.`;
+	    } else if (currentDepth >= 3) {
+	        // Concern level or deeper
+	        return "Share this link with specific stakeholders who need to collaborate on this particular concern. They'll have focused access to this issue only.";
+	    }
+	    
+	    return "Share this secure link with authorized collaborators.";
+	}
+
+	handleShareAction(action, url) {
+	    switch (action) {
+	        case 'email':
+	            const subject = encodeURIComponent('Shared Support Link');
+	            const body = encodeURIComponent(`Hi,\n\nI'm sharing this support link with you: ${url}\n\nBest regards`);
+	            window.location.href = `mailto:?subject=${subject}&body=${body}`;
+	            break;
+	            
+	        case 'whatsapp':
+	            const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(url)}`;
+	            window.open(whatsappUrl, '_blank');
+	            break;
+	            
+	        case 'telegram':
+	            const telegramUrl = `https://t.me/share/url?url=${encodeURIComponent(url)}`;
+	            window.open(telegramUrl, '_blank');
+	            break;
+	            
+	        case 'copy':
+	            // Copy full URL even if displayed truncated
+	            navigator.clipboard.writeText(url).then(() => {
+	                // Show copied feedback
+	                const input = this.currentSharePopup.querySelector('.share-link-input');
+	                const originalText = input.value;
+	                input.value = '✓ Copied to clipboard!';
+	                setTimeout(() => {
+	                    input.value = originalText;
+	                }, 2000);
+	            }).catch(err => {
+	                console.error('Failed to copy: ', err);
+	                // Fallback for older browsers
+	                const input = this.currentSharePopup.querySelector('.share-link-input');
+	                input.select();
+	                document.execCommand('copy');
+	            });
+	            break;
+	    }
+	    
+	    // Close popup after action (except copy)
+	    if (action !== 'copy') {
+	        this.closeSharePopup();
+	    }
+	}
+	closeSharePopup() {
+	    if (this.currentSharePopup) {
+			    const existingBackdrop = document.querySelector('.share-popup-backdrop');
+					    
+			    if (existingBackdrop) {
+			        existingBackdrop.classList.remove('show');
+			        existingBackdrop.style.display = 'none';
+			    }
+	        this.currentSharePopup.remove();
+	        this.currentSharePopup = null;
+	        document.removeEventListener('click', this.closeSharePopupOnClickOutside);
+			
+			
+	    }
+	}
+
+	closeSharePopupOnClickOutside = (e) => {
+	    if (this.currentSharePopup && !this.currentSharePopup.contains(e.target)) {
+	        this.closeSharePopup();
+	    }
+	}
+	
+
+	
+	saveLastViewedContext(appId, pathIds) {
+	    if (!appId || !pathIds || pathIds.length === 0) return;
+	    
+	    try {
+	        // ✅ NEW FORMAT: Append to history array (max 10 entries)
+	        // Key format: savedContexts_${appId}
+	        
+	        // Determine if this is real UUID or hashed ID
+	        const hasRealUUID = pathIds.some(id => this.isRealUuid(id));
+	        
+	        // Create new context object
+	        const newContext = {
+	            path: pathIds,              // ✅ NOT pathIds
+	            timestamp: Date.now(),
+	            isOwnerAccess: hasRealUUID  // ✅ NOT isOwner
+	        };
+	        
+	        // Get existing contexts for this app
+	        const existingContexts = JSON.parse(
+	            localStorage.getItem(`savedContexts_${appId}`) || '[]'
+	        );
+	        
+	        // ✅ CRITICAL: Check if owner context already exists for this tenant
+	        const currentRootId = pathIds[0];
+	        const currentNormalized = this.isRealUuid(currentRootId) 
+	            ? this.db.hashUUID(currentRootId) 
+	            : currentRootId;
+	        
+	        const existingOwnerContext = existingContexts.find(ctx => {
+	            const ctxRoot = ctx.path[0];
+	            const ctxNormalized = this.isRealUuid(ctxRoot) 
+	                ? this.db.hashUUID(ctxRoot) 
+	                : ctxRoot;
+	            return ctxNormalized === currentNormalized && ctx.isOwnerAccess;
+	        });
+	        
+	        // ✅ ONLY save if no owner context exists for this tenant
+	        if (!existingOwnerContext) {
+	            // Prepend new context (most recent first), keep max 10
+	            const updatedContexts = [newContext, ...existingContexts.slice(0, 9)];
+	            
+	            localStorage.setItem(
+	                `savedContexts_${appId}`,
+	                JSON.stringify(updatedContexts)
+	            );
+	            
+	            console.log('[saveLastViewedContext] ✅ Context saved:', {appId, path: pathIds, isOwnerAccess: hasRealUUID, total: updatedContexts.length });
+	        } else {
+	            console.log('[saveLastViewedContext] ℹ️ Skipped - owner context already exists for this tenant');
+	        }
+	        
+	    } catch (error) {
+	        console.error('[saveLastViewedContext] Error:', error);
+	    }
+	}
+
+	redirectToLastViewedContext(targetAppId) {
+	    if (isowner) return;
+	    
+	    const context = this.getLastViewedContext(targetAppId);
+	    
+	    if (context && context.pathIds?.length > 0) {
+	        // ✅ Hash any real UUIDs (with hyphens) before putting in URL
+	        const hashedPathIds = context.pathIds.map(id => {
+	            // If ID contains hyphens, it's a real UUID - hash it
+	            if (id && id.includes('-')) {
+	                return this.db.hashUUID(id);
+	            }
+	            // Otherwise, assume it's already hashed
+	            return id;
+	        });
+	        
+	        const url = `/t/apps/${targetAppId}/${hashedPathIds.join('/')}`;
+	        window.location.href = url;
+	    }
+	}
+	
+
+	
+	async showWelcomeForm(tenant, entityType) {
+		var self = this;
+		const entitySchema = await this.getEntityConfig(entityType);
+		
+		const modal = document.getElementById('add-modal');
+		const title = document.getElementById('modal-title');
+		const form = document.getElementById('add-form');
+		
+		title.textContent = '🎉 Welcome! Create Your Profile';
+		form.innerHTML = '';
+		
+		// Add welcome message
+		const welcomeMsg = document.createElement('div');
+		welcomeMsg.style.cssText = 'background: #e8f4f8; padding: 12px; border-radius: 6px; margin-bottom: 20px; color: #2c3e50;';
+		welcomeMsg.innerHTML = '<strong>Welcome to . Apps!</strong><br>Please enter your organization details to get started.';
+		form.appendChild(welcomeMsg);
+		
+		// Create form fields for all editable fields
+		entitySchema.fields.forEach(function(field) {
+			if (field.name === 'ID') return; // Skip ID field
+			
+			const group = document.createElement('div');
+			group.className = 'form-group';
+			const label = document.createElement('label');
+			label.textContent = field.label + (field.mandatory ? ' *' : '');
+			group.appendChild(label);
+
+			let input;
+			if (field.type === 'textarea') {
+				input = document.createElement('textarea');
+			} else if (field.type === 'checkbox') {
+				const checkboxGroup = document.createElement('div');
+				checkboxGroup.className = 'checkbox-group';
+				input = document.createElement('input');
+				input.type = 'checkbox';
+				const checkboxLabel = document.createElement('label');
+				checkboxLabel.textContent = field.label;
+				checkboxGroup.appendChild(input);
+				checkboxGroup.appendChild(checkboxLabel);
+				group.innerHTML = '';
+				group.appendChild(checkboxGroup);
+				input.checked = tenant[field.name] || false;
+			} else {
+				input = document.createElement('input');
+				input.type = field.type;
+			}
+
+			input.name = field.name;
+			input.required = field.mandatory;
+			
+			// Pre-fill with existing tenant data
+			if (field.type !== 'checkbox' && tenant[field.name]) {
+				input.value = tenant[field.name];
+			}
+			
+			if (field.type !== 'checkbox') group.appendChild(input);
+			form.appendChild(group);
+		});
+
+		const buttonGroup = document.createElement('div');
+		buttonGroup.style.marginTop = '20px';
+		const submitBtn = document.createElement('button');
+		submitBtn.type = 'submit';
+		submitBtn.className = 'btn btn-primary';
+		submitBtn.textContent = 'Complete Setup & Continue';
+		buttonGroup.appendChild(submitBtn);
+		form.appendChild(buttonGroup);
+
+		form.onsubmit = async function(e) {
+			e.preventDefault();
+			await self.updateTenantProfile(tenant, entityType, form);
+		};
+		
+		modal.style.display = 'block';
+	}
+	
+	async updateTenantProfile(tenant, entityType, form) {
+		const formData = new FormData(form);
+		
+		// Update tenant with form data
+		for (let [key, value] of formData.entries()) {
+			if (key !== 'ID') {
+				tenant[key] = value;
+			}
+		}
+		
+		// Handle checkboxes
+		const checkboxes = form.querySelectorAll('input[type="checkbox"]');
+		checkboxes.forEach(cb => tenant[cb.name] = cb.checked);
+		
+		// NOW save for the first time
+		if (!this.data.items) {
+			this.data.items = [];
+		}
+		this.data.items.push(tenant);
+		
+		// Save to server
+		await this.db.saveAppData(this.currentApp.id, this.data);
+		
+		// Clean up temporary storage
+		localStorage.removeItem('pendingTenant');
+		
+		// Close modal and navigate
+		document.getElementById('add-modal').style.display = 'none';
+		
+		// Now navigate to tenant's children
+		this.navigateTo(tenant, entityType);
+	}
+
+
+
+	getCookie(name) {
+		const value = `; ${document.cookie}`;
+		const parts = value.split(`; ${name}=`);
+		if (parts.length === 2) return parts.pop().split(';').shift();
+		return null;
+	}
+
+	// Replace the setupEventListeners method in schema-orchestrator.js with this version:
+
+	// ✅ REPLACE ENTIRE METHOD (no stored reference, no entity type changes)
+	_updateShareButtonVisibility() {
+	    const shareBtn = document.getElementById('header-share-btn');
+	    if (!shareBtn) {
+	        console.error('[CRITICAL] Share button MISSING from DOM!');
+	        return;
+	    }
+	    
+	    const currentEntityType = this._getCurrentEntityType();
+	    const entityConfig = this.currentApp?.entityConfigs?.[currentEntityType] || {};
+	    
+	    if (entityConfig.disallowShareButton) {
+	        // ✅ ADD CLASS (CSS handles hiding)
+	        shareBtn.classList.add('share-hidden');
+	        shareBtn.setAttribute('aria-hidden', 'true');
+	        console.log(`[ShareBtn] HIDDEN via CLASS for ${currentEntityType}`);
+	    } else {
+	        // ✅ REMOVE CLASS (CSS allows visibility)
+	        shareBtn.classList.remove('share-hidden');
+	        shareBtn.removeAttribute('aria-hidden');
+	        console.log(`[ShareBtn] VISIBLE via CLASS for ${currentEntityType}`);
+	        
+	        // ✅ VERIFY CSS WON (critical debug)
+	        const computed = window.getComputedStyle(shareBtn);
+	        console.log(`[ShareBtn] Computed display: "${computed.display}" (should be "inline-block" or "flex")`);
+	    }
+	}
+	
+	setupEventListeners() {
+		console.log(`setupEventListeners: Starting`);
+	    const self = this;
+
+	    // Safe helper: attach event listener only if element exists
+	    function safeOn(id, event, handler) {
+	        const el = document.getElementById(id);
+	        if (!el) {
+	            console.warn(`setupEventListeners: Element #${id} not found`);
+	            return;
+	        }
+	        el.addEventListener(event, handler);
+	    }
+
+	    // Safe helper: hide element if it exists
+	    function safeHide(id) {
+	        const el = document.getElementById(id);
+	        if (!el) {
+	            console.warn(`setupEventListeners: Element #${id} not found for hide()`);
+	            return;
+	        }
+	        el.style.display = 'none';
+	    }
+	    
+		function setupMobileMenu() {
+		    const mobileMenuBtn = document.getElementById('mobile-menu-btn');
+		    const dropdown = document.getElementById('mobileDropdown');
+		    
+		    if (!mobileMenuBtn || !dropdown) {
+		        console.error('❌ Mobile menu elements not found');
+		        return false;
+		    }
+		    
+		    // Toggle dropdown on button click
+		    mobileMenuBtn.addEventListener('click', (e) => {
+		        e.stopPropagation();
+		        dropdown.classList.toggle('show');
+		    });
+		    
+		    // Close dropdown when clicking outside
+		    document.addEventListener('click', (e) => {
+		        if (!dropdown.contains(e.target) && !mobileMenuBtn.contains(e.target)) {
+		            dropdown.classList.remove('show');
+		        }
+		    });
+		    
+		    // Handle dropdown item clicks
+		    dropdown.querySelectorAll('.mobile-dropdown-item').forEach(item => {
+		        item.addEventListener('click', (e) => {
+		            e.stopPropagation();
+		            const action = item.dataset.action;
+		            dropdown.classList.remove('show');
+		            
+		            if (action === 'share') {
+		                window.app.showSharePopup(e.currentTarget);
+		            } else if (action === 'switch') {
+		                window.app?.openAppSelector?.();
+		            } else if (action === 'settings') {
+		                window.app?.openSchemaManager?.();
+		            }
+		        });
+		    });
+		    
+		    // Close dropdown on window resize (desktop view)
+		    window.addEventListener('resize', () => {
+		        if (window.innerWidth > 768) {
+		            dropdown.classList.remove('show');
+		        }
+		    });
+		    
+		    console.log('✅ Mobile menu event handlers attached');
+		    return true;
+		}
+
+		// ===== UPDATE MOBILE DROPDOWN CONTENT =====
+		function updateMobileDropdown() {
+		    const dropdown = document.getElementById('mobileDropdown');
+		    if (!dropdown) {
+		        console.error('❌ Mobile dropdown not found');
+		        return false;
+		    }
+		    
+		    const appBtn = document.getElementById('app-selector-btn');
+		    const schemaBtn = document.getElementById('schema-btn');
+		    
+		    // Build dropdown HTML with correct class names
+		    let dropdownHTML = `
+		        <button class="mobile-dropdown-item" data-action="share">
+		            <span>📤</span> Share
+		        </button>
+		    `;
+		    
+		    // Check if buttons are visible on desktop
+		    if (appBtn && (appBtn.style.display !== 'none' || getComputedStyle(appBtn).display !== 'none')) {
+		        dropdownHTML += `
+		            <button class="mobile-dropdown-item" data-action="switch">
+		                <span>🔄</span> Switch App
+		            </button>
+		        `;
+		    }
+		    
+		    if (schemaBtn && (schemaBtn.style.display !== 'none' || getComputedStyle(schemaBtn).display !== 'none')) {
+		        dropdownHTML += `
+		            <button class="mobile-dropdown-item" data-action="settings">
+		                <span>⚙️</span> Settings
+		            </button>
+		        `;
+		    }
+		    
+		    dropdown.innerHTML = dropdownHTML;
+		    
+		    // Re-attach event listeners
+		    dropdown.querySelectorAll('.mobile-dropdown-item').forEach(item => {
+		        item.onclick = (e) => {
+		            e.stopPropagation();
+		            const action = item.dataset.action;
+		            dropdown.classList.remove('show');
+		            
+		            if (action === 'share') {
+		                window.app.showSharePopup(e.currentTarget);
+		            } else if (action === 'switch') {
+		                window.app?.openAppSelector?.();
+		            } else if (action === 'settings') {
+		                window.app?.openSchemaManager?.();
+		            }
+		        };
+		    });
+		    
+		    console.log('✅ Mobile dropdown updated successfully');
+		    return true;
+		}
+
+		// ===== MAIN REORGANIZATION FUNCTION (Orchestrator) =====
+		function reorganizeHeaderButtons() {
+		    // Only run once
+		    if (document.querySelector('.header-reorganized')) {
+		        console.log('⏭️ Header already reorganized, skipping');
+		        return;
+		    }
+
+		    const actionsContainer = document.querySelector('.header-actions');
+		    if (!actionsContainer) {
+		        console.error('❌ .header-actions container not found');
+		        return;
+		    }
+
+		    // Mark as reorganized to prevent re-running
+		    actionsContainer.classList.add('header-reorganized');
+
+		    try {
+		        // ===== CLEAR ONLY DESKTOP BUTTONS (preserve mobile elements) =====
+		        const existingDesktopBtns = actionsContainer.querySelectorAll('.header-btn, .share-btn');
+		        existingDesktopBtns.forEach(btn => btn.remove());
+
+		        // ===== CREATE DESKTOP BUTTONS =====
+		        
+		        // Share button (desktop)
+		        const shareBtn = document.createElement('button');
+		        shareBtn.className = 'share-btn header-btn';
+		        shareBtn.id = 'header-share-btn';
+		        shareBtn.title = 'Share';
+				shareBtn.style.display =  'inline-flex';
+		        shareBtn.innerHTML = `
+		            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+		                <circle cx="18" cy="5" r="3"/>
+		                <circle cx="6" cy="12" r="3"/>
+		                <circle cx="18" cy="19" r="3"/>
+		                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+		                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+		            </svg>
+		        `;
+		        shareBtn.addEventListener('click', (e) => {
+		            e.stopPropagation();
+		            if (window.app?.showSharePopup) {
+		                window.app.showSharePopup(e.currentTarget);
+		            } else if (window.app?.copyShareLink) {
+		                window.app.copyShareLink();
+		            }
+		        });
+
+		        // App selector button (desktop)
+		        const appBtn = document.createElement('button');
+		        appBtn.className = 'header-btn';
+		        appBtn.id = 'app-selector-btn';
+		        appBtn.textContent = 'Switch App';
+				appBtn.style.display =  'inline-flex';
+		        appBtn.addEventListener('click', () => {
+		            if (window.app?.openAppSelector) {
+		                window.app.openAppSelector();
+		            }
+		        });
+
+		        // Settings button (desktop) - only if owner
+		        let schemaBtn = null;
+		        if (typeof isowner !== 'undefined' && isowner) {
+		            schemaBtn = document.createElement('button');
+		            schemaBtn.className = 'header-btn';
+		            schemaBtn.id = 'schema-btn';
+		            schemaBtn.textContent = 'Settings';
+					schemaBtn.style.display =  'inline-flex';
+		            schemaBtn.addEventListener('click', () => {
+		                if (window.app?.openSchemaManager) {
+		                    window.app.openSchemaManager();
+		                }
+		            });
+		        }
+
+		        // ===== APPEND DESKTOP BUTTONS =====
+	
+				actionsContainer.insertBefore(appBtn, actionsContainer.firstChild); // Adjusted to account for conditional shareBtn
+
+				if (schemaBtn) {
+				    actionsContainer.insertBefore(schemaBtn, appBtn.nextSibling);
+				}
+
+				// ✅ SET INITIAL STATE VIA CLASS (not inline style)
+				const currentEntityType = self._getCurrentEntityType();
+				const entityConfig = self.currentApp?.entityConfigs?.[currentEntityType] || {};
+				if (entityConfig.disallowShareButton) {
+				    shareBtn.classList.add('share-hidden');
+				    shareBtn.setAttribute('aria-hidden', 'true');
+				} // else: no class = visible by default
+
+				// Always insert into DOM
+				actionsContainer.insertBefore(shareBtn, actionsContainer.firstChild);
+				
+		        console.log('✅ Desktop buttons reorganized successfully');
+		        
+		        // ===== ORCHESTRATE MOBILE MENU SETUP =====
+		        console.log('🔧 Setting up mobile menu...'); 
+		        const mobileMenuSetup = setupMobileMenu();	
+		        const dropdownUpdated = updateMobileDropdown();
+		        
+		        if (mobileMenuSetup && dropdownUpdated) {
+		            console.log('🎉 Header fully initialized and ready');
+		        }
+
+		    } catch (error) {
+		        console.error('❌ Error in reorganizeHeaderButtons:', error);
+		        actionsContainer.classList.remove('header-reorganized');
+		    }
+		}
+
+
+		// ── Dot canvas scroll → paginate ──────────────────────────────
+		const dotCanvas = document.getElementById('canvas-area');
+		if (dotCanvas) {
+		    dotCanvas.addEventListener('wheel', (e) => {
+			    if (!self._dotPageItemCount) return;
+			    const totalPages = Math.ceil(self._dotPageItemCount / (self._dotPageSize || 30));
+			    if (totalPages <= 1) return; // allow normal scroll if no pagination
+
+			    const currentPage = self._dotPage || 0;
+			    const goingDown = e.deltaY > 0;
+			    const goingUp = e.deltaY < 0;
+
+			    // At boundaries — don't prevent default, don't render
+			    if (goingDown && currentPage >= totalPages - 1) return;
+			    if (goingUp && currentPage <= 0) return;
+
+			    // Only prevent default when we're actually going to paginate
+			    e.preventDefault();
+			    self._dotPage = goingDown ? currentPage + 1 : currentPage - 1;
+			    self.render();
+			}, { passive: false });
+		} else {
+		    console.warn('setupEventListeners: #canvas-area not found for wheel listener');
+		}
+
+		// ── Mobile swipe → paginate ───────────────────────────────────
+		let touchStartY = 0;
+		document.addEventListener('touchstart', (e) => {
+		    touchStartY = e.touches[0].clientY;
+		}, { passive: true });
+
+		document.addEventListener('touchend', (e) => {
+		    if (!self._dotPageItemCount) return;
+		    const totalPages = Math.ceil(self._dotPageItemCount / (self._dotPageSize || 30));
+		    if (totalPages <= 1) return;
+		    const deltaY = touchStartY - e.changedTouches[0].clientY;
+		    if (Math.abs(deltaY) < 40) return;
+		    const currentPage = self._dotPage || 0;
+		    const goingDown = deltaY > 0;
+		    if (goingDown && currentPage >= totalPages - 1) return;
+		    if (!goingDown && currentPage <= 0) return;
+		    self._dotPage = goingDown ? currentPage + 1 : currentPage - 1;
+		    self.render();
+		}, { passive: true });
+
+	    // Attach button listeners safely
+	    safeOn('close-app-selector', 'click', () => safeHide('app-selector-modal'));
+	    safeOn('close-add-modal', 'click', () => safeHide('add-modal'));
+	    safeOn('close-schema-modal', 'click', () => safeHide('schema-modal'));
+	    safeOn('close-app-schema-editor', 'click', () => safeHide('app-schema-editor-modal'));
+	    safeOn('close-entity-editor', 'click', () => safeHide('entity-editor-modal'));
+
+	    // Tabs
+	    const tabs = document.querySelectorAll('.tab');
+	    const tabContents = document.querySelectorAll('.tab-content');
+
+	    if (tabs.length === 0) {
+	        console.warn("setupEventListeners: No .tab elements found");
+	    }
+
+	    tabs.forEach(tab => {
+	        tab.addEventListener('click', e => {
+	            tabs.forEach(t => t.classList.remove('active'));
+	            tabContents.forEach(c => c.classList.remove('active'));
+
+	            const target = e.currentTarget;
+	            target.classList.add('active');
+
+	            const contentId = target.dataset.tab;
+	            if (!contentId) {
+	                console.warn("Tab clicked but no data-tab attribute found", target);
+	                return;
+	            }
+	            const panel = document.getElementById(contentId);
+	            if (!panel) {
+	                console.warn(`No tab-content found with id #${contentId}`);
+	                return;
+	            }
+	            panel.classList.add('active');
+
+				if (contentId === 'json-view' && !panel.dataset.wired) {
+				    self.exportSchemasJSON();
+				    panel.dataset.populated = 'true';
+
+				    // Export button
+				    document.getElementById('export-schemas-json').onclick = () => self.exportSchemasJSON();
+				    
+				    // Import button - triggers file selection
+				    document.getElementById('import-schemas-json').onclick = () =>
+				        document.getElementById('import-json-file').click();
+				    
+				    // ✅ File selection handler - actually imports the data
+				    document.getElementById('import-json-file').onchange = async (e) => {
+				        const file = e.target.files[0];
+				        if (file) {
+				            try {
+				                const text = await file.text();
+				                const jsonData = JSON.parse(text);
+				                await self.importSchemasJSON(jsonData);
+				                // Clear file input for next use
+				                e.target.value = '';
+				            } catch (error) {
+				                console.error('Failed to parse JSON file:', error);
+				                alert('Invalid JSON file: ' + error.message);
+				            }
+				        }
+				    };
+				    
+				    // Copy to clipboard
+				    document.getElementById('copy-json').onclick = () =>
+				        self.copyJSONToClipboard(document.getElementById('json-export').value);
+				        
+				    panel.dataset.wired = 'true'; // Mark as wired to prevent duplicate handlers
+				}
+
+	            const jsonBtnBar = document.getElementById('json-buttons');
+	            if (jsonBtnBar) jsonBtnBar.style.display = (contentId === 'json-view') ? 'flex' : 'none';
+	        });
+	    });
+		
+		// Add to constructor or initialization
+		window.addEventListener('beforeunload', () => {
+		    this.stopVersionPolling();
+		});
+
+
+
+	    // Reorganize header buttons after DOM is ready
+	    reorganizeHeaderButtons();
+	    
+	}
+
+
+	async exportSchemasJSON() {
+
+		var self = this;
+
+		const schemas = await this.db.getAppSchemas();
+
+		const nativeEntities = await this.db.getNativeEntities();
+
+
+
+		const exportData = {
+
+			appSchemas: schemas,
+
+			nativeEntities: nativeEntities,
+
+			exportDate: new Date().toISOString(),
+
+			version: "1.0"
+
+		};
+
+
+
+		const jsonString = JSON.stringify(exportData, null, 2);
+
+
+
+		// Show in JSON view tab
+
+		document.getElementById('json-export').value = jsonString;
+
+
+
+		// Switch to JSON view tab
+
+		document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+
+		document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+
+		document.querySelector('[data-tab="json-view"]').classList.add('active');
+
+		document.getElementById('json-view').classList.add('active');
+
+
+
+		// Set up copy and download handlers
+
+		document.getElementById('copy-json').onclick = function() { self.copyJSONToClipboard(jsonString); };
+
+		document.getElementById('download-json').onclick = function() { self.downloadJSON(exportData); };
+
+	}
+
+	/**
+	 * Send welcome email to new tenant
+	 */
+	async sendTenantWelcomeEmail(tenantData, appUrl) {
+		console.log('[EMAIL] sendTenantWelcomeEmail - tenantData', tenantData);
+
+		const emailConfig = this.currentApp.emailConfig?.tenantWelcome;
+		if (!emailConfig) {
+			console.error('[EMAIL] No tenant welcome email config found');
+			return;
+		}
+
+		const templateData = {
+			appName: this.currentApp.name,
+			portalName: this.currentApp.name,
+			platformName: 'newauth',
+			year: new Date().getFullYear(),
+			tenantName: tenantData.name,
+			appUrl: appUrl
+		};
+
+		const emailData = {
+			to: tenantData.contactemail,
+			subject: this.replaceTemplateVariables(emailConfig.subject, templateData),
+			htmlBody: this.getTenantEmailTemplate(tenantData, appUrl, emailConfig, templateData),
+			textBody: this.getTenantEmailText(tenantData, appUrl, emailConfig, templateData)
+		};
+
+		const rootEntityType = this.currentApp.hierarchy[0];
+		return await this.sendEmail(emailData, this.currentApp.id, rootEntityType);
+	}
+
+	/**
+	 * Send notification email to new subtenant
+	 */
+	async sendSubtenantNotificationEmail(subtenantData, parentTenantName, appUrl) {
+		const emailConfig = this.currentApp.emailConfig?.subtenantNotification;
+		if (!emailConfig) {
+			console.error('[EMAIL] No subtenant notification email config found');
+			return;
+		}
+
+		const templateData = {
+			appName: this.currentApp.name,
+			pageName: 'Feedback Page',
+			platformName: 'newauth',
+			year: new Date().getFullYear(),
+			parentName: parentTenantName,
+			subtenantName: subtenantData.name,
+			appUrl: appUrl
+		};
+
+		const emailData = {
+			to: subtenantData.contactemail,
+			subject: this.replaceTemplateVariables(emailConfig.subject, templateData),
+			htmlBody: this.getSubtenantEmailTemplate(subtenantData, parentTenantName, appUrl, emailConfig, templateData),
+			textBody: this.getSubtenantEmailText(subtenantData, parentTenantName, appUrl, emailConfig, templateData)
+		};
+
+		const leveltwoEntityType = this.currentApp.hierarchy[1];
+		return await this.sendEmail(emailData, this.currentApp.id, leveltwoEntityType);
+	}
+
+	/**
+	 * Replace template variables in strings
+	 */
+	replaceTemplateVariables(template, data) {
+		return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+			return data[key] !== undefined ? data[key] : match;
+		});
+	}
+
+	/**
+	 * Generate tenant welcome email HTML template
+	 */
+	getTenantEmailTemplate(tenantData, appUrl, config, templateData) {
+		const featuresList = config.features.map(feature =>
+			`<li style="margin-bottom: 10px;">${this.replaceTemplateVariables(feature, templateData)}</li>`
+		).join('');
+
+		return `
+	<!DOCTYPE html>
+	<html>
+	<head>
+	    <meta charset="UTF-8">
+	    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+	</head>
+	<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; background-color: #f4f4f5;">
+	    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f5; padding: 40px 20px;">
+	        <tr>
+	            <td align="center">
+	                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+	                    
+	                    <!-- Header -->
+	                    <tr>
+	                        <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center;">
+	                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
+	                                ${this.replaceTemplateVariables(config.headerTitle, templateData)}<span style="color: #ffd700;">.</span>apps
+	                            </h1>
+	                            <p style="margin: 10px 0 0 0; color: rgba(255, 255, 255, 0.9); font-size: 14px; letter-spacing: 1px; text-transform: uppercase;">
+	                                ${this.replaceTemplateVariables(config.headerSubtitle, templateData)}
+	                            </p>
+	                        </td>
+	                    </tr>
+	                    
+	                    <!-- Body -->
+	                    <tr>
+	                        <td style="padding: 40px 30px;">
+	                            <h2 style="margin: 0 0 20px 0; color: #1f2937; font-size: 22px; font-weight: 600;">
+	                                ${this.replaceTemplateVariables(config.greeting, templateData)}
+	                            </h2>
+	                            
+	                            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+	                                Hello <strong>${tenantData.name}</strong>,
+	                            </p>
+	                            
+	                            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+	                                ${this.replaceTemplateVariables(config.welcomeMessage, templateData)}
+	                            </p>
+	                            
+	                            <div style="background: linear-gradient(135deg, #f0f4ff 0%, #f5f3ff 100%); border-left: 4px solid #667eea; padding: 20px; margin: 24px 0; border-radius: 6px;">
+	                                <p style="margin: 0 0 12px 0; color: #1f2937; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">
+	                                    ${this.replaceTemplateVariables(config.portalUrlLabel, templateData)}
+	                                </p>
+	                                <a href="${appUrl}" style="color: #667eea; font-size: 16px; font-weight: 600; text-decoration: none; word-break: break-all;">
+	                                    ${appUrl}
+	                                </a>
+	                            </div>
+	                            
+	                            <h3 style="margin: 30px 0 16px 0; color: #1f2937; font-size: 18px; font-weight: 600;">
+	                                ${this.replaceTemplateVariables(config.featuresTitle, templateData)}
+	                            </h3>
+	                            
+	                            <ul style="margin: 0 0 24px 0; padding-left: 20px; color: #4b5563; font-size: 15px; line-height: 1.8;">
+	                                ${featuresList}
+	                            </ul>
+
+	                            <!-- Security Notice -->
+	                            <div style="background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); border-left: 4px solid #f59e0b; padding: 24px; margin: 30px 0; border-radius: 6px; position: relative;">
+	                                <div style="position: absolute; top: -12px; left: -12px; background: #f59e0b; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 18px;">
+	                                    🔒
+	                                </div>
+	                                <h3 style="margin: 0 0 12px 28px; color: #92400e; font-size: 16px; font-weight: 700; display: flex; align-items: center;">
+	                                    <span style="margin-right: 8px;">${this.replaceTemplateVariables(config.securityNoticeTitle, templateData)}</span>
+	                                </h3>
+	                                <p style="margin: 0 0 16px 28px; color: #78350f; font-size: 14px; line-height: 1.6;">
+	                                    ${this.replaceTemplateVariables(config.securityNoticeMessage, templateData)}
+	                                </p>
+	                                <ul style="margin: 0 0 0 28px; padding-left: 20px; color: #78350f; font-size: 14px; line-height: 1.8;">
+	                                    <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityDoShare, templateData)}</strong></li>
+	                                    <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityDoNotForward, templateData)}</strong></li>
+	                                    <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityExternalAccess, templateData)}</strong></li>
+	                                </ul>
+	                                <p style="margin: 16px 0 0 28px; color: #92400e; font-size: 13px; font-style: italic; line-height: 1.5;">
+	                                    ${this.replaceTemplateVariables(config.securityFooter, templateData)}
+	                                </p>
+	                            </div>
+	                            
+	                            <table width="100%" cellpadding="0" cellspacing="0" style="margin: 30px 0;">
+	                                <tr>
+	                                    <td align="center">
+	                                        <a href="${appUrl}" style="display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);">
+	                                            ${this.replaceTemplateVariables(config.ctaButton, templateData)}
+	                                        </a>
+	                                    </td>
+	                                </tr>
+	                            </table>
+	                            
+	                            <p style="margin: 24px 0 0 0; color: #6b7280; font-size: 14px; line-height: 1.6;">
+	                                ${this.replaceTemplateVariables(config.supportMessage, templateData)}
+	                            </p>
+	                        </td>
+	                    </tr>
+	                    
+	                    <!-- Footer -->
+	                    <tr>
+	                        <td style="background-color: #f9fafb; padding: 24px 30px; border-top: 1px solid #e5e7eb;">
+	                            <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-align: center;">
+	                                ${this.replaceTemplateVariables(config.footerText, templateData)}
+	                            </p>
+	                            <p style="margin: 0; color: #9ca3af; font-size: 12px; text-align: center;">
+	                                ${this.replaceTemplateVariables(config.footerCopyright, templateData)}
+	                            </p>
+	                        </td>
+	                    </tr>
+	                    
+	                </table>
+	            </td>
+	        </tr>
+	    </table>
+	</body>
+	</html>
+	    `.trim();
+	}
+
+	/**
+	 * Generate subtenant notification email HTML template
+	 */
+	getSubtenantEmailTemplate(subtenantData, parentTenantName, appUrl, config, templateData) {
+		const featuresList = config.features.map(feature =>
+			`<li style="margin-bottom: 10px;">${this.replaceTemplateVariables(feature, templateData)}</li>`
+		).join('');
+
+		return `
+	<!DOCTYPE html>
+	<html>
+	<head>
+	    <meta charset="UTF-8">
+	    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+	</head>
+	<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; background-color: #f4f4f5;">
+	    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f5; padding: 40px 20px;">
+	        <tr>
+	            <td align="center">
+	                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+	                    
+	                    <!-- Header -->
+	                    <tr>
+	                        <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center;">
+	                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
+	                                ${this.replaceTemplateVariables(config.headerTitle, templateData)}<span style="color: #ffd700;">.</span>apps
+	                            </h1>
+	                            <p style="margin: 10px 0 0 0; color: rgba(255, 255, 255, 0.9); font-size: 14px; letter-spacing: 1px; text-transform: uppercase;">
+	                                ${this.replaceTemplateVariables(config.headerSubtitle, templateData)}
+	                            </p>
+	                        </td>
+	                    </tr>
+	                    
+	                    <!-- Body -->
+	                    <tr>
+	                        <td style="padding: 40px 30px;">
+	                            <h2 style="margin: 0 0 20px 0; color: #1f2937; font-size: 22px; font-weight: 600;">
+	                                ${this.replaceTemplateVariables(config.greeting, templateData)}
+	                            </h2>
+	                            
+	                            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+	                                Hello <strong>${subtenantData.name}</strong>,
+	                            </p>
+	                            
+	                            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 16px; line-height: 1.6;">
+	                                ${this.replaceTemplateVariables(config.welcomeMessage, templateData)}
+	                            </p>
+	                            
+	                            <div style="background: linear-gradient(135deg, #fff7ed 0%, #fef3c7 100%); border-left: 4px solid #f59e0b; padding: 20px; margin: 24px 0; border-radius: 6px;">
+	                                <p style="margin: 0 0 8px 0; color: #92400e; font-size: 14px; font-weight: 600;">
+	                                    ${this.replaceTemplateVariables(config.importantNoteTitle, templateData)}
+	                                </p>
+	                                <p style="margin: 0; color: #78350f; font-size: 14px; line-height: 1.6;">
+	                                    ${this.replaceTemplateVariables(config.importantNoteMessage, templateData)}
+	                                </p>
+	                            </div>
+	                            
+	                            <div style="background: linear-gradient(135deg, #f0f4ff 0%, #f5f3ff 100%); border-left: 4px solid #667eea; padding: 20px; margin: 24px 0; border-radius: 6px;">
+	                                <p style="margin: 0 0 12px 0; color: #1f2937; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">
+	                                    ${this.replaceTemplateVariables(config.portalUrlLabel, templateData)}
+	                                </p>
+	                                <a href="${appUrl}" style="color: #667eea; font-size: 16px; font-weight: 600; text-decoration: none; word-break: break-all;">
+	                                    ${appUrl}
+	                                </a>
+	                            </div>
+	                            
+	                            <h3 style="margin: 30px 0 16px 0; color: #1f2937; font-size: 18px; font-weight: 600;">
+	                                ${this.replaceTemplateVariables(config.featuresTitle, templateData)}
+	                            </h3>
+	                            
+	                            <ul style="margin: 0 0 24px 0; padding-left: 20px; color: #4b5563; font-size: 15px; line-height: 1.8;">
+	                                ${featuresList}
+	                            </ul>
+	                            
+	                            <table width="100%" cellpadding="0" cellspacing="0" style="margin: 30px 0;">
+	                                <tr>
+	                                    <td align="center">
+	                                        <a href="${appUrl}" style="display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);">
+	                                            ${this.replaceTemplateVariables(config.ctaButton, templateData)}
+	                                        </a>
+	                                    </td>
+	                                </tr>
+	                            </table>
+	                            
+	                            <p style="margin: 24px 0 0 0; color: #6b7280; font-size: 14px; line-height: 1.6;">
+	                                ${this.replaceTemplateVariables(config.supportMessage, templateData)}
+	                            </p>
+	                        </td>
+	                    </tr>
+	                    
+	                    <!-- Footer -->
+	                    <tr>
+	                        <td style="background-color: #f9fafb; padding: 24px 30px; border-top: 1px solid #e5e7eb;">
+	                            <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-align: center;">
+	                                ${this.replaceTemplateVariables(config.footerText, templateData)}
+	                            </p>
+	                            <p style="margin: 0; color: #9ca3af; font-size: 12px; text-align: center;">
+	                                ${this.replaceTemplateVariables(config.footerCopyright, templateData)}
+	                            </p>
+	                        </td>
+	                    </tr>
+	                    
+	                </table>
+	            </td>
+	        </tr>
+	    </table>
+	</body>
+	</html>
+	    `.trim();
+	}
+
+	/**
+	 * Generate tenant welcome email text version
+	 */
+	getTenantEmailText(tenantData, appUrl, config, templateData) {
+		return `
+	Welcome to ${this.replaceTemplateVariables(config.headerTitle, templateData)}!
+
+	Hello ${tenantData.name},
+
+	${this.replaceTemplateVariables(config.welcomeMessage, templateData)}
+
+	Your Portal URL: ${appUrl}
+
+	${this.replaceTemplateVariables(config.featuresTitle, templateData)}
+	${config.features.map(f => `- ${this.replaceTemplateVariables(f, templateData)}`).join('\n')}
+
+	${this.replaceTemplateVariables(config.ctaButton, templateData)}: ${appUrl}
+
+	${this.replaceTemplateVariables(config.supportMessage, templateData)}
+
+	${this.replaceTemplateVariables(config.footerText, templateData)}
+	${this.replaceTemplateVariables(config.footerCopyright, templateData)}
+	    `.trim();
+	}
+
+	/**
+	 * Generate subtenant notification email text version
+	 */
+	getSubtenantEmailText(subtenantData, parentTenantName, appUrl, config, templateData) {
+		return `
+	${this.replaceTemplateVariables(config.greeting, templateData)}
+
+	Hello ${subtenantData.name},
+
+	${this.replaceTemplateVariables(config.welcomeMessage, templateData)}
+
+	Your Feedback Page URL: ${appUrl}
+
+	${this.replaceTemplateVariables(config.featuresTitle, templateData)}
+	${config.features.map(f => `- ${this.replaceTemplateVariables(f, templateData)}`).join('\n')}
+
+	${this.replaceTemplateVariables(config.ctaButton, templateData)}: ${appUrl}
+
+	${this.replaceTemplateVariables(config.supportMessage, templateData)}
+
+	${this.replaceTemplateVariables(config.footerText, templateData)}
+	${this.replaceTemplateVariables(config.footerCopyright, templateData)}
+	    `.trim();
+	}
+
+	/**
+	 * Send email via server endpoint
+	 */
+	async sendEmail(emailData, appId, entitytype) {
+	    try {
+			const url = `/newauth/api/sendappemail/${encodeURIComponent(appId)}/${encodeURIComponent(entitytype)}`;
+			     
+			     const response = await fetch(url, {
+			         method: 'POST',
+			         headers: {
+			             'Content-Type': 'application/json'
+			         },
+			         body: JSON.stringify(emailData)
+			     });
+			     
+	        
+	        if (!response.ok) {
+	            throw new Error('Failed to send email: ' + response.statusText);
+	        }
+	        
+	        const result = await response.json();
+	        console.log('Email sent successfully:', result);
+	        return result;
+	    } catch (error) {
+	        console.error('Error sending email:', error);
+	        throw error;
+	    }
+	}
+
+	/**
+	 * Helper to generate the full app URL for email
+	 */
+	getAppUrl(pathSegments) {
+	    const baseUrl = window.location.origin;
+	    const useShortUrl = window.location.pathname.startsWith('/.');  // stay in same format
+
+	    const pathIds = (pathSegments || []).map(seg =>
+	        seg.asuuid ? seg.id : (seg.displayID || this.db.hashUUID(seg.id))
+	    );
+
+	    if (useShortUrl) {
+	        // /.agnts or /.agnts/tenantId/...
+	        const base = `${baseUrl}/.${this.currentApp.id}`;
+	        return pathIds.length ? `${base}/${pathIds.join('/')}` : base;
+	    }
+
+	    // default long format
+	    const base = `${baseUrl}/t/apps/${this.currentApp.id}`;
+	    return pathIds.length ? `${base}/${pathIds.join('/')}` : base;
+	}
+
+
+	copyJSONToClipboard(jsonString) {
+
+		navigator.clipboard.writeText(jsonString).then(function() {
+
+			alert('JSON copied to clipboard!');
+
+		}).catch(function(err) {
+
+			console.error('Failed to copy JSON:', err);
+
+			// Fallback for older browsers
+
+			const textarea = document.getElementById('json-export');
+
+			textarea.select();
+
+			document.execCommand('copy');
+
+			alert('JSON copied to clipboard!');
+
+		});
+
+	}
+
+
+
+	downloadJSON(exportData) {
+
+		const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+
+		const url = URL.createObjectURL(blob);
+
+		const a = document.createElement('a');
+
+		a.href = url;
+
+		a.download = 'schemas-export-' + new Date().toISOString().slice(0, 10) + '.json';
+
+		document.body.appendChild(a);
+
+		a.click();
+
+		document.body.removeChild(a);
+
+		URL.revokeObjectURL(url);
+
+	}
+
+
+
+	// Add method to import JSON (bonus feature)
+
+	async importSchemasJSON(jsonData) {
+	    try {
+	        let hasImported = false;
+
+	        // Handle app schemas
+	        if (jsonData.appSchemas) {
+	            for (const schema of jsonData.appSchemas) {
+	                await this.db.saveAppSchema(schema);
+	            }
+	            hasImported = true;
+	        }
+
+	        // Handle native entities - check both wrapped and direct formats
+			const nativeEntities = jsonData.nativeEntities ||
+			                      (!jsonData.appSchemas && !jsonData.models && !jsonData.feedLibrary &&
+			                       typeof jsonData === 'object' && !Array.isArray(jsonData) ? jsonData : null);
+								   
+	        if (nativeEntities) {
+	            for (const [entityId, entityData] of Object.entries(nativeEntities)) {
+	                await this.db.saveNativeEntity(entityId, entityData);
+	            }
+	            hasImported = true;
+	        }
+
+	        // Handle agent reference data (models + feed library)
+	        if (jsonData.models || jsonData.feedLibrary) {
+	            await fetch('/newauth/api/saveagntreferencedata', {
+	                method: 'PUT',
+	                headers: { 'Content-Type': 'application/json' },
+	                body: JSON.stringify(jsonData)
+	            });
+	            hasImported = true;
+	        }
+
+	        if (hasImported) {
+	            alert('Schemas imported successfully!');
+	            await this.loadAppSchemas();
+				if (jsonData.nativeEntities || (!jsonData.models && !jsonData.feedLibrary)) {
+			        await this.loadNativeEntities();
+			    }
+	        } else {
+	            alert('No valid data found. Please select an app schema file or native entities file.');
+	        }
+
+	    } catch (error) {
+	        console.error('Import failed:', error);
+	        alert('Import failed: ' + error.message);
+	    }
+	}
+
+
+	getChildCount(item, entityType) {
+	    const config = this.currentApp.entityConfigs[entityType];
+	    if (!config?.childrenField) return 0;
+	    const children = item[config.childrenField];
+	    return Array.isArray(children) ? children.length : 0;
+	}
+
+
+
+	calculateDotSize(item, entityType, index) {
+	    const config = this.currentApp.entityConfigs[entityType];
+	    const sortConfig = config?.sortConfig;
+	    
+	    // Get all items at current level for normalization
+	    const currentItems = this.getItemsForCurrentLevel();
+	    
+	    // Size range configuration
+	    const MIN_SIZE = 16;
+	    const MAX_SIZE = 40;
+	    const DEFAULT_SIZE = 24;
+	    
+	    if (!sortConfig) {
+	        // Handle concerns (leaf nodes) with timestamp
+	        if (entityType === 'concern' && item.timestamp) {
+	            return this.calculateSizeByTimestamp(item.timestamp, currentItems, MIN_SIZE, MAX_SIZE);
+	        }
+	        return DEFAULT_SIZE;
+	    }
+	    
+	    if (sortConfig.type === 'count') {
+	        const childrenCount = this.getChildCount(item, entityType);
+	        return this.calculateSizeByValue(childrenCount, currentItems, entityType, MIN_SIZE, MAX_SIZE);
+	        
+	    } else if (sortConfig.type === 'aggregate' && sortConfig.aggregateField) {
+	        const aggregateValue = this.calculateAggregate(item, entityType, sortConfig);
+	        return this.calculateSizeByValue(aggregateValue, currentItems, entityType, MIN_SIZE, MAX_SIZE);
+	    }
+	    
+	    return DEFAULT_SIZE;
+	}
+
+	// ✅ NEW: Calculate size based on timestamp (exponential)
+	calculateSizeByTimestamp(timestamp, allItems, minSize, maxSize) {
+	    if (!allItems.length || !timestamp) return minSize;
+	    
+	    // Find min/max timestamps in current view
+	    const timestamps = allItems
+	        .filter(item => item.timestamp)
+	        .map(item => item.timestamp);
+	    
+	    if (timestamps.length === 0) return minSize;
+	    
+	    const minTime = Math.min(...timestamps);
+	    const maxTime = Math.max(...timestamps);
+	    const timeRange = maxTime - minTime;
+	    
+	    if (timeRange === 0) return maxSize; // All items have same timestamp
+	    
+	    // Exponential scaling: recent items get much larger
+	    const normalized = (timestamp - minTime) / timeRange; // 0 to 1
+	    const exponentialFactor = Math.pow(normalized, 0.3); // Adjust exponent (0.3 = strong emphasis on recent)
+	    
+	    return minSize + (exponentialFactor * (maxSize - minSize));
+	}
+
+	// ✅ NEW: Generic size calculation with proper normalization
+	calculateSizeByValue(value, allItems, entityType, minSize, maxSize) {
+	    if (!allItems.length || value === undefined || value === null) return minSize;
+	    
+	    // Get values for all items at this entity type
+	    let values;
+	    const config = this.currentApp.entityConfigs[entityType];
+	    const sortConfig = config?.sortConfig;
+	    
+	    if (sortConfig?.type === 'count') {
+	        values = allItems.map(item => this.getChildCount(item, entityType));
+	    } else if (sortConfig?.type === 'aggregate') {
+	        values = allItems.map(item => this.calculateAggregate(item, entityType, sortConfig));
+	    } else {
+	        return minSize;
+	    }
+	    
+	    const minValue = Math.min(...values);
+	    const maxValue = Math.max(...values);
+	    const valueRange = maxValue - minValue;
+	    
+	    if (valueRange === 0) return maxSize; // All items have same value
+	    
+	    const normalized = (value - minValue) / valueRange; // 0 to 1
+	    
+	    // For count/aggregate, use linear scaling (you can change to exponential if desired)
+	    return minSize + (normalized * (maxSize - minSize));
+	}
+
+
+	// Ensure calculateAggregate works properly
+	calculateAggregate(item, entityType, sortConfig) {
+	    const config = this.currentApp.entityConfigs[entityType];
+	    if (!config?.childrenField) return 0;
+
+	    const children = item[config.childrenField] || [];
+	    if (!Array.isArray(children) || children.length === 0) return null;
+
+	    const values = children.map(child => {
+	        const v = child[sortConfig.aggregateField];
+	        return typeof v === 'number' ? v : (parseFloat(v) || 0);
+	    });
+
+	    switch (sortConfig.aggregateFunction) {
+	        case 'sum': return values.reduce((a, b) => a + b, 0);
+	        case 'min': return Math.min(...values);
+	        case 'max': return Math.max(...values);
+	        case 'avg': return values.reduce((a, b) => a + b, 0) / values.length;
+	        default:    return children.length; // fallback to count
+	    }
+	}
+
+	async loadAppSelector() {
+	    const schemas = await this.db.getAppSchemas();
+	    if (schemas.length === 0) return;
+	    
+	    const urlInfo = this.parseUrlForDataFetch();
+	    
+	    // ✅ ROOT LEVEL: App selector mode
+	    if (!urlInfo || !urlInfo.appId) {
+	        this.currentApp = null;
+	        this.currentPath = [];
+	        this.data = {
+	            items: schemas.map(schema => ({
+	                ID: schema.id,
+	                displayID: schema.id,
+	                name: schema.name,
+	                entityType: 'app'
+	            }))
+	        };
+	        this.render();
+	        if (this.breadcrumb) this.updateBreadcrumb();
+	        if (this.watermark) this.updateWatermark();
+	        return;
+	    }
+	    
+		// ✅ APP LEVEL: Let init() handle (will show tenants for app owners)
+		if (this.currentApp?.id !== urlInfo.appId) {
+		    await this.selectApp(urlInfo.appId);
+		}
+	    
+	    if (!isowner && schemas.length < 2) {
+	        window.app.hideAppSelectorButton();
+	    }
+	}
+
+	async openAppSelector() {
+	    var self = this;
+
+	    const modal = document.getElementById('app-selector-modal');
+	    const content = document.getElementById('app-selector-content');
+	    const schemas = await this.db.getAppSchemas();
+
+	    content.innerHTML = '<div class="form-group"><label>Select Application:</label></div>';
+
+	    schemas.forEach(function(schema) {
+	        const card = document.createElement('div');
+	        card.className = 'schema-card';
+	        card.style.cursor = 'pointer';
+	        card.innerHTML = '<h3>' + schema.name + '</h3>' +
+	            '<p style="color: #666; margin-top: 8px;">' + schema.description + '</p>' +
+	            '<p style="color: #999; font-size: 13px; margin-top: 8px;">' +
+	            'Hierarchy: ' + schema.hierarchy.join(' → ') +
+	            '</p>';
+
+	        card.addEventListener('click', async function() {
+	            // ✅ UPDATE URL BEFORE SELECTING APP
+	            window.history.pushState({}, '', `/t/apps/${schema.id}`);
+	            
+	            // Select the app
+	            await self.selectApp(schema.id);
+	            
+	            // ✅ RE-RENDER EVERYTHING
+	            self.render();
+	            self.updateBreadcrumb();
+	            self.updateWatermark();
+	            
+	            // Close modal
+	            modal.style.display = 'none';
+	        });
+
+	        content.appendChild(card);
+	    });
+
+	    modal.style.display = 'block';
+	}
+
+	async selectApp(appId) {
+	    if (!appId || !appId.trim()) {
+	        console.log('No Appid, returning from selectApp');
+	        return;
+	    }
+
+	    var previousAppId = this.currentApp && this.currentApp.id;
+	    if (previousAppId && previousAppId !== appId) {
+	        window.location.href = '/t/apps/' + appId;
+	        return;
+	    }
+
+	    const schemas = await this.db.getAppSchemas();
+		console.log('[selectApp] schemas found:', schemas.length, 'looking for:', appId);
+		console.log('[selectApp] schema ids:', schemas.map(s => s.id));
+	    this.currentApp = schemas.find(function(s) { return s.id === appId; });
+
+	    // Schema not in local DB — fetch from server and cache it
+	    if (!this.currentApp) {
+	        console.log('[selectApp] Schema not cached — fetching from server');
+	        try {
+	            const res = await fetch('/newauth/api/appschemas');
+				if (res.ok) {
+				    const allSchemas   = await res.json();
+				    const serverSchema = allSchemas.find(function(s) { return s.id === appId; });
+				    if (serverSchema) {
+				        // Cache locally only — schema already exists on server, no need to POST back
+				        const cachedSchemas = await this.db.getAppSchemas();
+				        const cacheIndex = cachedSchemas.findIndex(s => s.id === appId);
+				        cacheIndex >= 0 ? cachedSchemas[cacheIndex] = serverSchema : cachedSchemas.push(serverSchema);
+				        await this.db.storage.set('app_schemas', JSON.stringify(cachedSchemas));
+				        
+				        this.currentApp = serverSchema;
+				        console.log('[selectApp] Schema cached from server:', appId);
+				    }
+				}
+	        } catch (err) {
+	            console.error('[selectApp] Server fetch failed:', err.message);
+	        }
+	    }
+
+	    if (this.currentApp) {
+	        console.log('[selectApp] App selected:', appId);
+	        this.updateWatermark();
+	        this.updatePageTitle();
+	    } else {
+	        console.error('[selectApp] Could not load schema for:', appId);
+	    }
+	}
+
+
+	hash(str) {
+
+		let hash = 0;
+
+		for (let i = 0; i < str.length; i++) {
+
+			const char = str.charCodeAt(i);
+
+			hash = ((hash << 5) - hash) + char;
+
+			hash = hash & hash;
+
+		}
+
+		return Math.abs(hash).toString(36);
+
+	}
+
+
+
+
+
+	_getCurrentEntityType() {
+	    // Safely read entityType directly from path segment
+	    if (!this.currentPath || this.currentPath.length === 0) {
+	        return this.currentApp?.type || 'app';
+	    }
+	    const lastSegment = this.currentPath[this.currentPath.length - 1];
+	    return lastSegment?.entityType || 'unknown'; // Uses actual path data
+	}
+
+
+
+	getNextEntityType() {
+
+		if (!this.currentApp) return null;
+
+		const nextIndex = this.currentPath.length;
+
+		const result = nextIndex < this.currentApp.hierarchy.length ? this.currentApp.hierarchy[nextIndex] : null;
+
+		// console.log('getNextEntityType - nextIndex:', nextIndex, 'hierarchy:', this.currentApp.hierarchy, 'result:', result);
+
+		return result;
+
+	}
+
+	// ✅ ENHANCED POPSTATE HANDLER - ADD THIS METHOD
+	setupPopstateHandler() {
+	    // Handle browser back/forward buttons
+	    window.addEventListener('popstate', (e) => {
+	        const state = e.state;
+	        
+	        if (!state) {
+	            // No state (initial page load or direct navigation)
+	            this.handleInitialState();
+	            return;
+	        }
+	        
+	        const targetDepth = state.depth || 0;
+	        const statePath = state.path || [];
+	        
+	        // Rebuild currentPath from state
+	        this.currentPath = statePath.map(pathItem => ({
+	            id: pathItem.id,
+	            displayID: pathItem.displayID || pathItem.id,
+	            hashed: pathItem.hashed || false,
+	            entityType: pathItem.entityType,
+	            shortName: pathItem.shortName || pathItem.id.substring(0, 8)
+	        }));
+	        
+	        // Re-render UI
+	        this.render();
+	        this.updateBreadcrumb();
+	    });
+	    
+	    // Handle initial page load
+	    this.handleInitialState();
+	}
+
+	// ✅ HANDLE INITIAL PAGE LOAD - ADD THIS METHOD
+	handleInitialState() {
+		
+		if (this.currentPath?.length > 0) {
+		        console.log('[handleInitialState] Path already initialized - skipping reset');
+		        return;
+		}
+		    
+	    const urlInfo = this.parseUrlForDataFetch();
+	    if (!urlInfo || !urlInfo.appId) return;
+	    
+	    // Build path from URL info
+	    this.currentPath = [];
+	    if (urlInfo.pathIds && urlInfo.pathIds.length > 0) {
+	        for (let i = 0; i < urlInfo.pathIds.length && i < this.currentApp.hierarchy.length; i++) {
+	            const pathId = urlInfo.pathIds[i];
+	            const entityType = this.currentApp.hierarchy[i];
+	            this.currentPath.push({
+	                id: pathId,
+	                displayID: pathId,
+	                hashed: true,
+	                shortName: pathId.substring(0, 8),
+	                entityType: entityType
+	            });
+	        }
+	    }
+	}
+
+	getCurrentData() {
+		let current = this.data.items;
+		for (let i = 0; i < this.currentPath.length; i++) {
+			const pathItem = this.currentPath[i];
+			const entityType = this.currentApp.hierarchy[i];
+			const config = this.currentApp.entityConfigs[entityType];
+			const self = this;
+			current = current.find(function (item) {
+				// Use the same getItemId logic to ensure consistent ID comparison
+				const itemId = self.getItemId(item, entityType);
+				return itemId === pathItem.id;
+			});
+			if (!current) return [];
+			const childrenField = config.childrenField;
+			if (!current[childrenField]) current[childrenField] = [];
+			current = current[childrenField];
+		}
+		return current;
+	}
+
+	_hasFullDataStructure() {
+	    // ✅ CRITICAL: Verify we have ROOT-LEVEL entities matching app schema
+	    if (!this.data?.items || this.data.items.length === 0) {
+	        return false;
+	    }
+	    
+	    // Get expected root entity type from app schema
+	    const expectedRootType = this.currentApp?.hierarchy?.[0];
+	    if (!expectedRootType) return false;
+	    
+	    // ✅ VALIDATE: First root item MUST match schema's root entity type
+	    // This confirms we have full app data (not partial subtree)
+	    const firstRootItem = this.data.items[0];
+	    return firstRootItem.entityType === expectedRootType;
+	}
+	
+	// ✅ CHECK IF WE HAVE FULL HIERARCHY (Browser 1 after initial load)
+	_hasFullDataStructure() {
+	    // Root level has multiple tenants OR deep level has parent with siblings
+	    return this.data?.items?.length > 1 || 
+	           (this.data?.items?.[0]?.entityType && 
+	            this.currentPath.length > 0);
+	}
+
+	// ✅ SURGICAL MERGE: Update ONLY the changed branch
+	_mergePartialIntoFullData(freshPartial, pathContext) {
+	    if (pathContext.length === 0) {
+	        // Root level update (rare for polling)
+	        this.data.items = freshPartial.items;
+	        return;
+	    }
+	    
+	    // Navigate to parent level in EXISTING full data
+	    let current = this.data.items;
+	    for (let i = 0; i < pathContext.length - 1; i++) {
+	        const entityType = this.currentApp.hierarchy[i];
+	        const childrenField = this.currentApp.entityConfigs[entityType]?.childrenField;
+	        const targetId = pathContext[i];
+	        
+	        const parent = current.find(item => 
+	            item.displayID === targetId || item.ID === targetId
+	        );
+	        if (!parent || !parent[childrenField]) return;
+	        current = parent[childrenField];
+	    }
+	    
+	    // Replace target entity with fresh version (preserves siblings!)
+	    const targetId = pathContext[pathContext.length - 1];
+	    const index = current.findIndex(item => 
+	        item.displayID === targetId || item.ID === targetId
+	    );
+	    
+	    if (index !== -1 && freshPartial.items?.[0]) {
+	        current[index] = { ...freshPartial.items[0] }; // Deep copy fresh entity
+	        console.log(`[Merge] Updated entity at path: ${pathContext.join('/')}`);
+	    }
+	}
+
+	/**
+	 * Generic method to get items for the current level
+	 * Works for any hierarchy depth (tenant/customer/concern or org/dept/team/epic/story/task)
+	 * Handles both full hierarchy data (owner view) and flattened data (link user view)
+	 */
+	getItemsForCurrentLevel() {
+	    const currentDepth = this.currentPath.length;
+	    console.log('=== DEBUG getItemsForCurrentLevel ===');
+	    console.log('currentDepth:', currentDepth);
+	    console.log('isDataOwner():', this.isDataOwner());
+	    console.log('isFilteredView:', !this.isDataOwner());
+	    
+	    if (currentDepth === 0) {
+	        console.log('Returning root level items:', this.data.items?.length || 0);
+	        console.log('=====================================');
+	        return this.data.items || [];
+	    }
+	    
+	    if (!this.data?.items || this.data.items.length === 0) {
+	        console.log('No data items available');
+	        console.log('=====================================');
+	        return [];
+	    }
+	    
+	    // ✅ Check if we're in filtered view (Browser 2)
+	    const isFilteredView = !this.isDataOwner();
+	    
+		if (isFilteredView) {
+		    // Browser 2: data.items contains the CURRENT LEVEL items
+		    
+		    const targetEntityType = this.currentApp.hierarchy[currentDepth];
+		    if (!targetEntityType) {
+		        // We're at the deepest level, return data.items as-is
+		        return this.data.items;
+		    }
+		    
+		    // Get the parent entity type (what we're viewing)
+		    const parentEntityType = this.currentApp.hierarchy[currentDepth - 1];
+		    const parentConfig = this.currentApp.entityConfigs[parentEntityType];
+		    const childrenField = parentConfig.childrenField;
+		    
+		    if (!childrenField) {
+		        return this.data.items; // No children field, return as-is
+		    }
+		    
+		    // For Browser 2 with nested data, extract children from first item
+		    const parent = this.data.items[0];
+		    if (parent && parent[childrenField]) {
+		        return parent[childrenField];
+		    } else {
+		        return this.data.items; // Fallback to direct items
+		    }
+		}
+
+	    
+	    console.log('Browser 1 - navigating nested hierarchy');
+	    console.log('Hierarchy:', this.currentApp.hierarchy);
+	    console.log('Current path:', this.currentPath.map(p => ({id: p.id, displayID: p.displayID})));
+	    
+	    // Browser 1: navigate through nested hierarchy
+	    let currentItems = this.data.items;
+	    let currentDepthIndex = 0;
+	    
+	    console.log('Initial currentItems count:', currentItems.length);
+	    if (currentItems.length > 0) {
+	        console.log('Initial currentItems first item ID/displayID:', {ID: currentItems[0].ID, displayID: currentItems[0].displayID, entityType: currentItems[0].entityType });
+	    }
+	    
+	    // Navigate TO the parent level
+	    while (currentDepthIndex < currentDepth - 1 && currentItems.length > 0) {
+	        const entityType = this.currentApp.hierarchy[currentDepthIndex];
+	        const config = this.currentApp.entityConfigs[entityType];
+	        const childrenField = config.childrenField;
+	        
+	        console.log(`Navigating level ${currentDepthIndex}:`);
+	        console.log(`  entityType: ${entityType}`);
+	        console.log(`  childrenField: ${childrenField}`);
+	        
+	        const pathItem = this.currentPath[currentDepthIndex];
+	        console.log(`  Looking for pathItem id: ${pathItem.id}, displayID: ${pathItem.displayID}`);
+	        console.log(`  Current items count: ${currentItems.length}`);
+	        
+	        // Log all current items for debugging
+	        currentItems.forEach((item, idx) => {
+	            console.log(`    Item ${idx}: ID=${item.ID}, displayID=${item.displayID}`);
+	        });
+	        
+	        const foundItem = currentItems.find(item => 
+	            item.ID === pathItem.id || item.displayID === pathItem.id
+	        );
+	        
+	        if (!foundItem) {
+	            console.log('❌ Item NOT FOUND at level', currentDepthIndex);
+	            console.log('=====================================');
+	            return [];
+	        }
+	        
+	        console.log('✅ Found item at level', currentDepthIndex, ':', {ID: foundItem.ID,  displayID: foundItem.displayID   });
+	        
+	        // Move to next level
+	        if (!foundItem[childrenField]) {
+	            console.log(`❌ No children field "${childrenField}" on found item`);
+	            console.log('Available fields:', Object.keys(foundItem));
+	            console.log('=====================================');
+	            return [];
+	        }
+	        
+	        currentItems = foundItem[childrenField] || [];
+	        currentDepthIndex++;
+	        console.log(`Moved to next level - new currentItems count: ${currentItems.length}`);
+	    }
+	    
+	    // Now currentItems contains the PARENT LEVEL items
+	    console.log('Reached parent level navigation complete');
+	    console.log('Parent level currentItems count:', currentItems.length);
+	    
+	    const parentEntityType = this.currentApp.hierarchy[currentDepth - 1];
+	    const parentConfig = this.currentApp.entityConfigs[parentEntityType];
+	    const childrenField = parentConfig.childrenField;
+	    
+	    console.log('Looking for parent:');
+	    console.log('  parentEntityType:', parentEntityType);
+	    console.log('  childrenField:', childrenField);
+	    
+	    const parentPathItem = this.currentPath[currentDepth - 1];
+	    console.log('  parentPathItem id:', parentPathItem.id);
+	    console.log('  parentPathItem displayID:', parentPathItem.displayID);
+	    
+	    if (currentItems.length > 0) {
+	        console.log('Parent level items:');
+	        currentItems.forEach((item, idx) => {
+	            console.log(`  Item ${idx}: ID=${item.ID}, displayID=${item.displayID}`);
+	        });
+	    }
+	    
+	    const parent = currentItems.find(item => 
+	        item.ID === parentPathItem.id || item.displayID === parentPathItem.id
+	    );
+	    
+	    if (!parent) {
+	        console.log('❌ PARENT NOT FOUND in parent level items');
+	        console.log('=====================================');
+	        return [];
+	    }
+	    
+	    console.log('✅ Parent found:', {
+	        ID: parent.ID,
+	        displayID: parent.displayID
+	    });
+	    
+	    if (!parent[childrenField]) {
+	        console.log(`❌ Parent has no children field "${childrenField}"`);
+	        console.log('Parent fields:', Object.keys(parent));
+	        console.log('=====================================');
+	        return [];
+	    }
+	    
+	    console.log('✅ Returning children:', parent[childrenField].length, 'items');
+	    if (parent[childrenField].length > 0) {
+	        console.log('First child:', parent[childrenField][0]);
+	    }
+	    console.log('=====================================');
+	    return parent[childrenField];
+	}   
+
+	/**
+	 * Navigate through the full hierarchy structure to find children at current path
+	 * Returns null if navigation fails (indicates we should try flattened structure)
+	 */
+	navigateHierarchy() {
+	    console.log('  [navigateHierarchy] START');
+	    console.log('  [navigateHierarchy] Data items count:', this.data.items.length);
+	    console.log('  [navigateHierarchy] Path length to navigate:', this.currentPath.length);
+	    
+	    let currentLevel = this.data.items;
+	    
+	    // Navigate down the path
+	    for (let i = 0; i < this.currentPath.length; i++) {
+	        const pathItem = this.currentPath[i];
+	        const entityType = this.currentApp.hierarchy[i];
+	        const config = this.currentApp.entityConfigs[entityType];
+	        
+	        console.log(`  [navigateHierarchy] Level ${i}: Looking for ${entityType} with ID:`, pathItem.id);
+	        console.log(`  [navigateHierarchy] Level ${i}: Current level has ${currentLevel.length} items`);
+	        
+			console.log(`  [navigateHierarchy] Level ${i}: Path item ID:`, pathItem.id);
+			console.log(`  [navigateHierarchy] Path item displayID:`, pathItem.displayID);
+			console.log(`  [navigateHierarchy] Current level items:`);
+			currentLevel.forEach((item, idx) => {
+			    console.log(`    Item ${idx}: ID=${item.ID}, displayID=${item.displayID}`);
+			});
+	        // Find the specific item at this level
+	        const foundItem = currentLevel.find(item => {
+	            const itemId = this.getItemId(item, entityType);
+	            const itemDisplayId = item.displayID;
+	            
+	            // Try matching both real ID and display ID
+	            const matchesRealId = itemId === pathItem.id;
+	            const matchesDisplayId = itemDisplayId === pathItem.id;
+	            const matches = matchesRealId || matchesDisplayId;
+	            
+	            console.log(`    [navigateHierarchy] Checking item:`);
+	            console.log(`     [navigateHierarchy] Real ID: ${itemId} === ${pathItem.id}? ${matchesRealId}`);
+	            console.log(`     [navigateHierarchy] Display ID: ${itemDisplayId} === ${pathItem.id}? ${matchesDisplayId}`);
+	            console.log(`    [navigateHierarchy]  Match: ${matches}`);
+	            
+	            return matches;
+	        });
+	        
+	        if (!foundItem) {
+	            console.error(`  [navigateHierarchy] ❌ Item NOT FOUND at level ${i} for ID:`, pathItem.id);
+	            console.log(`  [navigateHierarchy] Available items:`, currentLevel.map(item => ({realId: this.getItemId(item, entityType), displayId: item.displayID })));
+	            return null; // Navigation failed - hierarchy doesn't exist
+	        }
+	        
+	        console.log(`  [navigateHierarchy] ✅ Found item at level ${i}:`, {ID: foundItem.ID, displayID: foundItem.displayID, keys: Object.keys(foundItem) });
+	        
+	        // If this is the last level in our path, get its children
+	        if (i === this.currentPath.length - 1) {
+	            const childrenField = config.childrenField;
+	            console.log(`  [navigateHierarchy] FINAL LEVEL - Looking for children in field:`, childrenField);
+	            
+	            if (!childrenField) {
+	                console.error('  [navigateHierarchy] ❌ No children field at final level');
+	                return [];
+	            }
+	            
+	            const children = foundItem[childrenField] || [];
+	            console.log(`  [navigateHierarchy] ✅ FINAL RESULT: Found ${children.length} children`);
+	            if (children.length > 0) {
+	                console.log('  [navigateHierarchy] First child:', children[0]);
+	            }
+	            return children;
+	        }
+	        
+	        // Move to next level
+	        const childrenField = config.childrenField;
+	        console.log(`  [navigateHierarchy] Moving to next level via field:`, childrenField);
+	        
+	        if (!foundItem[childrenField]) {
+	            console.error(`  [navigateHierarchy] ❌ No children field "${childrenField}" at level ${i}`);
+	            console.log(`  [navigateHierarchy] Available fields:`, Object.keys(foundItem));
+	            return null;
+	        }
+	        
+	        currentLevel = foundItem[childrenField];
+	        console.log(`  [navigateHierarchy] Next level has ${currentLevel.length} items`);
+	    }
+	    
+	    console.warn('  [navigateHierarchy] ⚠️ Unexpected: Loop completed without returning');
+	    return null;
+	}
+
+
+	async getEntityConfig(entityType) {
+
+		const entities = await this.db.getNativeEntities();
+
+		return entities[entityType];
+
+	}
+
+
+
+	getItemId(item, entityType) {
+	    const config = this.currentApp.entityConfigs[entityType];
+
+	    // If we previously hashed it, return the exact same hash we stored
+	    if (item.hashed && item.ID) return item.ID;
+
+	    // Otherwise fall back to the configured field
+	    return item[config.idField];
+	}
+
+
+
+	hashCode(str) {
+	    let hash = 0;
+	    if (!str || str.length === 0) return hash;
+	    
+	    for (let i = 0; i < str.length; i++) {
+	        const char = str.charCodeAt(i);
+	        hash = ((hash << 5) - hash) + char;
+	        hash = hash & hash; // Convert to 32bit integer
+	    }
+	    return Math.abs(hash);
+	}
+
+	generateDotPositions(items, entityType, margin) {
+	    if (!items?.length) return [];
+
+	    const canvas = document.getElementById('canvas-area');
+	    if (!canvas) return [];
+
+		const W = canvas.offsetWidth;
+		const H = canvas.offsetHeight;
+
+	    const fnv32 = (str, seed = 0x811c9dc5) => {
+	        let h = seed;
+	        for (let i = 0; i < str.length; i++) {
+	            h ^= str.charCodeAt(i);
+	            h = (h * 0x01000193) >>> 0;
+	        }
+	        return h;
+	    };
+
+	    // Mix in index with a large prime so sequential IDs scatter
+	    const positions = items.map((item, i) => {
+	        const seed = item.ID || item.displayname || item.displayID || item.name || `item_${i}`;
+
+	        // XOR index * large prime into both hashes before hashing the string
+	        // This ensures test-customer-0 and test-customer-1 land far apart
+	        const indexMix = (i * 2654435761) >>> 0; // Knuth multiplicative hash
+	        
+	        const hx = fnv32(seed, (0x811c9dc5 ^ indexMix) >>> 0);
+	        const hy = fnv32(seed, (0x33333333 ^ indexMix) >>> 0);
+
+	        return {
+	            x: margin + (hx / 0xFFFFFFFF) * (W - margin * 2),
+	            y: margin + (hy / 0xFFFFFFFF) * (H - margin * 2)
+	        };
+	    });
+
+	    return positions;
+	}
+	
+	_repelPositions(positions, dotSizes, canvasWidth, canvasHeight, margin, centerObstacle) {
+	    const ITERS = 40;  // up from 15 — clusters need more passes to spread
+
+		const bounds = {
+		    minX: margin, maxX: canvasWidth - margin,
+		    minY: margin, maxY: canvasHeight - margin
+		};
+
+	    const maxDot = Math.max(...dotSizes, 20);
+	    const cellSize = maxDot * 2 + 20;  // wider cells — catches more neighbors per pass
+
+	    for (let pass = 0; pass < ITERS; pass++) {
+
+	        // Rebuild grid each pass
+	        const grid = new Map();
+	        positions.forEach((pos, i) => {
+	            const cx = Math.floor(pos.x / cellSize);
+	            const cy = Math.floor(pos.y / cellSize);
+	            const key = `${cx},${cy}`;
+	            if (!grid.has(key)) grid.set(key, []);
+	            grid.get(key).push(i);
+	        });
+
+	        for (let i = 0; i < positions.length; i++) {
+	            const cx = Math.floor(positions[i].x / cellSize);
+	            const cy = Math.floor(positions[i].y / cellSize);
+
+	            for (let dcx = -1; dcx <= 1; dcx++) {
+	                for (let dcy = -1; dcy <= 1; dcy++) {
+	                    const neighbors = grid.get(`${cx + dcx},${cy + dcy}`);
+	                    if (!neighbors) continue;
+
+	                    for (const j of neighbors) {
+	                        if (j <= i) continue;
+
+	                        // ── Generous padding so dots breathe ──────
+	                        const minDist = (dotSizes[i] + dotSizes[j]) / 2 + 16;
+	                        const dx = positions[j].x - positions[i].x;
+	                        const dy = positions[j].y - positions[i].y;
+	                        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+
+	                        if (dist < minDist) {
+	                            // ── Stronger push per iteration ────────
+	                            const push = (minDist - dist) * 0.6;
+	                            const nx = dx / dist;
+	                            const ny = dy / dist;
+	                            positions[i].x -= nx * push;
+	                            positions[i].y -= ny * push;
+	                            positions[j].x += nx * push;
+	                            positions[j].y += ny * push;
+	                        }
+	                    }
+	                }
+	            }
+
+	            // Clamp after each dot
+	            const r = dotSizes[i] / 2;
+	            positions[i].x = Math.max(bounds.minX + r, Math.min(bounds.maxX - r, positions[i].x));
+	            positions[i].y = Math.max(bounds.minY + r, Math.min(bounds.maxY - r, positions[i].y));
+	        }
+			
+			// ── Center obstacle repulsion ─────────────────────────
+			if (centerObstacle) {
+			    for (let i = 0; i < positions.length; i++) {
+			        const dx = positions[i].x - centerObstacle.x;
+			        const dy = positions[i].y - centerObstacle.y;
+			        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+			        const minDist = centerObstacle.r + dotSizes[i] / 2;
+
+			        if (dist < minDist) {
+			            const push = (minDist - dist) * 0.8; // slightly stronger than dot-dot
+			            const nx = dx / dist;
+			            const ny = dy / dist;
+			            positions[i].x += nx * push;
+			            positions[i].y += ny * push;
+
+			            // Clamp after center push
+			            const r = dotSizes[i] / 2;
+			            positions[i].x = Math.max(margin + r, Math.min(canvasWidth  - margin - r, positions[i].x));
+			            positions[i].y = Math.max(margin + r, Math.min(canvasHeight - margin - r, positions[i].y));
+			        }
+			    }
+			}
+	    }
+
+	    return positions;
+	}
+
+	_resolveDotColor(item, entityType) {
+	    const entityConfig = this.currentApp?.entityConfigs?.[entityType];
+
+	    // ── Priority 1: Fixed hex color on entity config ──────────────
+	    if (entityConfig?.color && typeof entityConfig.color === 'string' && entityConfig.color.startsWith('#')) {
+	        return entityConfig.color;
+	    }
+
+	    // ── Priority 2: Urgency mode — caller handles this via tier ───
+	    // (urgencyMode colors are applied in the dot loop, not here)
+	    // Return null so the loop knows to use urgency palette instead
+	    if (entityConfig?.sortConfig?.urgencyMode) {
+	        return null;
+	    }
+
+	    // ── Priority 3: color = true → hash from entity type name ─────
+	    if (entityConfig?.color === true) {
+	        return this._colorFromHash(entityType);
+	    }
+
+	    // ── Priority 4: Instance hash, stored permanently on item ──────
+	    if (!item._dotColor) {
+	        const seed = item.ID || item.name || item.displayID || item.displayname || 'unknown';
+	        item._dotColor = this._colorFromHash(seed);
+	    }
+	    return item._dotColor;
+	}
+
+	_colorFromHash(str) {
+	    // FNV32 for good distribution
+	    let h = 0x811c9dc5;
+	    for (let i = 0; i < str.length; i++) {
+	        h ^= str.charCodeAt(i);
+	        h = (h * 0x01000193) >>> 0;
+	    }
+	    const hue = h % 360;
+	    return `hsl(${hue}, 65%, 50%)`;
+	}
+	
+	
+
+	async render() {
+	    const self = this;
+	    console.log('=== RENDER START ===');
+		
+		document.getElementById('context-bar')?.remove();
+
+	    const canvas = document.getElementById('canvas-area');
+	    if (!canvas) { console.error('[Render] No canvas'); return; }
+
+	    const rect = canvas.getBoundingClientRect();
+	    if (rect.width === 0 || rect.height === 0) { console.error('[Render] Zero dimensions'); return; }
+
+	    // ── Entity selector mode ──────────────────────────────────────
+	    const isEntitySelectorMode = (
+	        (!this.currentApp && this.data?.items?.some?.(item => item.entityType === 'app')) ||
+	        (this.currentApp && this.currentPath.length === 0 && this.data?.items?.length > 0 && !this.data.items[0].entityType)
+	    );
+	    if (isEntitySelectorMode) { this.renderEntitySelector(); return; }
+
+	    if (!this.currentApp) {
+	        canvas.innerHTML = '<div class="loading">Please select an application to continue</div>';
+	        return;
+	    }
+
+	    // ── Guards (unchanged) ────────────────────────────────────────
+	    const urlInfo = this.parseUrlForDataFetch();
+	    const isAtRootApp = urlInfo && !urlInfo.tenantId && !urlInfo.subtenantId;
+	    const hasSavedContext = !isowner && isAtRootApp && this.hasSavedContextForApp(urlInfo?.appId);
+	    if (!isowner && isAtRootApp && !hasSavedContext && this.data.items.length === 0) {
+	        this.showCreateTenantOption();
+	        return;
+	    }
+
+		// ── Animate out existing foreground dots ──────────────────
+		const existingForeground = canvas.querySelectorAll('.dot:not(.dot-bg)');
+		if (existingForeground.length > 0) {
+		    existingForeground.forEach(d => {
+		        d.classList.remove('dot-fade-in');
+		        d.classList.add('dot-exit');
+		    });
+		    await new Promise(resolve => setTimeout(resolve, 180));
+		}
+		
+	    canvas.innerHTML = '';
+
+	    // ── Center zone / add button (unchanged) ──────────────────────
+	    const nextEntityType = this.getNextEntityType();
+	    const centerZone = document.createElement('div');
+	    centerZone.className = 'center-zone';
+
+	    if (nextEntityType) {
+	        let hoverText;
+	        const currentDepth = this.currentPath.length;
+	        if (currentDepth === 0) {
+	            const firstEntity = this.currentApp.hierarchy?.[0];
+	            hoverText = firstEntity ? `Create new ${firstEntity.charAt(0).toUpperCase()}${firstEntity.slice(1)}` : 'Create new item';
+	        } else if (currentDepth < this.currentApp.hierarchy.length) {
+	            const childEntity = this.currentApp.hierarchy[currentDepth];
+	            hoverText = `Add new ${childEntity.charAt(0).toUpperCase()}${childEntity.slice(1)}`;
+	        } else {
+	            hoverText = 'Add new item';
+	        }
+	        const addBtn = self._createAddButton(() => self.openAddDialog());
+	        addBtn.style.left = `${rect.width / 2}px`;
+	        addBtn.style.top  = `${rect.height / 2}px`;
+	        addBtn.querySelector('.orb-add-btn').setAttribute('title', hoverText);
+	        canvas.appendChild(addBtn);
+	    } else {
+	        const maxLabel = document.createElement('div');
+	        maxLabel.style.cssText = 'font-size: 14px; color: #999; text-align: center;';
+	        maxLabel.textContent = 'Maximum nesting level reached';
+	        centerZone.appendChild(maxLabel);
+	    }
+	    canvas.appendChild(centerZone);
+
+	    // ── Item resolution (unchanged) ───────────────────────────────
+	    let items = [];
+	    const pathDepth = this.currentPath.length;
+
+	    if (pathDepth === 0) {
+	        items = this.data?.items || [];
+	    } else if (pathDepth >= 1 && this.data?.items?.length > 0) {
+	        const firstItem = this.data.items[0];
+	        const lastPathEntity = this.currentPath[pathDepth - 1];
+	        const isPartialResponse =
+	            firstItem.entityType === lastPathEntity.entityType &&
+	            firstItem.displayID === lastPathEntity.displayID;
+
+	        if (isPartialResponse) {
+	            const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
+	            const config = this.currentApp.entityConfigs[currentEntityType];
+	            if (config?.childrenField) items = firstItem[config.childrenField] || [];
+	        } else {
+	            let currentItems = this.data.items;
+	            let currentEntity = null;
+	            for (let i = 0; i < pathDepth; i++) {
+	                const pathItem = this.currentPath[i];
+	                const entityType = this.currentApp.hierarchy[i];
+	                currentEntity = currentItems.find(item =>
+	                    item.ID === pathItem.id ||
+	                    item.displayID === pathItem.displayID ||
+	                    (!pathItem.id.includes('-') && item.ID.includes('-') && this.db.hashUUID(item.ID) === pathItem.id)
+	                );
+	                if (!currentEntity) break;
+	                if (i < pathDepth - 1) {
+	                    const config = this.currentApp.entityConfigs[entityType];
+	                    currentItems = currentEntity[config.childrenField] || [];
+	                }
+	            }
+	            if (currentEntity) {
+	                const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
+	                const config = this.currentApp.entityConfigs[currentEntityType];
+	                if (config?.childrenField) items = currentEntity[config.childrenField] || [];
+	            }
+	        }
+	    }
+
+	    // ── Stress test (unchanged flag) ─────────────────────────────
+	    const STRESS_TEST = false;
+	    const STRESS_TEST_COUNT = 80;
+	    if (STRESS_TEST) items = this._generateStressTestItems(STRESS_TEST_COUNT);
+		const PAGE_SIZE = 30;
+		const SOFT_BAND = 5;
+
+	    // ── Search filter (unchanged) ─────────────────────────────────
+	    items = this.searchResults
+	        ? items.filter(item => this.shouldShowItemInSearch(item) !== 'hide')
+	        : items;
+
+	    const entityType = this.currentApp.hierarchy[this.currentPath.length] || this.currentApp.hierarchy[0];
+
+	    if (!Array.isArray(items) || items.length === 0) {
+	        const noDataBox = document.createElement('div');
+	        noDataBox.style.cssText = 'position:absolute;left:50%;bottom:40px;transform:translateX(-50%);text-align:center;color:#999;font-size:16px;';
+	        noDataBox.innerHTML = `<div style="margin-bottom:8px;">📊 No ${nextEntityType?.replace(/_/g, ' ') ?? 'item'} to track yet.</div><div style="font-size:14px;">Use the + button to add ${nextEntityType?.replace(/_/g, ' ') ?? 'item'}s</div>`;
+	        canvas.appendChild(noDataBox);
+			this.updateWatermark();
+
+	        return;
+	    }
+
+		// ── Visual scores ─────────────────────────────────────────────
+		// Full scores for ALL items — used for ranking only
+		const visualScores = this.calculateVisualScores(items, entityType);
+		this.renderContextBar(items, entityType, visualScores);
+
+		const { engagementScores, agesInMs, safeHits,
+		        rawValues, isIncomplete, alertThresholdField,
+		        alertDirection, scoreField } = visualScores;
+
+		// ── Ranking — uses full-set engagement scores ─────────────────
+
+		
+		this._dotPageSize = PAGE_SIZE; // store for listeners
+		
+		if (this._dotPageItemCount !== items.length) {
+		    this._dotPage = 0;
+		    this._dotPageItemCount = items.length;
+		}
+		const pageStart = this._dotPage * PAGE_SIZE;
+		const pageEnd   = Math.min(pageStart + PAGE_SIZE, items.length);
+
+		const rankOf = new Array(items.length);
+		const sortedIndices = items.map((_, i) => i)
+		    .sort((a, b) => engagementScores[b] - engagementScores[a]);
+		sortedIndices.forEach((itemIdx, rank) => { rankOf[itemIdx] = rank; });
+
+		// ── Page-relative scores — used for sizing/color of foreground ─
+		// Extracting just the foreground items and rescoring them means
+		// the top dot on page 3 gets a large dot, not a tiny one
+		const foregroundIndices = sortedIndices.slice(pageStart, pageEnd);
+		const foregroundItems   = foregroundIndices.map(idx => items[idx]);
+		const pageScores        = this.calculateVisualScores(foregroundItems, entityType);
+
+		// Map: original item index → page-relative score index
+		const pageScoreIndexOf = new Map();
+		foregroundIndices.forEach((originalIdx, pageIdx) => {
+		    pageScoreIndexOf.set(originalIdx, pageIdx);
+		});
+		
+		const margin = Math.min(70, rect.width * 0.08);
+
+		// ── Positions for ALL items ───────────────────────────────────
+		const positions = this.generateDotPositions(items, entityType,margin);
+
+		// Repel using page dotSizes for foreground, small fixed size for background
+		const allDotSizes = items.map((_, i) => {
+		    const pageIdx = pageScoreIndexOf.get(i);
+		    if (pageIdx !== undefined) return pageScores.dotSizes[pageIdx]; // foreground
+		    return 5; // background placeholder — just needs to not be zero
+		});
+		const centerX = rect.width / 2;
+		const centerY = rect.height / 2;
+		const CENTER_CLEAR_RADIUS = 80; // px of breathing room around the + button
+
+		this._repelPositions(positions, allDotSizes, rect.width, rect.height, margin, { 
+		    x: centerX, 
+		    y: centerY, 
+		    r: CENTER_CLEAR_RADIUS 
+		});
+
+		// ── Sort config for urgency ───────────────────────────────────
+		const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+		const useUrgencyColors = !!sortConfig?.urgencyMode;
+		const effectiveInvert  = sortConfig?.invertScore && !this._contextBarFlipped;
+
+		const urgencyPalette = {
+		    top:      effectiveInvert ? '#e53935' : '#2e7d32',
+		    upperMid: effectiveInvert ? '#ffa726' : '#66bb6a',
+		    lowerMid: effectiveInvert ? '#66bb6a' : '#ffa726',
+		    bottom:   effectiveInvert ? '#2e7d32' : '#e53935'
+		};
+
+		// Tier thresholds from PAGE scores (not full set)
+		// This is what makes foreground dots show contrast relative to each other
+		const pageSortedEng = [...pageScores.engagementScores].sort((a, b) => a - b);
+		const pageLen = pageSortedEng.length;
+		const tier1 = pageSortedEng[Math.floor(pageLen * 0.75)] ?? 0;
+		const tier2 = pageSortedEng[Math.floor(pageLen * 0.50)] ?? 0;
+		const tier3 = pageSortedEng[Math.floor(pageLen * 0.25)] ?? 0;
+		const applyTiers = foregroundItems.length >= 2;
+
+		const totalAnimationMs = 600;
+		const delayPerDot = Math.min(30, totalAnimationMs / items.length);
+
+	    // ── Dot loop — ALL items ──────────────────────────────────────
+		items.forEach((item, index) => {
+		    if (!positions[index]) return;
+
+		    const rank = rankOf[index];
+		    const isForeground = rank >= pageStart && rank < pageEnd;
+		    const isSoftBand   = !isForeground && (
+		        (rank >= pageStart - SOFT_BAND && rank < pageStart) ||
+		        (rank >= pageEnd && rank < pageEnd + SOFT_BAND)
+		    );
+		    const isBackground = !isForeground && !isSoftBand;
+
+		    try {
+		        const dot = document.createElement('div');
+		        const pos = positions[index];
+				const totalItems = items.length;
+				const bgOpacity = 0.65 - (index / totalItems) * 0.45; // rank 31 → ~0.61, rank 250 → ~0.20
+
+		        // ── BACKGROUND ────────────────────────────────────────
+		        if (isBackground) {
+		            const BG_SIZE = 5;
+		            Object.assign(dot.style, {
+		                position:        'absolute',
+		                left:            `${pos.x - BG_SIZE / 2}px`,
+		                top:             `${pos.y - BG_SIZE / 2}px`,
+		                width:           `${BG_SIZE}px`,
+		                height:          `${BG_SIZE}px`,
+		                borderRadius:    '50%',
+		                backgroundColor: '#b0b0b0',
+						opacity:         bgOpacity.toFixed(2),
+		                opacity:         '0.6',
+		                pointerEvents:   'auto',
+		                cursor:          'pointer',
+		                zIndex:          '1'
+		            });
+		            dot.addEventListener('click', (e) => {
+		                e.stopPropagation();
+		                this._promoteNearestDots(pos, positions, rankOf, PAGE_SIZE);
+		                this.render();
+		            });
+		            canvas.appendChild(dot);
+		            return;
+		        }
+
+		        // ── Get page-relative scores for this dot ─────────────
+				// In the dot loop, replace where you get itemRawValue:
+
+				const pageIdx      = pageScoreIndexOf.get(index);
+
+				// Sizing + page-relative engagement → from pageScores
+				const engScore     = pageIdx !== undefined
+				    ? pageScores.engagementScores[pageIdx]
+				    : engagementScores[index];
+				const dotSize      = pageIdx !== undefined
+				    ? pageScores.dotSizes[pageIdx]
+				    : 12;
+				const itemAgeInMs  = pageIdx !== undefined
+				    ? pageScores.agesInMs[pageIdx]
+				    : agesInMs[index];
+				const itemIsIncomplete = pageIdx !== undefined
+				    ? pageScores.isIncomplete[pageIdx]
+				    : isIncomplete[index];
+
+				// ── Urgency color ALWAYS from full-set scores ─────────────────
+				// rawValue and threshold are absolute — never page-relative
+				const itemRawValue     = visualScores.rawValues[index];
+				const itemIsIncompleteForColor = visualScores.isIncomplete[index];
+
+		        // ── Resolve color ─────────────────────────────────────
+				// ── Resolve color ─────────────────────────────────────────────
+				let resolvedColor;
+
+				if (useUrgencyColors) {
+				    // engagementScore already accounts for invertScore — just map to palette
+				    if (!applyTiers) {
+				        resolvedColor = urgencyPalette.top;
+				    } else if (engScore >= tier1) {
+				        resolvedColor = urgencyPalette.top;
+				    } else if (engScore >= tier2) {
+				        resolvedColor = urgencyPalette.upperMid;
+				    } else if (engScore >= tier3) {
+				        resolvedColor = urgencyPalette.lowerMid;
+				    } else {
+				        resolvedColor = urgencyPalette.bottom;
+				    }
+				} else {
+				    resolvedColor = this._resolveDotColor(item, entityType);
+				}
+				
+		        // ── Size / opacity by layer ───────────────────────────
+		        let finalDotSize, dotOpacity, dotColor, dotTextColor;
+
+		        if (isSoftBand) {
+		            const distFromEdge = rank < pageStart
+		                ? pageStart - rank
+		                : rank - pageEnd + 1;
+		            const bandFraction = 1 - (distFromEdge / SOFT_BAND);
+		            finalDotSize  = Math.max(6, dotSize * 0.45 * bandFraction);
+		            dotOpacity    = 0.35 + 0.25 * bandFraction;
+		            dotColor      = resolvedColor;
+		            dotTextColor  = '#ffffff';
+		        } else {
+		            // Foreground
+		            finalDotSize = dotSize;
+		            dotColor     = resolvedColor;
+		            dotTextColor = '#ffffff';
+
+		            if (!applyTiers) {
+		                dotOpacity = 1.0;
+		            } else if (engScore >= tier1) {
+		                dotOpacity = 1.0;
+		            } else if (engScore >= tier2) {
+		                dotOpacity = 0.75;
+		            } else if (engScore >= tier3) {
+		                dotOpacity = 0.55;
+		            } else {
+		                dotOpacity   = useUrgencyColors ? 0.6 : 0.35;
+		                if (!useUrgencyColors) dotTextColor = '#666666';
+		            }
+		        }
+
+		        // ── Search override ───────────────────────────────────
+		        const searchState = this.searchResults ? this.shouldShowItemInSearch(item) : null;
+		        let filterStyle = '';
+		        if (searchState === 'match') {
+		            dotOpacity  = 1.0;
+		            filterStyle = 'brightness(1.2)';
+		        } else if (searchState === 'ancestor') {
+		            dotOpacity   = 0.4;
+		            filterStyle  = 'grayscale(100%) brightness(0.8)';
+		            dotColor     = '#b0b0b0';
+		            dotTextColor = '#555555';
+		        }
+
+		        // ── Image handling ────────────────────────────────────
+		        const hasImage = !!item.image;
+		        if (hasImage) {
+		            const ringWidth = Math.max(2, Math.round(finalDotSize * 0.03));
+		            dot.style.border             = '3px solid white';
+		            dot.style.boxShadow          = `0 0 0 ${ringWidth}px ${dotColor}`;
+		            dot.style.backgroundColor    = 'transparent';
+		            dot.style.backgroundImage    = `url(${item.image})`;
+		            dot.style.backgroundSize     = 'cover';
+		            dot.style.backgroundPosition = 'center';
+		        } else {
+		            dot.style.backgroundColor = dotColor;
+		            dot.style.boxShadow       = '0 4px 6px rgba(0,0,0,0.1)';
+		        }
+
+		        // ── Base styles ───────────────────────────────────────
+		        Object.assign(dot.style, {
+		            position:       'absolute',
+		            left:           `${pos.x - finalDotSize / 2}px`,
+		            top:            `${pos.y - finalDotSize / 2}px`,
+		            width:          `${finalDotSize}px`,
+		            height:         `${finalDotSize}px`,
+		            borderRadius:   '50%',
+		            color:          dotTextColor,
+		            cursor:         'pointer',
+		            display:        'flex',
+		            alignItems:     'center',
+		            justifyContent: 'center',
+		            fontSize:       `${Math.max(10, finalDotSize * 0.75)}px`,
+		            fontWeight:     'bold',
+		            textAlign:      'center',
+		            zIndex:         isForeground ? String(100 + Math.round(engScore * 100)) : '50',
+		            opacity:        String(dotOpacity),
+		            filter:         filterStyle,
+		            overflow:       'visible',
+		            pointerEvents:  'auto'
+		        });
+
+		        // ── Classes + animation ───────────────────────────────
+				const dotClasses = ['dot'];
+
+				if (isForeground || isSoftBand) {
+				    dot.style.setProperty('--dot-target-opacity', String(dotOpacity));
+				    dotClasses.push('dot-fade-in');
+
+				    // Stagger only on first render — scroll feels instant
+				    if (this._isFirstRender && isForeground) {
+				        dot.style.animationDelay = `${(index + 1) * delayPerDot}ms`;
+				    }
+				} else {
+				    // Background dots — no animation, excluded from exit selector
+				    dotClasses.push('dot-bg');
+				}
+
+				// Pulse for recently created items (keep existing logic)
+				if (agesInMs[index] < 30000) {
+				    dotClasses.push('dot-pulse');
+				    if (item.image) dot.style.setProperty('--pulse-color', '#6c5ce7');
+				}
+
+				dot.className = dotClasses.join(' ');
+
+		        // ── Data attributes ───────────────────────────────────
+		        if (item.ID)               dot.dataset.id = item.ID;
+		        else if (item.displayname) dot.dataset.id = item.displayname.split('/').pop();
+		        else if (item.displayID)   dot.dataset.id = item.displayID;
+
+		        dot.itemData   = item;
+		        dot.entityType = entityType;
+		        dot.itemIndex  = index;
+
+		        // ── Label (foreground only) ───────────────────────────
+		        if (!hasImage && isForeground) {
+		            const labelField = this.currentApp.entityConfigs[entityType]?.labelField || 'name';
+		            const labelText  = (item[labelField] || '?').substring(0, 3);
+		            if (labelText.length === 3) {
+		                const [a, b, c] = labelText.split('');
+		                dot.innerHTML = `<span class="dot-label"><span>${a}</span><span>${b}</span><span>${c}</span></span>`;
+		            } else {
+		                dot.textContent = labelText;
+		            }
+		        }
+
+		        // ── Ripple (foreground only) ──────────────────────────
+		        if (isForeground) {
+		            const rippleExpiry = this._pendingRipples?.get(item.displayID);
+		            if (rippleExpiry && Date.now() < rippleExpiry) {
+		                const enterDuration = 400 + ((index + 1) * delayPerDot);
+		                setTimeout(() => {
+		                    dot.classList.remove('dot-ripple', 'dot-boost');
+		                    void dot.offsetWidth;
+		                    dot.classList.add('dot-boost', 'dot-ripple');
+		                    setTimeout(() => dot.classList.remove('dot-ripple', 'dot-boost'), 5000);
+		                }, enterDuration);
+		                this._pendingRipples.delete(item.displayID);
+		            }
+		        }
+
+		        canvas.appendChild(dot);
+
+		        // ── Badges (foreground only) ──────────────────────────
+		        if (isForeground) {
+		            if (alertThresholdField && !itemIsIncomplete && !useUrgencyColors) {
+		                const raw       = itemRawValue;
+		                const threshold = parseFloat(item[alertThresholdField]) || 0;
+		                const breached  = alertDirection === 'above'
+		                    ? raw >= threshold
+		                    : raw <= threshold && raw > 0;
+		                if (raw !== null && breached) {
+		                    const badge = document.createElement('span');
+		                    badge.style.cssText = 'position:absolute;top:-4px;right:-4px;width:13px;height:13px;border-radius:50%;background:white;border:2px solid #e53935;font-size:7px;display:flex;align-items:center;justify-content:center;color:#e53935;font-weight:bold;pointer-events:none;z-index:101;';
+		                    badge.textContent = '!';
+		                    badge.title = `Below threshold (${raw} ≤ ${threshold})`;
+		                    dot.style.position = 'relative';
+		                    dot.appendChild(badge);
+		                }
+		            }
+
+		            if (itemIsIncomplete && !useUrgencyColors) {
+		                const badge = document.createElement('span');
+		                badge.style.cssText = 'position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:#b2bec3;border:2px solid white;font-size:7px;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;pointer-events:none;z-index:101;';
+		                badge.textContent = '?';
+		                badge.title = 'No variations added yet';
+		                dot.style.position = 'relative';
+		                dot.appendChild(badge);
+		            }
+		        }
+
+		        // ── Interaction handlers ──────────────────────────────
+		        this.attachDotInteractionHandlers(dot, item, entityType);
+
+		    } catch (err) {
+		        console.error(`[Render] Error creating dot ${index}:`, err, item);
+		    }
+		});
+
+		this._isFirstRender = false;
+		this.updateWatermark();
+
+	    // ── Polling (unchanged) ───────────────────────────────────────
+	    if (this._isRefreshing) { console.log('=== RENDER COMPLETE ==='); return; }
+
+	    if (this.currentPath.length === 0) {
+	        if (this.isPollingActive) this.stopVersionPolling();
+	    } else {
+	        this.startVersionPolling();
+	    }
+
+	    console.log('=== RENDER COMPLETE ===');
+	}
+	
+	_promoteNearestDots(clickPos, positions, rankOf, pageSize) {
+	    let closestRank = 0;
+	    let closestDist = Infinity;
+
+	    positions.forEach((pos, i) => {
+	        const dx = pos.x - clickPos.x;
+	        const dy = pos.y - clickPos.y;
+	        const dist = Math.sqrt(dx * dx + dy * dy);
+	        if (dist < closestDist) {
+	            closestDist = dist;
+	            closestRank = rankOf[i];
+	        }
+	    });
+
+	    const totalPages = Math.ceil(positions.length / pageSize);
+	    const targetPage = Math.floor(closestRank / pageSize); // ← simplest: just go to that rank's page
+	    this._dotPage = Math.min(targetPage, totalPages - 1);
+	}
+	
+
+		
+		// ✅ ADD THIS HELPER (minimal, no external dependencies)
+		_stringToSeed(str) {
+		    let hash = 0;
+		    if (!str) return hash;
+		    for (let i = 0; i < str.length; i++) {
+		        const char = str.charCodeAt(i);
+		        hash = ((hash << 5) - hash) + char;
+		        hash = hash & hash; // Convert to 32-bit integer
+		    }
+		    return Math.abs(hash) || 1; // Avoid seed=0
+		}
+		
+		_getRecencyBiasValue(recencyBias) {
+		    switch (recencyBias) {
+		        case 'none':   return 0.0;
+		        case 'low':    return 0.3;
+		        case 'medium': return 0.5;
+		        case 'high':   return 0.7;
+		        case 'full':   return 1.0;
+		        default:       return 0.5;
+		    }
+		}
+		
+		/**
+		 * Calculate adaptive visual scores with space-aware sizing
+		 * Automatically scales dots based on available canvas area per item
+		 * @param {Array} items - Items to score
+		 * @param {string} entityType - Entity type for config lookup
+		 * @returns {Object} Precomputed scores and metadata for rendering
+		 */
+		
+		calculateVisualScores(items, entityType) {
+
+		    const currentTime = Date.now();
+		    const entityConfig = this.currentApp?.entityConfigs?.[entityType];
+		    const childrenField = entityConfig?.childrenField;
+		    const sortConfig = entityConfig?.sortConfig;
+		    const itemCount = items.length;
+
+		    // ✅ GET CANVAS DIMENSIONS
+		    const canvasEl = document.getElementById('canvas-area');
+		    const canvasWidth = canvasEl?.offsetWidth || 1920;
+		    const canvasHeight = canvasEl?.offsetHeight || 1080;
+		    const canvasArea = canvasWidth * canvasHeight;
+
+		    // ✅ SINGLE PASS: Extract hits, ages, timestamps
+		    const safeHits = new Array(itemCount);
+		    const agesInMs = new Array(itemCount);
+		    const timestamps = [];
+
+		    for (let i = 0; i < itemCount; i++) {
+		        const item = items[i];
+		        safeHits[i] = this._extractHitCount(item, childrenField);
+
+		        // ✅ For aggregate type, recency = max child timestamp
+		        // For field type, recency = own timestamp
+		        if (sortConfig?.type === 'aggregate' && childrenField) {
+		            const children = item[childrenField] || [];
+		            const maxChildTs = children.length > 0
+		                ? Math.max(...children.map(c => c.timestamp || 0))
+		                : 0;
+		            agesInMs[i] = maxChildTs > 0 ? currentTime - maxChildTs : currentTime;
+		        } else {
+		            agesInMs[i] = this._extractAgeInMs(item, currentTime);
+		        }
+
+		        const ts = item.lastupdatetime || item.crTime;
+		        if (ts && typeof ts === 'number' && !isNaN(ts)) {
+		            timestamps.push(ts);
+		        }
+		    }
+
+		    // ✅ CALCULATE PERCENTILES
+		    const recencyPercentiles = this._calculatePercentiles(agesInMs, true);
+		    const hitPercentiles = this._calculatePercentiles(safeHits, false);
+
+		    // ✅ RESOLVE SCORING CONFIG
+		    const invertScore = sortConfig?.invertScore;
+		    const scoreField = sortConfig?.type === 'field'
+		        ? sortConfig.scoreField
+		        : sortConfig?.aggregateField;
+		    const alertThresholdField = sortConfig?.alertThresholdField;
+		    const alertDirection = sortConfig?.alertDirection || 'below';
+		    const recencyBias = this._getRecencyBiasValue(sortConfig?.recencyBias);
+
+		    // ✅ Flip state — view preference only, does not mutate sortConfig
+		    const flipped = !!this._contextBarFlipped;
+		    const effectiveInvert = invertScore ? !flipped : false;
+
+		    // ✅ EXTRACT RAW VALUES + DETECT INCOMPLETE ITEMS
+		    const rawValues = new Array(itemCount);
+		    const isIncomplete = new Array(itemCount).fill(false);
+
+		    for (let i = 0; i < itemCount; i++) {
+		        const item = items[i];
+
+		        if (childrenField) {
+		            const children = item[childrenField];
+		            if (!Array.isArray(children) || children.length === 0) {
+		                rawValues[i] = null;
+		                isIncomplete[i] = true;
+		                continue;
+		            }
+		        }
+
+		        if (sortConfig?.type === 'aggregate') {
+		            const agg = this.calculateAggregate(item, entityType, sortConfig);
+		            rawValues[i] = agg === null ? null : agg;
+		        } else {
+		            rawValues[i] = scoreField ? (parseFloat(item[scoreField]) || 0) : null;
+		        }
+		    }
+
+		    // ✅ COMPUTE ENGAGEMENT SCORES (0.0-1.0)
+		    const engagementScores = new Array(itemCount);
+
+		    if (invertScore) {
+		        const validRaws = rawValues.filter(v => v !== null);
+		        const maxRaw = validRaws.length > 0 ? Math.max(...validRaws) : 0;
+		        const minRaw = validRaws.length > 0 ? Math.min(...validRaws) : 0;
+		        const range = maxRaw === minRaw ? 1 : maxRaw - minRaw;
+
+		        const thresholds = alertThresholdField
+		            ? items.map(item => parseFloat(item[alertThresholdField]) || 0)
+		            : null;
+
+		        for (let i = 0; i < itemCount; i++) {
+		            if (isIncomplete[i]) {
+		                engagementScores[i] = 0.5;
+		                continue;
+		            }
+
+		            const raw = rawValues[i];
+		            const normalised = (raw - minRaw) / range;
+
+		            let urgency;
+		            if (effectiveInvert) {
+		                urgency = (1 - normalised); // low value = urgent
+		            } else {
+		                urgency = normalised; // high value = urgent
+		            }
+
+		            // ✅ Alert threshold override — only in normal (non-flipped) mode
+		            if (!flipped && thresholds) {
+		                const breached = alertDirection === 'above'
+		                    ? raw >= thresholds[i]
+		                    : raw <= thresholds[i];
+		                if (breached) urgency = Math.max(urgency, 0.9);
+		            }
+
+		            // ✅ Apply recencyBias — inverted for invertScore (old = more urgent)
+		            if (recencyBias === 0) {
+		                engagementScores[i] = urgency;
+		            } else {
+		                const recencyContribution = recencyBias * (1 - recencyPercentiles[i]); // inverted
+		                engagementScores[i] = recencyContribution + (1 - recencyBias) * urgency;
+		            }
+		        }
+
+		    } else {
+		        const validRaws = rawValues.filter(v => v !== null);
+		        const maxRaw = validRaws.length > 0 ? Math.max(...validRaws) : 0;
+		        const minRaw = validRaws.length > 0 ? Math.min(...validRaws) : 0;
+		        const rawRange = maxRaw === minRaw ? 1 : maxRaw - minRaw;
+
+		        for (let i = 0; i < itemCount; i++) {
+		            if (isIncomplete[i]) {
+		                engagementScores[i] = 0.1;
+		                continue;
+		            }
+
+		            if (rawValues[i] !== null) {
+		                const normalised = (rawValues[i] - minRaw) / rawRange;
+		                if (recencyBias === 0) {
+		                    // ✅ None — pure value, ignore recency entirely
+		                    engagementScores[i] = normalised;
+		                } else {
+		                    engagementScores[i] = recencyBias * recencyPercentiles[i]
+		                        + (1 - recencyBias) * normalised;
+		                }
+		            } else {
+		                // ✅ No raw value — fall back to recency only, or neutral if recencyBias none
+		                engagementScores[i] = recencyBias > 0
+		                    ? recencyPercentiles[i]
+		                    : 0.5;
+		            }
+		        }
+		    }
+
+		    // ✅ SMART SIZE SCALING
+		    const charLength = Math.sqrt(canvasArea / Math.max(1, itemCount));
+		    const maxSizeRaw = 0.35 * charLength;
+		    const maxSize = Math.min(72, Math.max(16, maxSizeRaw));
+		    const minSize = Math.max(20, maxSize * 0.15);
+
+		    const sortedScores = [...engagementScores].sort((a, b) => a - b);
+		    const len = sortedScores.length;
+		    const topThreshold = sortedScores[Math.floor(len * 0.75)] ?? 0;
+		    const bottomThreshold = sortedScores[Math.floor(len * 0.25)] ?? 0;
+		    const midThreshold = (topThreshold + bottomThreshold) / 2;
+
+		    const dotSizes = engagementScores.map((score, i) => {
+		        if (isIncomplete[i]) return minSize + (maxSize - minSize) * 0.5;
+		        if (score >= topThreshold) return maxSize;
+		        if (score >= midThreshold) return minSize + (maxSize - minSize) * 0.65;
+		        if (score > bottomThreshold) return minSize + (maxSize - minSize) * 0.35;
+		        return minSize;
+		    });
+
+		    // ✅ TIME CONTEXT FOR OPACITY
+		    const timeContext = timestamps.length > 0
+		        ? {
+		            minTime: Math.min(...timestamps),
+		            maxTime: Math.max(...timestamps),
+		            timeSpan: Math.max(1, Math.max(...timestamps) - Math.min(...timestamps))
+		          }
+		        : { minTime: currentTime, maxTime: currentTime, timeSpan: 1 };
+
+		    // ✅ CONTEXT MESSAGE
+		    let contextMessage = '';
+		    if (scoreField && invertScore) {
+		        contextMessage = flipped
+		            ? `Bigger dots = highest ${scoreField}`
+		            : `Bigger dots = lowest ${scoreField}`;
+		    } else {
+		        const bias = sortConfig?.recencyBias ?? 'medium';
+				if (bias === 'none') {
+				    contextMessage = `Bigger dots = most ${scoreField || 'active'}`;
+				} else if (bias === 'full') {
+				    contextMessage = 'Bigger dots = most recently active';
+				} else if (bias === 'high') {
+				    contextMessage = 'Bigger dots = most recently active (value secondary)';
+				} else if (bias === 'low') {
+				    contextMessage = `Bigger dots = most ${scoreField || 'active'} (recency secondary)`;
+				} else {
+				    contextMessage = 'Bigger dots = most active recently';
+				}
+		    }
+
+		    return {
+		        recencyPercentiles,
+		        hitPercentiles,
+		        engagementScores,
+		        dotSizes,
+		        agesInMs,
+		        safeHits,
+		        rawValues,
+		        isIncomplete,
+		        alertThresholdField,
+		        alertDirection,
+		        scoreField,
+		        contextMessage,
+		        timeContext,
+		        stats: {
+		            itemCount,
+		            canvasDimensions: { width: canvasWidth, height: canvasHeight },
+		            canvasArea: Math.round(canvasArea),
+		            charLength: charLength.toFixed(1),
+		            spacePerItem: (canvasArea / itemCount).toFixed(0),
+		            maxHit: Math.max(...safeHits, 0),
+		            minAge: Math.min(...agesInMs),
+		            maxAge: Math.max(...agesInMs),
+		            sizeRange: {
+		                min: minSize.toFixed(1),
+		                max: maxSize.toFixed(1),
+		                ratio: (minSize / maxSize).toFixed(2),
+		                formula: `15% of sqrt(canvasArea/${itemCount})`
+		            }
+		        }
+		    };
+		}
+		
+		_generateStressTestItems(count) {
+		    const now = Date.now();
+		    const hierarchy = this.currentApp.hierarchy;
+		    const entityConfigs = this.currentApp.entityConfigs;
+		    const currentDepth = this.currentPath.length;
+		    const currentEntityType = hierarchy[currentDepth];
+		    const childEntityType = entityConfigs[currentEntityType]?.childEntity;
+		    const isLeaf = !entityConfigs[currentEntityType]?.childrenField;
+			const pseudoRandom = (seed) => {
+			        const x = Math.sin(seed) * 10000;
+			        return x - Math.floor(x);
+			    };
+
+
+		    const makeLeaf = (entityType, parentIndex, leafIndex) => {
+		        const config = entityConfigs[entityType];
+		        const sortConfig = config?.sortConfig;
+		        const ageMs = (parentIndex * 3600000) + (leafIndex * 600000);
+		        const scoreField = sortConfig?.type === 'field'
+		            ? sortConfig.scoreField
+		            : sortConfig?.aggregateField;
+
+				
+				const tag = (pseudoRandom(parentIndex * 13) * 0xFFFFFF | 0).toString(36).substring(0, 3).toUpperCase();
+		        const leaf = {
+		            ID: `test-${entityType}-${parentIndex}-${leafIndex}`,
+		            displayID: `t-${entityType}-${parentIndex}-${leafIndex}`,
+		            name: tag,
+		            dotLabel: tag,
+		            timestamp: now - ageMs,
+		            lastupdatetime: now - ageMs,
+		            crTime: now - ageMs,
+		            entityType,
+		        };
+
+		        if (scoreField) {
+					if (scoreField === 'stock') {
+					    // Spread evenly: index 0 = full stock, last index = empty
+					    const stockValue = Math.floor(100 * (1 - (parentIndex / count)));
+					    leaf[scoreField] = stockValue;
+					    leaf['alertThreshold'] = 20;
+					} else if (scoreField === 'hit') {
+		                leaf[scoreField] = Math.floor(Math.random() * 50) + (parentIndex * 2);
+		            } else {
+		                leaf[scoreField] = Math.floor(Math.random() * 100);
+		            }
+		        }
+
+		        return leaf;
+		    };
+
+		    const makeMid = (entityType, parentIndex, childEntityType) => {
+		        const config = entityConfigs[entityType];
+		        const childrenField = config?.childrenField;
+		        const ageMs = parentIndex * 3600000;
+		        const isOld = parentIndex > count * 0.4;
+				const noChildThreshold = Math.floor(count * 0.15); // first 15% have no children
+				const childCount = parentIndex < noChildThreshold 
+				    ? 0 
+				    : Math.max(1, Math.floor(pseudoRandom(parentIndex) * 4) + (isOld ? 2 : 0));
+				const tag = (pseudoRandom(parentIndex * 13) * 0xFFFFFF | 0).toString(36).substring(0, 3).toUpperCase();
+
+		        const node = {
+		            ID: `test-${entityType}-${parentIndex}`,
+		            displayID: `t-${entityType}-${parentIndex}`,
+		            name: tag,
+		            dotLabel: tag,
+		            timestamp: now - ageMs,
+		            lastupdatetime: now - ageMs,
+		            crTime: now - ageMs,
+		            entityType,
+		        };
+
+		        if (childrenField && childEntityType && childCount > 0) {
+		            node[childrenField] = Array.from({ length: childCount }, (_, j) =>
+		                makeLeaf(childEntityType, parentIndex, j)
+		            );
+		        } else if (childrenField) {
+		            node[childrenField] = [];
+		        }
+
+		        return node;
+		    };
+
+		    const items = Array.from({ length: count }, (_, i) =>
+		        isLeaf
+		            ? makeLeaf(currentEntityType, i, 0)
+		            : makeMid(currentEntityType, i, childEntityType)
+		    );
+			
+			console.log('[stress debug] entityType:', currentEntityType, 
+			    'childrenField:', entityConfigs[currentEntityType]?.childrenField,
+			    'item[5] keys:', Object.keys(items[5] || {}),
+			    'item[5] children:', items[5]?.[entityConfigs[currentEntityType]?.childrenField]
+			);
+
+		    console.log(`[STRESS TEST] App: ${this.currentApp.id} | Entity: ${currentEntityType} | Depth: ${currentDepth} | Count: ${count} | Leaf: ${isLeaf}`);
+		    return items;
+		}
+		
+		renderContextBar(items, entityType, visualScores) {
+			var self = this; 
+			console.log('[renderContextBar] received contextMessage:', visualScores?.contextMessage, 'flipped:', this._contextBarFlipped);
+		    document.getElementById('context-bar')?.remove();
+
+		    const breadcrumb = document.getElementById('breadcrumb');
+		    if (!breadcrumb) return;
+
+		    const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+		    const canFlip = !!sortConfig?.invertScore || !!sortConfig?.contextLabel;
+		    const itemCount = items.length;
+		    const entityLabel = entityType.charAt(0).toUpperCase() + entityType.slice(1);
+		    const plural = itemCount !== 1 ? 's' : '';
+
+		    const bar = document.createElement('div');
+		    bar.id = 'context-bar';
+		    bar.style.cssText = `
+		        display: flex; align-items: center; justify-content: space-between;
+		        padding: 0 16px; height: 32px; background: #f8f8f8;
+		        border-bottom: 1px solid #eee; font-size: 13px; color: #636e72;
+		        box-sizing: border-box;
+		    `;
+			
+			// ✅ ALWAYS build countEl with datamap hover
+			var countEl = document.createElement('span');
+			countEl.style.cssText = 'font-weight:700; border-bottom:1px dotted #b2bec3; cursor:default; padding-bottom:1px;';
+			countEl.textContent = itemCount;
+
+			var mapTimer;
+			countEl.addEventListener('mouseenter', function() {
+			    mapTimer = setTimeout(function() {
+			        self._showDataMap(countEl);
+			    }, 400);
+			});
+			countEl.addEventListener('mouseleave', function() {
+			    clearTimeout(mapTimer);
+			});
+
+			var msgEl = document.createElement('span');
+			msgEl.appendChild(countEl);
+
+			if (canFlip) {
+			    const flipped = !!this._contextBarFlipped;
+			    const keyword = flipped ? `highest` : `lowest`;
+			    const otherKeyword = flipped ? `lowest` : `highest`;
+			    const scoreField = sortConfig?.type === 'field'
+			        ? sortConfig.scoreField
+			        : sortConfig?.aggregateField;
+
+			    var pill = document.createElement('span');
+			    pill.className = 'sort-flip-pill';
+			    pill.textContent = keyword;
+			    pill.style.cssText = 'display:inline-block; padding:1px 8px; border-radius:10px; border:1px solid #b2bec3; cursor:pointer; font-weight:600; color:#2d3436; background:#f0f0f0; transition:all 0.15s; user-select:none;';
+
+			    msgEl.appendChild(document.createTextNode(' ' + entityLabel + plural + ' — Bigger dots = '));
+			    msgEl.appendChild(pill);
+			    msgEl.appendChild(document.createTextNode(' ' + scoreField));
+
+			    pill.onmouseenter = function() {
+			        pill.style.background = '#dfe6e9';
+			        pill.style.borderColor = '#636e72';
+			        pill.title = 'Switch to ' + otherKeyword;
+			    };
+			    pill.onmouseleave = function() {
+			        pill.style.background = '#f0f0f0';
+			        pill.style.borderColor = '#b2bec3';
+			    };
+			    pill.onclick = function() {
+			        var canvas = document.getElementById('canvas-area');
+			        canvas.style.transition = 'opacity 0.3s ease';
+			        canvas.style.opacity = '0.3';
+			        setTimeout(function() {
+			            self._contextBarFlipped = !self._contextBarFlipped;
+			            self.render();
+			            canvas.style.opacity = '1';
+			        }, 300);
+			    };
+			} else {
+			    // ✅ No flip pill, just count + context message
+			    msgEl.appendChild(document.createTextNode(' ' + entityLabel + plural + ' — ' + visualScores.contextMessage));
+			}
+			
+			const totalPages = Math.ceil(itemCount / (this._dotPageSize || 30));
+			if (totalPages > 1) {
+				const currentPage = this._dotPage || 0;
+				const pageStart = currentPage * (this._dotPageSize || 30);
+				const showing = Math.min(this._dotPageSize || 30, itemCount - pageStart);
+			    const hint = document.createElement('span');
+			    hint.style.cssText = 'color:#b2bec3; font-size:11px; margin-left:6px;';
+			    hint.textContent = `(${showing} showing)`;
+			    msgEl.appendChild(hint);
+			}
+
+			bar.appendChild(msgEl);
+			
+			if (typeof this.openReconcileModal === 'function' && this.currentPath.length === 1) {
+			    const reconcileBtn = document.createElement('button');
+			    reconcileBtn.textContent = '📦 Reconcile';
+			    reconcileBtn.style.cssText = `
+			        background: none; border: 1px solid #b2bec3; border-radius: 12px;
+			        padding: 3px 10px; font-size: 12px; color: #636e72;
+			        cursor: pointer; font-weight: 600; margin-left: 8px;
+			    `;
+			    reconcileBtn.onmouseenter = () => {
+			        reconcileBtn.style.background = '#f0f0f0';
+			        reconcileBtn.style.borderColor = '#636e72';
+			    };
+			    reconcileBtn.onmouseleave = () => {
+			        reconcileBtn.style.background = 'none';
+			        reconcileBtn.style.borderColor = '#b2bec3';
+			    };
+			    reconcileBtn.onclick = () => this.openReconcileModal();
+			    bar.appendChild(reconcileBtn);
+			}
+
+		    breadcrumb.insertAdjacentElement('afterend', bar);
+		    updateCanvasHeight();
+		}
+		
+		/**
+		 * Calculate dispersion direction based on screen orientation
+		 * @returns {Object} Dispersion factors with canvas center
+		 */
+		_getDispersionDirection() {
+		    const canvasEl = document.getElementById('canvas-area');
+		    const canvasWidth = canvasEl?.offsetWidth || 1920;
+		    const canvasHeight = canvasEl?.offsetHeight || 1080;
+		    const aspectRatio = canvasWidth / canvasHeight;
+		    
+		    // Center of canvas
+		    const centerX = canvasWidth / 2;
+		    const centerY = canvasHeight / 2;
+		    
+		    // Dispersion factors
+		    const horizontal = aspectRatio >= 1.5 ? 1.8 : 1.2;
+		    const vertical = aspectRatio < 1.2 ? 2.0 : 1.2;
+		    
+		    return {
+		        horizontal,
+		        vertical,
+		        centerX,
+		        centerY,
+		        aspectRatio
+		    };
+		}
+		// ===== PRIVATE HELPERS (supporting methods) =====
+
+		/**
+		 * Extract hit count with fallback chain
+		 */
+		_extractHitCount(item, childrenField) {
+		    // PRIORITY 1: Valid hit field (>0)
+		    if (item.hit != null && typeof item.hit === 'number' && !isNaN(item.hit) && item.hit > 0) {
+		        return item.hit;
+		    }
+		    
+		    // PRIORITY 2: Configured children field
+		    if (childrenField && item[childrenField] && Array.isArray(item[childrenField])) {
+		        return item[childrenField].length;
+		    }
+		    
+		    // PRIORITY 3: Common child field names
+		    const commonFields = ['customers', 'concerns', 'children', 'items', 'subtenants'];
+		    for (const field of commonFields) {
+		        if (item[field] && Array.isArray(item[field])) {
+		            return item[field].length;
+		        }
+		    }
+		    
+		    // PRIORITY 4: Count all array properties (last resort)
+		    const arrayCounts = Object.values(item)
+		        .filter(val => Array.isArray(val))
+		        .map(arr => arr.length);
+		    if (arrayCounts.length > 0) {
+		        return Math.max(...arrayCounts);
+		    }
+		    
+		    // PRIORITY 5: Default to 0
+		    return 0;
+		}
+
+		/**
+		 * Extract age in milliseconds with fallback chain
+		 */
+		_extractAgeInMs(item, currentTime) {
+		    // PRIORITY 1: lastupdatetime
+		    if (item.lastupdatetime != null && 
+		        typeof item.lastupdatetime === 'number' && 
+		        !isNaN(item.lastupdatetime)) {
+		        return currentTime - item.lastupdatetime;
+		    }
+		    
+		    // PRIORITY 2: crTime
+		    if (item.crTime != null && 
+		        typeof item.crTime === 'number' && 
+		        !isNaN(item.crTime)) {
+		        return currentTime - item.crTime;
+		    }
+		    
+		    // PRIORITY 3: Common timestamp fields
+		    const timestampFields = ['created', 'timestamp', 'createdAt', 'updated'];
+		    for (const field of timestampFields) {
+		        const val = item[field];
+		        if (val != null && typeof val === 'number' && !isNaN(val)) {
+		            return currentTime - val;
+		        }
+		    }
+		    
+		    // PRIORITY 4: Default to "very recent"
+		    return 0;
+		}
+
+		/**
+		 * Calculate percentile ranks where BEST value = 1.0, WORST = 0.0
+		 * @param {Array<number>} values - Values to rank
+		 * @param {boolean} lowerIsBetter - true if lower values are "better" (e.g., age)
+		 * @returns {Array<number>} Percentiles (0.0 = worst, 1.0 = best)
+		 */
+		_calculatePercentiles(values, lowerIsBetter) {
+		    if (values.length <= 1) return [1.0];
+		    
+		    // Sort: BEST value comes FIRST (index 0)
+		    const indexedValues = values.map((val, idx) => ({ val, idx }));
+		    indexedValues.sort((a, b) => 
+		        lowerIsBetter ? a.val - b.val : b.val - a.val // Ascending if lower=better, else descending
+		    );
+		    
+		    // ✅ CRITICAL FIX: BEST (rank 0) = 1.0, WORST (rank n-1) = 0.0
+		    const percentiles = new Array(values.length);
+		    for (let rank = 0; rank < indexedValues.length; rank++) {
+		        const { idx } = indexedValues[rank];
+		        percentiles[idx] = 1 - (rank / (indexedValues.length - 1)); // ← INVERTED
+		    }
+		    
+		    return percentiles;
+		}
+
+		/**
+		 * Calculate time context for opacity (oldest to newest range)
+		 */
+		_calculateTimeContext(items) {
+		    const currentTime = Date.now();
+		    const validItems = items.filter(i => 
+		        (i.lastupdatetime != null && typeof i.lastupdatetime === 'number' && !isNaN(i.lastupdatetime)) ||
+		        (i.crTime != null && typeof i.crTime === 'number' && !isNaN(i.crTime))
+		    );
+		    
+		    if (validItems.length === 0) {
+		        return { minTime: currentTime, maxTime: currentTime, timeSpan: 1 };
+		    }
+		    
+		    const timestamps = validItems.map(i => i.lastupdatetime || i.crTime || currentTime);
+		    const minTime = Math.min(...timestamps);
+		    const maxTime = Math.max(...timestamps);
+		    const timeSpan = Math.max(1, maxTime - minTime);
+		    
+		    return { minTime, maxTime, timeSpan };
+		}
+		
+		renderEntitySelector() {
+		    const canvas = document.getElementById('canvas-area');
+		    if (!canvas || !this.data?.items?.length) return;
+			
+			// ✅ ADD THIS AT START OF renderEntitySelector()
+			const visualScores = this.calculateVisualScores(this.data.items, 'entity-selector');
+			const { dotSizes, engagementScores, agesInMs } = visualScores;
+
+			// ✅ PRECOMPUTE THRESHOLDS (same as normal dots)
+			const topOpacityPercentile = 0.8;
+			const sortedEngagements = [...engagementScores].sort((a, b) => a - b);
+			const opacityThresholdIndex = Math.floor(sortedEngagements.length * topOpacityPercentile);
+			const opacityThreshold = sortedEngagements[opacityThresholdIndex] || 0;
+
+			const MIN_ITEMS_FOR_GRAY = 5;
+			const applyGrayColoring = this.data.items.length >= MIN_ITEMS_FOR_GRAY;
+			let colorThreshold = 0;
+			if (applyGrayColoring) {
+			    const bottomColorPercentile = 0.2;
+			    const colorThresholdIndex = Math.floor(sortedEngagements.length * bottomColorPercentile);
+			    colorThreshold = sortedEngagements[colorThresholdIndex] || 0;
+			}
+		    
+		    canvas.innerHTML = '';
+		    
+		    // Title
+		    const title = document.createElement('div');
+		    title.style.cssText = 'position: absolute; top: 30px; left: 50%; transform: translateX(-50%); font-size: 20px; font-weight: bold; color: #333; z-index: 200;';
+		    title.textContent = this.getEntitySelectorTitle();
+		    canvas.appendChild(title);
+		    
+		    // ✅ BETTER DETERMINISTIC POSITIONING: Bit-splitting from single hash
+		    const getXYFromHash = (input) => {
+		        // Simple but effective FNV-1a hash (better distribution than djb2)
+		        const FNV_OFFSET = 0x811c9dc5;
+		        const FNV_PRIME = 0x01000193;
+		        
+		        let hash = FNV_OFFSET;
+		        for (let i = 0; i < input.length; i++) {
+		            hash ^= input.charCodeAt(i);
+		            hash = (hash * FNV_PRIME) >>> 0; // Keep as 32-bit unsigned
+		        }
+		        
+		        // Split 32-bit hash into two 16-bit values for X and Y
+		        const xBits = hash & 0xFFFF;      // Lower 16 bits
+		        const yBits = (hash >> 16) & 0xFFFF; // Upper 16 bits
+		        
+		        // Normalize to [0, 1) range
+		        const xRatio = xBits / 0xFFFF;
+		        const yRatio = yBits / 0xFFFF;
+		        
+		        return { xRatio, yRatio, hash };
+		    };
+		    
+		    const canvasRect = canvas.getBoundingClientRect();
+		    const items = this.data.items;
+		    
+		    // Time-based sizing logic (unchanged)
+		    const hasCreationTimes = items.some(item => item.crTime !== undefined);
+		    let minTime = Infinity, maxTime = -Infinity;
+		    if (hasCreationTimes) {
+		        items.forEach(item => {
+		            if (item.crTime < minTime) minTime = item.crTime;
+		            if (item.crTime > maxTime) maxTime = item.crTime;
+		        });
+		    }
+		    
+		    // Safe bounds
+		    const safeBounds = {
+		        minX: 60,
+		        maxX: canvasRect.width - 60,
+		        minY: 100,
+		        maxY: canvasRect.height - 60
+		    };
+		    
+			items.forEach((item, i) => {
+			    // ✅ VISUAL SCORING: Get precomputed values
+			    const dotSize = dotSizes[i];
+			    const engagementScore = engagementScores[i];
+			    const ageInMs = agesInMs[i];
+			    
+			    // ✅ COLOR: Use getEntityDotColor + gray override for bottom tier
+			    let dotBackgroundColor = this.getEntityDotColor(item, !this.currentApp);
+			    let dotTextColor = 'white';
+			    
+			    if (applyGrayColoring && engagementScore <= colorThreshold) {
+			        dotBackgroundColor = '#d3d3d3'; // Gray for bottom tier
+			        dotTextColor = '#333333';       // Dark text for contrast
+			    }
+			    
+			    // ✅ OPACITY: Engagement-based (top 20% = 1.0)
+			    let baseOpacity = engagementScore >= opacityThreshold 
+			        ? 1.0 
+			        : (0.3 + 0.7 * (engagementScore / opacityThreshold));
+			    
+			    // ✅ POSITION: Bit-splitting hash (keep this superior method!)
+			    let uniqueId = item.displayname || item.ID || item.name || `entity_${i}`;
+			    
+			    if (item.displayname && item.displayname.includes('/')) {
+			        uniqueId = item.displayname.split('/').pop();
+			    } else if (item.ID && item.ID.includes('-')) {
+			        uniqueId = this.db.hashUUID(item.ID);
+			    }
+			    
+			    const { xRatio, yRatio } = getXYFromHash(uniqueId);
+			    const x = safeBounds.minX + xRatio * (safeBounds.maxX - safeBounds.minX);
+			    const y = safeBounds.minY + yRatio * (safeBounds.maxY - safeBounds.minY);
+			    
+			    // ✅ ANIMATION: Pulse if recent (<30s)
+			    const dotClasses = ['dot', 'entity-selector-dot'];
+			    if (ageInMs < 30000) {
+			        dotClasses.push('dot-pulse');
+					if (item.image) {
+				        // Override pulse glow to match ring color (purple for incomplete)
+				        dot.style.setProperty('--pulse-color', '#6c5ce7');
+				    }
+			    }
+			    
+			    // ✅ CREATE DOT
+			    const dot = document.createElement('div');
+			    dot.className = dotClasses.join(' ');
+			    
+			    // ✅ CRITICAL: SET data-id FOR LATER SELECTION
+			    let dotDataId;
+			    if (item.ID) {
+			        dotDataId = item.ID;
+			    } else if (item.displayname) {
+			        dotDataId = item.displayname.split('/').pop();
+			    } else {
+			        dotDataId = item.displayID || `entity_${i}`;
+			    }
+			    dot.dataset.id = dotDataId;
+			    
+			    // ✅ DOT STYLE (updated with visual scoring)
+			    Object.assign(dot.style, {
+			        position: 'absolute',
+			        left: `${x - dotSize/2}px`,
+			        top: `${y - dotSize/2}px`,
+			        width: `${dotSize}px`,
+			        height: `${dotSize}px`,
+			        backgroundColor: dotBackgroundColor,
+			        color: dotTextColor,
+			        borderRadius: '50%',
+			        cursor: 'pointer',
+			        display: 'flex',
+			        flexDirection: 'column',
+			        alignItems: 'center',
+			        justifyContent: 'center',
+			        fontWeight: 'bold',
+			        boxShadow: '0 4px 15px rgba(0,0,0,0.2)',
+			        border: '3px solid rgba(255,255,255,0.4)',
+			        zIndex: 100,
+			        opacity: baseOpacity.toString(),
+			        transition: 'transform 0.2s ease, box-shadow 0.2s ease'
+			    });
+			    
+			    // ✅ LABEL FORMATTING (keep your existing logic)
+			    let label, subLabel;
+			    const isAppSelector = !this.currentApp;
+			    const isTenantSelector = this.currentApp && this.currentPath.length === 0;
+			    
+			    if (isAppSelector) {
+			        label = item.name?.substring(0, 3).toUpperCase() || 'APP';
+			        subLabel = item.name;
+			    } else if (isTenantSelector) {
+			        const displayName = item.displayname || item.ID || '';
+			        const parts = displayName.split('/');
+			        const tenantId = parts[parts.length - 1] || displayName;
+			        label = tenantId.substring(0, 3).toUpperCase();
+			        subLabel = tenantId;
+			    } else {
+			        label = (item.name || item.ID || '').substring(0, 3).toUpperCase() || '???';
+			        subLabel = item.name || item.ID;
+			    }
+			    
+			    // ✅ LABEL HTML (responsive font sizes)
+			    dot.innerHTML = `
+			        <div style="font-size: ${Math.max(14, dotSize * 0.35)}px; margin-bottom: ${subLabel ? '2px' : '0'}; text-shadow: 1px 1px 2px rgba(0,0,0,0.3);">
+			            ${label}
+			        </div>
+			        ${subLabel ? `<div style="font-size: ${Math.max(8, dotSize * 0.16)}px; opacity: 0.9; text-shadow: 1px 1px 2px rgba(0,0,0,0.3);">${subLabel}</div>` : ''}
+			    `;
+			    
+			    // ✅ HOVER EFFECTS (keep your existing polish)
+			    dot.addEventListener('mouseenter', () => {
+			        dot.style.transform = 'scale(1.1) translateY(-5px)';
+			        dot.style.boxShadow = '0 8px 25px rgba(0,0,0,0.35)';
+			        dot.style.zIndex = '150';
+			    });
+			    
+			    dot.addEventListener('mouseleave', () => {
+			        dot.style.transform = 'scale(1) translateY(0)';
+			        dot.style.boxShadow = '0 4px 15px rgba(0,0,0,0.2)';
+			        dot.style.zIndex = '100';
+			    });
+			    
+			    // ✅ NAVIGATION (keep your existing click handler)
+			    dot.addEventListener('click', e => {
+			        e.stopPropagation();
+			        this.handleEntitySelectorClick(item, isAppSelector, isTenantSelector);
+			    });
+			    
+			    // ✅ TOOLTIP (keep creation time display)
+			    if (item.crTime) {
+			        const date = new Date(item.crTime).toLocaleDateString();
+			        dot.title = `Created: ${date}`;
+			    }
+			    
+			    // ✅ APPEND TO CANVAS
+			    canvas.appendChild(dot);
+			});
+		    
+		    console.log(`[renderEntitySelector] Rendered ${items.length} entities with bit-split positioning`);
+		}
+
+		// ✅ HELPER: Get title based on selector type
+		getEntitySelectorTitle() {
+		    if (!this.currentApp) {
+		        return 'Select an Application';
+		    }
+		    if (this.currentPath.length === 0) {
+		        return 'Select a Tenant';
+		    }
+		    return 'Select an Item';
+		}
+
+		// ✅ HELPER: Get dot color
+		getEntityDotColor(item, isAppSelector) {
+		    // Generate from name/displayname hash
+		    const name = item.name || item.displayname || item.ID || '';
+		    let hash = 0;
+		    for (let i = 0; i < name.length; i++) {
+		        hash = name.charCodeAt(i) + ((hash << 5) - hash);
+		    }
+		    const hue = Math.abs(hash) % 360;
+		    const saturation = isAppSelector ? 70 : 60;
+		    return `hsl(${hue}, ${saturation}%, 50%)`;
+		}
+
+		// Update handleEntitySelectorClick:
+		handleEntitySelectorClick(item, isAppSelector, isTenantSelector) {
+		    console.log('[handleEntitySelectorClick] START');
+		    console.log('[handleEntitySelectorClick] item:', item);
+		    console.log('[handleEntitySelectorClick] isAppSelector:', isAppSelector);
+		    console.log('[handleEntitySelectorClick] isTenantSelector:', isTenantSelector);
+		    
+		    if (isAppSelector) {
+		        console.log('[handleEntitySelectorClick] APP SELECTOR - navigating to app');
+		        const appId = item.ID || item.id;
+		        console.log('[handleEntitySelectorClick] App ID:', appId);
+		        const newUrl = `/t/apps/${appId}`;
+		        console.log('[handleEntitySelectorClick] New URL:', newUrl);
+		        
+		        window.history.pushState({ appId: appId, fromAppSelector: true }, '', newUrl);
+		        console.log('[handleEntitySelectorClick] History state set');
+		        console.log('[handleEntitySelectorClick] Calling init()...');
+		        this.init();
+		        console.log('[handleEntitySelectorClick] init() called');
+		    } else if (isTenantSelector) {
+		        console.log('[handleEntitySelectorClick] TENANT SELECTOR - navigating to tenant');
+		        const displayName = item.displayname || item.ID || '';
+		        console.log('[handleEntitySelectorClick] Display name:', displayName);
+		        
+		        const parts = displayName.split('/');
+		        const tenantId = parts[parts.length - 1] || displayName;
+		        console.log('[handleEntitySelectorClick] Extracted tenant ID:', tenantId);
+		        
+		        const newPath = [{
+		            id: tenantId,
+		            displayID: tenantId,
+		            shortName: tenantId.substring(0, 8),
+		            entityType: this.currentApp?.hierarchy?.[0] || 'tenant'
+		        }];
+		        
+		        console.log('[handleEntitySelectorClick] New path:', newPath);
+		        const newUrl = this.getAppUrl(newPath);
+		        console.log('[handleEntitySelectorClick] New URL:', newUrl);
+		        
+		        window.history.pushState({ path: newPath }, '', newUrl);
+		        console.log('[handleEntitySelectorClick] History state set');
+		        console.log('[handleEntitySelectorClick] Calling init()...');
+		        this.init();
+		        console.log('[handleEntitySelectorClick] init() called');
+		    } else {
+		        console.log('[handleEntitySelectorClick] Neither app nor tenant selector - no action');
+		    }
+		}
+
+	// Setup search functionality - FIXED VERSION
+	setupSearch() {
+	    const searchInput = document.getElementById('entity-search');
+	    const searchClear = document.getElementById('search-clear');
+
+	    if (!searchInput) return;
+
+	    // Handle search input changes
+	    searchInput.addEventListener('input', (e) => {
+	        const term = e.target.value.trim();
+	        
+	        // Show/hide clear button
+	        if (searchClear) {
+	            searchClear.style.display = term.length > 0 ? 'block' : 'none';
+	        }
+	        
+	        // Trigger search if term is long enough
+	        if (term.length >= 3) {
+	            this.handleSearch(term);
+	        } else if (term.length === 0) {
+	            this.handleSearch(''); // Clear search when empty
+	        }
+	    });
+
+	    // Handle Enter key
+	    searchInput.addEventListener('keypress', (e) => {
+	        if (e.key === 'Enter') {
+	            e.preventDefault();
+	            const term = searchInput.value.trim();
+	            this.handleSearch(term);
+	        }
+	    });
+
+	    // Handle Escape key to clear search
+	    searchInput.addEventListener('keydown', (e) => {
+	        if (e.key === 'Escape') {
+	            searchInput.value = '';
+	            if (searchClear) {
+	                searchClear.style.display = 'none';
+	            }
+	            this.handleSearch('');
+	            searchInput.blur();
+	        }
+	    });
+
+	    // Handle clear button
+	    if (searchClear) {
+	        searchClear.addEventListener('click', (e) => {
+	            e.stopPropagation();
+	            searchInput.value = '';
+	            searchClear.style.display = 'none';
+	            this.handleSearch('');
+	            searchInput.focus(); // Keep focus for better UX
+	        });
+	    }
+	}
+
+	// ✅ NEW METHOD: Main search handler
+	handleSearch(term) {
+	    const searchInput = document.getElementById('entity-search');
+	    const clearBtn = document.getElementById('search-clear');
+	    
+	    if (clearBtn) {
+	        clearBtn.style.display = term ? 'block' : 'none';
+	    }
+	    
+	    // Update search term
+	    this.searchTerm = term;
+	    
+	    if (term.length < 3) {
+	        // Clear search results
+	        this.searchResults = null;
+	        this.render();
+	        return;
+	    }
+	    
+	    // Perform search
+	    this.searchResults = this.performSearch(term.toLowerCase());
+	    this.render();
+	}
+
+	// ✅ NEW METHOD: Perform recursive search through all entities
+	performSearch(searchTerm) {
+	    const results = {
+	        matches: new Set(),           // Direct matches at any level
+	        ancestors: new Set(),         // Ancestors of matches
+	        matchPaths: []                // Full paths to matches
+	    };
+	    
+	    // Start search from root level
+	    this.searchRecursive(this.data.items, [], searchTerm, results);
+	    
+	    return results;
+	}
+
+	// ✅ NEW METHOD: Recursive search helper
+	searchRecursive(items, currentPath, searchTerm, results) {
+	    if (!items || !Array.isArray(items)) return;
+	    
+	    items.forEach(item => {
+	        const currentPathWithItem = [...currentPath, item];
+	        const currentDepth = currentPathWithItem.length - 1;
+	        const entityType = this.currentApp.hierarchy[currentDepth] || `level_${currentDepth}`;
+	        
+	        // Check if this item matches the search term
+	        const isMatch = this.itemMatchesSearch(item, searchTerm, entityType);
+	        
+	        if (isMatch) {
+	            // Add this item as a direct match
+	            results.matches.add(item.ID);
+	            results.matchPaths.push([...currentPathWithItem]);
+	            
+	            // Add all ancestors to ancestors set
+	            for (let i = 0; i < currentPath.length; i++) {
+	                results.ancestors.add(currentPath[i].ID);
+	            }
+	        }
+	        
+	        // Recursively search children
+	        const config = this.currentApp.entityConfigs[entityType];
+	        if (config && config.childrenField && item[config.childrenField]) {
+	            this.searchRecursive(item[config.childrenField], currentPathWithItem, searchTerm, results);
+	        }
+	    });
+	}
+
+	// ✅ NEW METHOD: Check if item matches search term
+	itemMatchesSearch(item, searchTerm, entityType) {
+	    if (!item) return false;
+	    
+	    // Get entity configuration to know which fields to search
+	    const entityConfig = this.nativeEntities?.[entityType];
+	    const searchableFields = entityConfig?.fields?.filter(field => 
+	        field.writePermission !== 'system' && 
+	        field.name !== 'ID' && 
+	        field.name !== 'displayID' &&
+	        field.name !== 'dotLabel' &&
+	        field.name !== 'timestamp' &&
+	        field.name !== 'count' &&
+	        field.name !== 'hidden' &&
+	        field.name !== 'hashed'
+	    ) || [];
+	    
+	    // Search in all relevant fields
+	    for (const field of searchableFields) {
+	        const value = item[field.name];
+	        if (value !== undefined && value !== null) {
+	            const stringValue = String(value).toLowerCase();
+	            if (stringValue.includes(searchTerm)) {
+	                return true;
+	            }
+	        }
+	    }
+	    
+	    // Also search in name and dotLabel as fallback
+	    if (item.name && String(item.name).toLowerCase().includes(searchTerm)) {
+	        return true;
+	    }
+	    if (item.dotLabel && String(item.dotLabel).toLowerCase().includes(searchTerm)) {
+	        return true;
+	    }
+	    
+	    return false;
+	}
+
+	// ✅ NEW METHOD: Check if item should be visible based on search
+	shouldShowItemInSearch(item) {
+	    if (!this.searchResults) return true;
+	    
+	    const currentDepth = this.currentPath.length;
+	    const isCurrentLevel = (this.getEntityDepth(item) === currentDepth);
+	    
+	    if (isCurrentLevel) {
+	        // At current level: show matches in color, ancestors in gray, hide others
+	        if (this.searchResults.matches.has(item.ID)) {
+	            return 'match'; // Show in color
+	        } else if (this.searchResults.ancestors.has(item.ID)) {
+	            return 'ancestor'; // Show in gray
+	        } else {
+	            return 'hide'; // Hide completely
+	        }
+	    } else {
+	        // Not at current level - let normal rendering handle it
+	        return true;
+	    }
+	}
+
+	// ✅ NEW METHOD: Get entity depth
+	getEntityDepth(entity) {
+	    // This is tricky without full path, but we can estimate based on current context
+	    // For now, we'll use the current path length as reference
+	    return this.currentPath.length;
+	}
+
+	getItemLabel(item, entityType) {
+	  const config = this.currentApp?.entityConfigs?.[entityType];
+	  const labelField = config?.labelField || 'name';
+
+	  // 1. Explicit dotLabel always wins for dot display
+	  if (item.dotLabel) return String(item.dotLabel);
+
+	  // 2. Configured labelField
+	  if (config?.labelField && item[config.labelField] != null) {
+	    return String(item[config.labelField]);
+	  }
+
+	  // 3. Name fallback
+	  if (item.name != null) return String(item.name);
+
+	  // 4. DisplayID fallback
+	  return item.displayID || item.ID || 'UNK';
+	}
+	
+	// ✅ ADD THIS HELPER (10 lines)
+	generateAppColor(name) {
+	    // Simple deterministic color from name
+	    let hash = 0;
+	    for (let i = 0; i < name.length; i++) {
+	        hash = name.charCodeAt(i) + ((hash << 5) - hash);
+	    }
+	    const hue = Math.abs(hash) % 360;
+	    return `hsl(${hue}, 70%, 50%)`;
+	}
+	
+	getDotColor(item, entityType) {
+	    // Get unique identifier for this item
+	    const itemId = this.getItemId(item, entityType) || 
+	                  this.getItemLabel(item, entityType) || 
+	                  `item_${Math.random()}`;
+	    
+	    // Create seeded random generator based on item ID (same as position logic)
+	    const seedValue = this.hashCode(itemId);
+	    const seed = new SeededRandom(seedValue);
+	    
+	    // Generate RGB values using seeded random
+	    let r = Math.floor(seed.randomBetween(0, 255));
+	    let g = Math.floor(seed.randomBetween(0, 255));
+	    let b = Math.floor(seed.randomBetween(0, 255));
+	    
+	    // Ensure colors are not too dark/dim
+	    const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+	    const minBrightness = 120; // Adjust this value as needed
+	    
+	    if (brightness < minBrightness) {
+	        // Scale up the color to make it brighter
+	        const scale = minBrightness / brightness;
+	        r = Math.min(255, Math.floor(r * scale));
+	        g = Math.min(255, Math.floor(g * scale));
+	        b = Math.min(255, Math.floor(b * scale));
+	    }
+	    
+	    // Ensure colors are not too light/washed out
+	    const maxBrightness = 220;
+	    if (brightness > maxBrightness) {
+	        const scale = maxBrightness / brightness;
+	        r = Math.floor(r * scale);
+	        g = Math.floor(g * scale);
+	        b = Math.floor(b * scale);
+	    }
+	    
+	    return `rgb(${r}, ${g}, ${b})`;
+	}
+
+	getFieldLabel(fieldName, entityType) {
+	    const entityConfig = this.currentApp.entityConfigs[entityType];
+	    if (entityConfig && entityConfig.fields) {
+	        const fieldConfig = entityConfig.fields.find(f => f.name === fieldName);
+	        return fieldConfig?.label || fieldName;
+	    }
+	    return fieldName.charAt(0).toUpperCase() + fieldName.slice(1);
+	}
+
+	truncateText(text, maxLength) {
+	    if (!text || text.length <= maxLength) return text;
+	    return text.substring(0, maxLength - 3) + '...';
+	}
+	
+
+
+	// Add this new method to handle all dot interactions
+	attachDotInteractionHandlers(dot, item, entityType) {
+	    const self = this;
+	    const isMobile = window.innerWidth <= 768;
+		
+    
+	    // Desktop: Hover with 1 second delay
+	    if (!isMobile) {
+			let hoverTimer = null;
+			let isTransformed = false;
+			let transformTime = 0;  // ← track when transformation happened
+			
+			let moveHandler;
+			const startCardWatchdog = () => {
+			    moveHandler = (e) => {
+			        if (!isTransformed) {
+			            document.removeEventListener('mousemove', moveHandler);
+			            return;
+			        }
+			        const rect = dot.getBoundingClientRect();
+			        const buffer = 10;
+			        const isOutside = (
+			            e.clientX < rect.left - buffer ||
+			            e.clientX > rect.right + buffer ||
+			            e.clientY < rect.top - buffer ||
+			            e.clientY > rect.bottom + buffer
+			        );
+			        if (isOutside) {
+			            document.removeEventListener('mousemove', moveHandler);
+			            self.transformCardToDot(dot);
+			            isTransformed = false;
+			        }
+			    };
+			    document.addEventListener('mousemove', moveHandler);
+			};
+
+			dot.addEventListener('mouseenter', (__e__) => {
+			    if (hoverTimer) clearTimeout(hoverTimer);
+
+			    hoverTimer = setTimeout(() => {
+			        if (!isTransformed) {
+			            self.transformDotToCard(dot, item, entityType);
+			            isTransformed = true;
+			            transformTime = Date.now(); 
+						startCardWatchdog();
+			        }
+			    }, 600);
+			});
+
+			dot.addEventListener('pointerleave', (__e__) => {
+			    if (hoverTimer) {
+			        clearTimeout(hoverTimer);
+			        hoverTimer = null;
+			    }
+			    if (isTransformed) return; // watchdog handles collapse
+			});
+	        
+	        // Click handler for navigation
+			dot.addEventListener('click', async (e) => {
+								
+			    if (!isTransformed) {
+					
+					 const level = this.currentPath.length;
+					 const slot = this.currentApp?.hierarchy?.[level];
+					 if (window.CompositeEntityHelper?.isComposite(slot)) {
+					     const state = window.CompositeEntityHelper.getCompletionState(dot.itemData, slot);
+					     if (state !== 'complete') {
+					         __e__.preventDefault();
+					         __e__.stopPropagation();
+					         this.openCompositeModal(slot, dot.itemData, () => { this.render(); }, null);
+					         return;
+					     }
+					 }
+					 
+			        const item = dot.itemData;
+			        const entityType = item.entityType;
+			        const entityConfig = this.currentApp.entityConfigs[entityType];
+			        
+			        // ✅ Check if this entity has children (can be navigated to)
+			        if (!entityConfig.childrenField) {
+			            // This is a leaf node - handle differently
+			            // For example, open detail view, chat, or do nothing
+			            console.log('Leaf node clicked - no navigation:', entityType);
+			            
+			            // If it has chat support, open chat
+						if (item.convid && typeof item.convid === 'string' && item.convid.trim()) {
+				            console.log('[Dot Click] Opening chat with convid:', item.convid);
+				            this.openChatView(item.convid, entityType, item);
+				        }
+			            return;
+			        }
+			        
+			        // Only navigate if entity has children
+			        this.navigateTo(item, entityType);
+			    }
+			});
+	    }
+	    
+	    // Mobile: Long-press for card, tap for navigation
+	    if (isMobile) {
+	        let pressTimer = null;
+	        let isLongPress = false;
+	        let startX = 0;
+	        let startY = 0;
+	        
+	        dot.addEventListener('touchstart', (e) => {
+	            e.preventDefault();
+	            isLongPress = false;
+	            
+	            // Record starting touch position
+	            const touch = e.touches[0];
+	            startX = touch.clientX;
+	            startY = touch.clientY;
+	            
+	            // Set timer for long press (1 second)
+	            pressTimer = setTimeout(() => {
+	                isLongPress = true;
+	                self.transformDotToCard(dot, item, entityType);
+	            }, 600);
+	        });
+	        
+	        dot.addEventListener('touchmove', (e) => {
+	            // Cancel long press if finger moves too much
+	            const touch = e.touches[0];
+	            const moveX = Math.abs(touch.clientX - startX);
+	            const moveY = Math.abs(touch.clientY - startY);
+	            
+	            if (moveX > 10 || moveY > 10) {
+	                clearTimeout(pressTimer);
+	            }
+	        });
+	        
+	        dot.addEventListener('touchend', (e) => {
+	            clearTimeout(pressTimer);
+				
+				// COMPOSITE GUARD — add these lines
+				 const level = this.currentPath.length;
+				 const slot = this.currentApp?.hierarchy?.[level];
+				 if (window.CompositeEntityHelper?.isComposite(slot)) {
+				     const state = window.CompositeEntityHelper.getCompletionState(dot.itemData, slot);
+				     if (state !== 'complete') {
+				         e.preventDefault();
+				         e.stopPropagation();
+				         this.openCompositeModal(slot, dot.itemData, () => { this.render(); }, null);
+				         return;
+				     }
+				 }
+	            
+				if (!isLongPress) {
+				    // ✅ CHECK FOR CHAT BEFORE NAVIGATION
+				    if (item.convid && typeof item.convid === 'string' && item.convid.trim()) {
+				        console.log('[Mobile Tap] Opening chat with convid:', item.convid);
+				        self.openChatView(item.convid, entityType, item);
+				    } else {
+				        // Only navigate if entity supports children
+				        const entityConfig = self.currentApp.entityConfigs[entityType];
+						// In the else block:
+						if (entityConfig && entityConfig.childrenField) {
+						    self.navigateTo(item, entityType);
+						} else {
+						    // Leaf node without chat - show card on short tap too
+						    self.transformDotToCard(dot, item, entityType);
+						}
+				       
+				    }
+				}
+
+	        });
+	        
+	        dot.addEventListener('touchcancel', () => {
+	            clearTimeout(pressTimer);
+	        });
+	    }
+	}
+	
+	openChatView(convid, entityType, item) {
+	    console.log('Opening chat view for11', entityType, 'with convid:', convid);
+	    
+	    // Create or get chat container
+	    let chatContainer = document.getElementById('chat-container');
+	    if (!chatContainer) {
+	        chatContainer = document.createElement('div');
+	        chatContainer.id = 'chat-container';
+	        // ✅ Append to body to avoid parent clipping issues
+	        document.body.appendChild(chatContainer);
+	    }
+		
+		console.log('Opening chat view for2', entityType, 'with convid:', convid);
+		// Add this line in openChatView(), after creating chatContainer:
+		this._pendingAttachment = null; // ✅ Track pending attachment
+	    
+		console.log('Opening chat view for3', entityType, 'with convid:', convid);
+	    const isMobile = window.innerWidth <= 768;
+	    
+	    if (isMobile) {
+	        // Mobile: Full screen overlay with semi-transparent background
+	        Object.assign(chatContainer.style, {
+	            position: 'fixed',
+	            top: '0',
+	            left: '0',
+	            width: '100%',
+	            height: '100%',
+	            background: 'rgba(0, 0, 0, 0.3)',
+	            backdropFilter: 'blur(2px)',
+	            zIndex: '1000',
+	            display: 'flex',
+	            alignItems: 'center',
+	            justifyContent: 'center'
+	        });
+	        
+			console.log('🔎 DEBUG: About to call loadChatInterface');
+			console.log('🔎 DEBUG: this.loadChatInterface type =', typeof this.loadChatInterface);
+			console.log('🔎 DEBUG: this =', this?.constructor?.name || typeof this);
+			
+	        this.loadChatInterface(convid, entityType, item, isMobile);
+	        setTimeout(() => chatContainer.classList.add('loaded'), 10);
+	        
+	    } else {
+	        // Desktop: Right sidebar with canvas shifting
+	        Object.assign(chatContainer.style, {
+	            position: 'fixed',
+	            top: '0',
+	            right: '0',
+	            width: '400px',
+	            height: '100%',
+	            background: 'white',
+	            zIndex: '1001', // ✅ Higher z-index than canvas
+	            boxShadow: '-4px 0 20px rgba(0, 0, 0, 0.15)',
+	            display: 'flex',
+	            flexDirection: 'column',
+	            transform: 'translateX(400px)',
+	            opacity: '0',
+	            transition: 'transform 0.3s ease, opacity 0.3s ease'
+	        });
+	        
+	        // ✅ Shift main canvas BEFORE loading chat interface
+	        const canvas = document.getElementById('canvas-area');
+	        if (canvas) {
+	            canvas.classList.add('chat-open');
+	        }
+			
+			console.log('🔎 DEBUG: About to call loadChatInterface');
+			console.log('🔎 DEBUG: this.loadChatInterface type =', typeof this.loadChatInterface);
+			console.log('🔎 DEBUG: this =', this?.constructor?.name || typeof this);
+	        
+	        this.loadChatInterface(convid, entityType, item, isMobile);
+	        
+	        // Animate chat container in
+	        setTimeout(() => {
+	            chatContainer.style.transform = 'translateX(0)';
+	            chatContainer.style.opacity = '1';
+	        }, 10);
+	    }
+	}
+
+	closeChatView() {
+		this._activeChatItem = null;
+	    const chatContainer = document.getElementById('chat-container');
+	    if (chatContainer) {
+	        // Animate out first
+	        chatContainer.style.transform = 'translateX(400px)';
+	        chatContainer.style.opacity = '0';
+	        
+	        setTimeout(() => {
+	            chatContainer.remove();
+	            
+	            // ✅ Restore canvas after animation
+	            const canvas = document.getElementById('canvas-area');
+	            if (canvas) {
+	                canvas.classList.remove('chat-open');
+	            }
+	        }, 300);
+	    }
+	}
+	
+	// ✅ Convert File to base64 data URL (Promise-based)
+	fileToBase64(file) {
+	    return new Promise((resolve, reject) => {
+	        const reader = new FileReader();
+	        reader.onload = () => resolve(reader.result); // Returns image/jpeg;base64,...
+	        reader.onerror = reject;
+	        reader.readAsDataURL(file);
+	    });
+	}
+	
+	// ✅ Base64 conversion with simulated progress callback (for UX)
+	fileToBase64WithProgress(file, onProgress) {
+	    return new Promise((resolve, reject) => {
+	        const reader = new FileReader();
+	        
+	        // Simulate progress for better UX (real encoding is near-instant for resized images)
+	        let simulatedProgress = 0;
+	        const progressInterval = setInterval(() => {
+	            simulatedProgress += Math.random() * 15;
+	            if (simulatedProgress < 95) {
+	                onProgress?.(Math.min(95, simulatedProgress));
+	            }
+	        }, 100);
+	        
+	        reader.onload = () => {
+	            clearInterval(progressInterval);
+	            onProgress?.(100);
+	            resolve(reader.result);
+	        };
+	        
+	        reader.onerror = () => {
+	            clearInterval(progressInterval);
+	            reject(reader.error);
+	        };
+	        
+	        reader.readAsDataURL(file);
+	    });
+	}
+	
+	// ✅ Format file size for human-readable display
+	formatFileSize(bytes) {
+	    if (bytes === 0) return '0 Bytes';
+	    const k = 1024;
+	    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+	    const i = Math.floor(Math.log(bytes) / Math.log(k));
+	    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+	}
+	
+	// ✅ Show inline upload progress indicator (non-blocking, matches your theme)
+	showUploadProgress(percentage = null, statusText = 'Uploading...') {
+	    // Remove any existing indicator
+	    const existing = document.getElementById('upload-progress-indicator');
+	    if (existing) existing.remove();
+	    
+	    const indicator = document.createElement('div');
+	    indicator.id = 'upload-progress-indicator';
+	    
+	    Object.assign(indicator.style, {
+	        position: 'absolute',
+	        bottom: '100%',
+	        left: '16px',
+	        right: '16px',
+	        background: 'rgba(255, 255, 255, 0.98)',
+	        border: '1px solid #e0e0e0',
+	        borderRadius: '10px',
+	        padding: '10px 14px',
+	        marginBottom: '8px',
+	        boxShadow: '0 4px 20px rgba(0, 0, 0, 0.12)',
+	        display: 'flex',
+	        alignItems: 'center',
+	        gap: '10px',
+	        zIndex: '100',
+	        animation: 'slideUp 0.2s ease',
+	        fontSize: '13px',
+	        color: '#333'
+	    });
+	    
+	    // Spinner
+	    const spinner = document.createElement('div');
+	    Object.assign(spinner.style, {
+	        width: '18px',
+	        height: '18px',
+	        border: '2px solid #e0e0e0',
+	        borderTop: `2px solid #667eea`,
+	        borderRadius: '50%',
+	        animation: 'spin 1s linear infinite',
+	        flexShrink: '0'
+	    });
+	    
+	    // Info container
+	    const info = document.createElement('div');
+	    info.style.flex = '1';
+	    info.style.minWidth = '0';
+	    
+	    const text = document.createElement('div');
+	    text.textContent = statusText;
+	    text.style.fontWeight = '500';
+	    text.style.marginBottom = '4px';
+	    
+	    // Progress bar (shown when percentage provided)
+	    const barContainer = document.createElement('div');
+	    Object.assign(barContainer.style, {
+	        height: '4px',
+	        background: '#f0f0f0',
+	        borderRadius: '2px',
+	        overflow: 'hidden',
+	        display: percentage !== null ? 'block' : 'none'
+	    });
+	    
+	    const barFill = document.createElement('div');
+	    Object.assign(barFill.style, {
+	        height: '100%',
+	        width: `${percentage || 0}%`,
+	        background: 'linear-gradient(90deg, #667eea, #764ba2)',
+	        borderRadius: '2px',
+	        transition: 'width 0.3s ease'
+	    });
+	    barFill.id = 'progress-bar-fill';
+	    
+	    barContainer.appendChild(barFill);
+	    info.appendChild(text);
+	    if (percentage !== null) info.appendChild(barContainer);
+	    
+	    indicator.appendChild(spinner);
+	    indicator.appendChild(info);
+	    
+	    // Insert above input area
+	    const chatContainer = document.getElementById('chat-container');
+	    const inputArea = chatContainer?.querySelector('#chat-input')?.closest('div[style*="padding: 16px"]');
+	    
+	    if (inputArea) {
+	        inputArea.parentNode.insertBefore(indicator, inputArea);
+	    } else {
+	        chatContainer?.appendChild(indicator);
+	    }
+	    
+	    // Add CSS animations (idempotent)
+	    if (!document.getElementById('upload-progress-styles')) {
+	        const style = document.createElement('style');
+	        style.id = 'upload-progress-styles';
+	        style.textContent = `
+	            @keyframes spin { to { transform: rotate(360deg); } }
+	            @keyframes slideUp { 
+	                from { opacity: 0; transform: translateY(10px); } 
+	                to { opacity: 1; transform: translateY(0); } 
+	            }
+	        `;
+	        document.head.appendChild(style);
+	    }
+	    
+	    return {
+	        update: (newPercentage, newText) => {
+	            if (newPercentage !== null) {
+	                const fill = document.getElementById('progress-bar-fill');
+	                if (fill) fill.style.width = `${Math.min(100, newPercentage)}%`;
+	                text.textContent = newText || `Uploading... ${newPercentage}%`;
+	            } else if (newText) {
+	                text.textContent = newText;
+	            }
+	        },
+	        hide: () => {
+	            indicator.style.opacity = '0';
+	            indicator.style.transform = 'translateY(-5px)';
+	            setTimeout(() => indicator.remove(), 200);
+	        }
+	    };
+	}
+	
+	// ✅ Initialize attachment event handlers (paste, file picker, camera)
+	setupAttachmentHandlers(convid) {
+	    const fileInput = document.getElementById('file-input');
+	    const attachBtn = document.getElementById('attach-btn');
+	    const cameraBtn = document.getElementById('camera-btn');
+	    const removeBtn = document.getElementById('remove-attachment');
+	    const preview = document.getElementById('attachment-preview');
+	    const chatInput = document.getElementById('chat-input');
+	    
+	    // Show camera button if device supports it (requires HTTPS)
+	    if (navigator.mediaDevices?.getUserMedia) {
+	        cameraBtn.style.display = 'flex';
+	    }
+	    
+	    // File picker trigger
+	    attachBtn.addEventListener('click', () => fileInput.click());
+	    
+	    // Camera capture
+	    cameraBtn.addEventListener('click', async () => {
+	        try {
+	            const stream = await navigator.mediaDevices.getUserMedia({ 
+	                video: { facingMode: 'environment' } 
+	            });
+	            
+	            const overlay = document.createElement('div');
+	            Object.assign(overlay.style, {
+	                position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
+	                background: 'rgba(0,0,0,0.95)', zIndex: 2001, display: 'flex',
+	                flexDirection: 'column', alignItems: 'center', justifyContent: 'center'
+	            });
+	            
+	            const video = document.createElement('video');
+	            video.autoplay = true; video.playsInline = true;
+	            video.style.maxWidth = '90%'; video.style.maxHeight = '70%';
+	            video.srcObject = stream;
+	            
+	            const captureBtn = document.createElement('button');
+	            captureBtn.textContent = '📸 Capture';
+	            Object.assign(captureBtn.style, {
+	                margin: '20px', padding: '12px 24px', fontSize: '16px',
+	                background: '#667eea', color: 'white', border: 'none',
+	                borderRadius: '8px', cursor: 'pointer'
+	            });
+	            
+	            const cancelBtn = document.createElement('button');
+	            cancelBtn.textContent = 'Cancel';
+	            Object.assign(cancelBtn.style, {
+	                padding: '8px 16px', background: '#666', color: 'white',
+	                border: 'none', borderRadius: '4px', cursor: 'pointer'
+	            });
+	            
+	            overlay.appendChild(video);
+	            overlay.appendChild(captureBtn);
+	            overlay.appendChild(cancelBtn);
+	            document.body.appendChild(overlay);
+	            
+	            captureBtn.onclick = () => {
+	                const canvas = document.createElement('canvas');
+	                canvas.width = video.videoWidth;
+	                canvas.height = video.videoHeight;
+	                canvas.getContext('2d').drawImage(video, 0, 0);
+	                
+	                canvas.toBlob(async (blob) => {
+	                    stream.getTracks().forEach(track => track.stop());
+	                    overlay.remove();
+	                    
+	                    const file = new File([blob], `photo-${Date.now()}.jpg`, { type: 'image/jpeg' });
+	                    await this.handleAttachmentFile(file, convid);
+	                }, 'image/jpeg', 0.9);
+	            };
+	            
+	            cancelBtn.onclick = () => {
+	                stream.getTracks().forEach(track => track.stop());
+	                overlay.remove();
+	            };
+	            
+	        } catch (err) {
+	            console.error('Camera access denied:', err);
+	            alert('Camera access required. Please allow permissions.');
+	        }
+	    });
+	    
+	    // File selection handler
+	    fileInput.addEventListener('change', (e) => {
+	        const file = e.target.files[0];
+	        if (file) this.handleAttachmentFile(file, convid);
+	        fileInput.value = ''; // Reset for re-selecting same file
+	    });
+	    
+	    // Paste handler for images
+	    chatInput.addEventListener('paste', async (e) => {
+	        const items = e.clipboardData?.items;
+	        if (!items) return;
+	        
+	        for (let item of items) {
+	            if (item.type?.startsWith('image/')) {
+	                e.preventDefault();
+	                const file = item.getAsFile();
+	                await this.handleAttachmentFile(file, convid);
+	                break;
+	            }
+	        }
+	    });
+	    
+	    // Remove attachment
+	    removeBtn.addEventListener('click', () => {
+	        this._pendingAttachment = null;
+	        preview.style.display = 'none';
+	        chatInput.focus();
+	    });
+	    
+	    // Click preview to enlarge image (reuses your showImageOverlay)
+	    preview.addEventListener('click', (e) => {
+	        if (e.target.id !== 'remove-attachment' && this._pendingAttachment?.previewUrl) {
+	            this.showImageOverlay(this._pendingAttachment.previewUrl);
+	        }
+	    });
+	}
+	
+	// ✅ Process selected/pasted file: validate, resize images, show preview
+	async handleAttachmentFile(file, convid) {
+	    // Validate file type
+	    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 
+	                         'application/pdf', 'application/msword', 
+	                         'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+	                         'text/plain'];
+	    
+	    if (!allowedTypes.includes(file.type)) {
+	        alert('Unsupported file type. Please use images, PDF, DOC, or TXT files.');
+	        return;
+	    }
+	    
+	    // Validate file size (10MB limit)
+	    const maxSize = 10 * 1024 * 1024;
+	    if (file.size > maxSize) {
+	        alert('File too large. Maximum size is 10MB.');
+	        return;
+	    }
+	    
+	    const preview = document.getElementById('attachment-preview');
+	    const previewName = document.getElementById('preview-name');
+	    
+	    // Handle image files: resize + generate preview
+	    if (file.type.startsWith('image/')) {
+	        try {
+	            // Reuse your existing resizeImage method for optimization
+	            const resizedDataUrl = await this.resizeImage(file, 1200, 900);
+	            
+	            this._pendingAttachment = {
+	                file: file,
+	                previewUrl: resizedDataUrl,
+	                type: 'image',
+	                name: file.name
+	            };
+	            
+	            previewName.textContent = `🖼️ ${file.name}`;
+	            preview.style.background = `url(${resizedDataUrl}) no-repeat center right 10px`;
+	            preview.style.backgroundSize = '40px 40px';
+	            preview.style.paddingLeft = '50px';
+	            
+	        } catch (err) {
+	            console.error('Image resize failed:', err);
+	            // Fallback to original
+	            const previewUrl = URL.createObjectURL(file);
+	            this._pendingAttachment = { file, previewUrl, type: 'image', name: file.name };
+	            previewName.textContent = `🖼️ ${file.name}`;
+	        }
+	    } 
+	    // Handle document files
+	    else {
+	        const icons = {
+	            'application/pdf': '📄',
+	            'application/msword': '📘',
+	            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '📘',
+	            'text/plain': '📝'
+	        };
+	        const icon = icons[file.type] || '📎';
+	        
+	        this._pendingAttachment = {
+	            file: file,
+	            type: 'document',
+	            name: file.name,
+	            size: this.formatFileSize(file.size)
+	        };
+	        
+	        previewName.innerHTML = `${icon} <strong>${file.name}</strong><br><small style="color:#666">${this._pendingAttachment.size}</small>`;
+	        preview.style.background = '#f8f9ff';
+	        preview.style.paddingLeft = '12px';
+	    }
+	    
+	    // Show preview area with animation
+	    preview.style.display = 'flex';
+	    preview.style.opacity = '0';
+	    preview.style.transform = 'translateY(-5px)';
+	    setTimeout(() => {
+	        preview.style.transition = 'all 0.2s ease';
+	        preview.style.opacity = '1';
+	        preview.style.transform = 'translateY(0)';
+	    }, 10);
+	    
+	    // Focus input for continued typing
+	    document.getElementById('chat-input')?.focus();
+	}
+	
+	scrollChatToBottom() {
+	    const messagesDiv = document.getElementById('chat-messages');
+	    if (messagesDiv) {
+	        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+	    }
+	}
+	
+	loadChatInterface(convid, entityType, item, isMobile) {
+	    this._activeChatItem = item;
+	    this._pendingAttachment = null;
+	    
+	    const chatContainer = document.getElementById('chat-container');
+	    if (!chatContainer) {
+	        console.error('❌ chat-container not found');
+	        return;
+	    }
+	    
+	    // ✅ Clear container
+	    chatContainer.innerHTML = '';
+	    
+	    if (isMobile) {
+	        // ✅ MOBILE: Card-like container centered on screen
+	        const chatContent = document.createElement('div');
+	        chatContent.id = 'chat-content';
+	        chatContent.style.cssText = 'background:white;border-radius:16px;width:95%;max-width:500px;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 10px 30px rgba(0,0,0,0.3);overflow:hidden;';
+	        
+	        // Header
+	        const header = document.createElement('div');
+	        header.style.cssText = 'padding:16px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;';
+	        header.innerHTML = `
+	            <h3 style="margin:0;font-size:18px">Chat: ${item.name || item.orgname || entityType}</h3>
+	            <button id="close-chat" style="background:#667eea;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:14px">✕</button>
+	        `;
+	        chatContent.appendChild(header);
+	        
+	        // Messages
+	        const messagesDiv = document.createElement('div');
+	        messagesDiv.id = 'chat-messages';
+	        messagesDiv.style.cssText = 'padding:16px;flex:1;overflow-y:auto;min-height:300px;';
+	        chatContent.appendChild(messagesDiv);
+	        
+	        // Row 1: Attach + Input
+	        const inputRow = document.createElement('div');
+	        inputRow.style.cssText = 'display:flex;gap:8px;padding:12px 16px;border-top:1px solid #eee;align-items:center;flex-shrink:0;';
+	        
+	        const attachBtn = document.createElement('button');
+	        attachBtn.id = 'attach-btn';
+	        attachBtn.title = 'Attach file';
+	        attachBtn.textContent = '📎';
+	        attachBtn.style.cssText = 'background:#f5f5f5;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:18px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;flex-shrink:0;';
+	        
+	        const cameraBtn = document.createElement('button');
+	        cameraBtn.id = 'camera-btn';
+	        cameraBtn.title = 'Take photo';
+	        cameraBtn.textContent = '📷';
+	        cameraBtn.style.cssText = 'background:#f5f5f5;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:18px;width:36px;height:36px;display:none;align-items:center;justify-content:center;flex-shrink:0;';
+	        
+	        const fileInput = document.createElement('input');
+	        fileInput.type = 'file';
+	        fileInput.id = 'file-input';
+	        fileInput.hidden = true;
+	        fileInput.accept = 'image/*,.pdf,.doc,.docx,.txt';
+	        
+	        const chatInput = document.createElement('input');
+	        chatInput.type = 'text';
+	        chatInput.id = 'chat-input';
+	        chatInput.placeholder = 'Type a message... ';
+	        chatInput.style.cssText = 'flex:1;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:14px;min-width:0;';
+	        
+	        const preview = document.createElement('div');
+	        preview.id = 'attachment-preview';
+	        preview.style.cssText = 'display:none;flex:1;background:#f8f9ff;border:1px dashed #667eea;border-radius:8px;padding:8px 12px;font-size:13px;color:#333;position:relative;min-width:0;';
+	        const previewName = document.createElement('span');
+	        previewName.id = 'preview-name';
+	        previewName.style.cssText = 'word-break:break-all;';
+	        const removeBtn = document.createElement('button');
+	        removeBtn.id = 'remove-attachment';
+	        removeBtn.textContent = '×';
+	        removeBtn.style.cssText = 'position:absolute;right:8px;top:50%;transform:translateY(-50%);background:#ff6b6b;color:white;border:none;border-radius:50%;width:20px;height:20px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;';
+	        preview.appendChild(previewName);
+	        preview.appendChild(removeBtn);
+	        
+	        inputRow.appendChild(attachBtn);
+	        inputRow.appendChild(cameraBtn);
+	        inputRow.appendChild(fileInput);
+	        inputRow.appendChild(chatInput);
+	        inputRow.appendChild(preview);
+	        chatContent.appendChild(inputRow);
+	        
+	        // Row 2: Send button
+	        const sendRow = document.createElement('div');
+	        sendRow.style.cssText = 'padding:0 16px 16px;flex-shrink:0;';
+	        const sendBtn = document.createElement('button');
+	        sendBtn.id = 'send-chat';
+	        sendBtn.textContent = 'Send';
+	        sendBtn.style.cssText = 'width:100%;background:#667eea;color:white;border:none;padding:12px 16px;border-radius:6px;cursor:pointer;font-size:14px;transition:opacity 0.2s;';
+	        sendRow.appendChild(sendBtn);
+	        chatContent.appendChild(sendRow);
+	        
+	        chatContainer.appendChild(chatContent);
+	        
+	    } else {
+	        // ✅ DESKTOP: Full-height sidebar (chatContainer IS the sidebar)
+	        
+	        // Header
+	        const header = document.createElement('div');
+	        header.style.cssText = 'padding:16px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;';
+	        header.innerHTML = `
+	            <h3 style="margin:0;font-size:16px">Chat: ${item.name || item.orgname || entityType}</h3>
+	            <button id="close-chat" style="background:#667eea;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:14px">✕</button>
+	        `;
+	        chatContainer.appendChild(header);
+	        
+	        // Messages
+	        const messagesDiv = document.createElement('div');
+	        messagesDiv.id = 'chat-messages';
+	        messagesDiv.style.cssText = 'padding:16px;flex:1;overflow-y:auto;';
+	        chatContainer.appendChild(messagesDiv);
+	        
+	        // Row 1: Attach + Input
+	        const inputRow = document.createElement('div');
+	        inputRow.style.cssText = 'display:flex;gap:8px;padding:12px 16px;border-top:1px solid #eee;align-items:center;flex-shrink:0;';
+	        
+	        const attachBtn = document.createElement('button');
+	        attachBtn.id = 'attach-btn';
+	        attachBtn.title = 'Attach file';
+	        attachBtn.textContent = '📎';
+	        attachBtn.style.cssText = 'background:#f5f5f5;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:18px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;flex-shrink:0;';
+	        
+	        const cameraBtn = document.createElement('button');
+	        cameraBtn.id = 'camera-btn';
+	        cameraBtn.title = 'Take photo';
+	        cameraBtn.textContent = '📷';
+	        cameraBtn.style.cssText = 'background:#f5f5f5;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:18px;width:36px;height:36px;display:none;align-items:center;justify-content:center;flex-shrink:0;';
+	        
+	        const fileInput = document.createElement('input');
+	        fileInput.type = 'file';
+	        fileInput.id = 'file-input';
+	        fileInput.hidden = true;
+	        fileInput.accept = 'image/*,.pdf,.doc,.docx,.txt';
+	        
+	        const chatInput = document.createElement('input');
+	        chatInput.type = 'text';
+	        chatInput.id = 'chat-input';
+	        chatInput.placeholder = 'Type a message... (paste images supported)';
+	        chatInput.style.cssText = 'flex:1;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:14px;min-width:0;';
+	        
+	        const preview = document.createElement('div');
+	        preview.id = 'attachment-preview';
+	        preview.style.cssText = 'display:none;flex:1;background:#f8f9ff;border:1px dashed #667eea;border-radius:8px;padding:8px 12px;font-size:13px;color:#333;position:relative;min-width:0;';
+	        const previewName = document.createElement('span');
+	        previewName.id = 'preview-name';
+	        previewName.style.cssText = 'word-break:break-all;';
+	        const removeBtn = document.createElement('button');
+	        removeBtn.id = 'remove-attachment';
+	        removeBtn.textContent = '×';
+	        removeBtn.style.cssText = 'position:absolute;right:8px;top:50%;transform:translateY(-50%);background:#ff6b6b;color:white;border:none;border-radius:50%;width:20px;height:20px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;';
+	        preview.appendChild(previewName);
+	        preview.appendChild(removeBtn);
+	        
+	        inputRow.appendChild(attachBtn);
+	        inputRow.appendChild(cameraBtn);
+	        inputRow.appendChild(fileInput);
+	        inputRow.appendChild(chatInput);
+	        inputRow.appendChild(preview);
+	        chatContainer.appendChild(inputRow);
+	        
+	        // Row 2: Send button
+	        const sendRow = document.createElement('div');
+	        sendRow.style.cssText = 'padding:0 16px 16px;flex-shrink:0;';
+	        const sendBtn = document.createElement('button');
+	        sendBtn.id = 'send-chat';
+	        sendBtn.textContent = 'Send';
+	        sendBtn.style.cssText = 'width:100%;background:#667eea;color:white;border:none;padding:12px 16px;border-radius:6px;cursor:pointer;font-size:14px;transition:opacity 0.2s;';
+	        sendRow.appendChild(sendBtn);
+	        chatContainer.appendChild(sendRow);
+	    }
+	    
+	    // EVENT HANDLERS (same for both)
+	    document.getElementById('close-chat').onclick = () => this.closeChatView();
+	    document.getElementById('send-chat').onclick = () => this.sendChatMessage(convid);
+	    const chatInput = document.getElementById('chat-input');
+	    chatInput.onkeypress = (e) => { if (e.key === 'Enter') this.sendChatMessage(convid); };
+	    
+	    // Setup attachment handlers
+	    this.setupAttachmentHandlers(convid);
+	    
+	    // Load messages
+	    this.loadChatMessages(convid).then(() => this.scrollChatToBottom());
+	    
+	    // Focus input
+	    setTimeout(() => chatInput.focus(), 100);
+	    
+	    console.log('✅ Chat interface loaded:', isMobile ? 'Mobile' : 'Desktop');
+	}
+	
+	// Placeholder methods for chat functionality
+	async loadChatMessages(convid) {
+	    const messagesContainer = document.getElementById('chat-messages');
+	    if (!messagesContainer) return;
+	    
+	    try {
+	        // Replace with your actual chat API endpoint
+	        const response = await fetch(`/newauth/api/appschat/${convid}/messages`);
+	        const messages = await response.json();
+	        
+			// Inside loadChatMessages(), when rendering messages:
+
+			let html = '';
+			messages.forEach(msg => {
+			    const isCurrentUser = msg.author === this._getChatAuthorName();
+			    
+			    // ✅ Handle attachment display
+			    let attachmentHTML = '';
+			    if (msg.attachment && msg.attachment.data) {
+			        const att = msg.attachment;
+			        
+			        if (att.type?.startsWith('image/')) {
+			            // ✅ CORRECT: Use att.data DIRECTLY as img src (it's already a data URL)
+			            // DO NOT construct any server URL!
+			            attachmentHTML = `
+			                <div style="margin: 4px 0;">
+			                    <img src="${att.data}" 
+			                         alt="${att.name}" 
+			                         style="max-width: 200px; max-height: 150px; border-radius: 8px; cursor: pointer; object-fit: cover;"
+			                         onclick="this.closest('[data-msg]').__ctx?.showImageOverlay?.('${att.data}')">
+			                    <div style="font-size: 11px; color: #666; margin-top: 4px;">
+			                        📎 ${att.name} (${this.formatFileSize(att.size)})
+			                    </div>
+			                </div>
+			            `;
+			        } else {
+			            // Document file with icon + download
+						// Document file with icon + download (updated button color)
+						const icon = att.type.includes('pdf') ? '📄' : 
+						            att.type.includes('word') ? '📘' : '📎';
+						attachmentHTML = `
+						    <div style="margin: 4px 0; padding: 8px; background: #f8f9ff; 
+						                border-radius: 6px; border-left: 3px solid #667eea;">
+						        <div style="display: flex; align-items: center; gap: 8px;">
+						            <span style="font-size: 18px;">${icon}</span>
+						            <div style="flex: 1; min-width: 0;">
+						                <div style="font-weight: 500; font-size: 13px; word-break: break-all;">
+						                    ${att.name}
+						                </div>
+						                <div style="font-size: 11px; color: #666;">
+						                    ${this.formatFileSize(att.size)}
+						                </div>
+						            </div>
+						            ${att.data ? `
+						            <a href="${att.data}" download="${att.name}" 
+						               style="background: #333; color: white; text-decoration: none; 
+						                      padding: 6px 12px; border-radius: 4px; font-size: 12px; white-space: nowrap;
+						                      transition: background 0.2s;"
+						               onmouseenter="this.style.background='#555'"
+						               onmouseleave="this.style.background='#333'">
+						                Download
+						            </a>` : ''}
+						        </div>
+						    </div>
+						`;
+			        }
+			    }
+			    
+			    // Message bubble
+			    html += `
+			        <div data-msg style="margin-bottom: 12px; display: flex; 
+			                            ${isCurrentUser ? 'justify-content: flex-end' : ''}">
+			            <div style="
+			                max-width: 85%; 
+			                padding: 10px 14px; 
+			                border-radius: 16px; 
+			                background: ${isCurrentUser ? '#667eea' : '#f0f2f5'}; 
+			                color: ${isCurrentUser ? 'white' : '#333'};
+			                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+			            ">
+			                ${attachmentHTML}
+			                ${msg.message ? `<div style="${msg.attachment ? 'margin-top: 8px;' : ''}">${msg.message}</div>` : ''}
+			                <div style="font-size: 10px; opacity: 0.7; margin-top: 4px; text-align: right;">
+			                    ${msg.author} • ${new Date(msg.timestamp || Date.now()).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+			                </div>
+			            </div>
+			        </div>
+			    `;
+			});
+			messagesContainer.innerHTML = html;
+
+			// Make showImageOverlay accessible for inline onclick handlers
+			document.querySelectorAll('[data-msg]').forEach(el => {
+			    el.__ctx = this;
+			});
+	    } catch (error) {
+	        console.error('Failed to load chat messages:', error);
+	        messagesContainer.innerHTML = '<div>No messages yet.</div>';
+	    }
+	}
+	
+	// ✅ ADD TO SchemaOrchestrator CLASS
+	_getChatAuthorName() {
+	    // Author = SECOND-LAST entity in path (tenant for browser1, customer for browser2)
+	    if (this.currentPath.length < 2) {
+	        console.warn('[Chat] Path too short for author:', this.currentPath);
+	        return this.currentApp?.name || 'Unknown'; // Fallback to app name
+	    }
+	    
+	    let authorSegment = 'unknown';
+		
+		if (this.isDataOwner()) {
+			authorSegment = this.currentPath[this.currentPath.length - 2];
+		} else {
+			authorSegment = this.currentPath[this.currentPath.length - 1];
+		}
+		
+		//console.log('DATA dot currentpath' + JSON.stringify(this.currentPath) + ' isdataowner ' + this.isDataOwner());
+	    
+	    // ✅ USE EXACT SAME LOGIC AS WATERMARK (proven reliable)
+	    return authorSegment.shortName || 
+	           authorSegment.displayname || 
+	           authorSegment.displayID || 
+	           authorSegment.name || 
+	           this.getEntityDisplayName(authorSegment.entityType) || 
+	           'Unknown';
+	}
+
+	async sendChatMessage(convid) {
+	    const input = document.getElementById('chat-input');
+	    const message = input.value.trim();
+	    const attachment = this._pendingAttachment;
+	    
+	    // Validate: must have message or attachment
+	    if (!message && !attachment) {
+	        input.focus();
+	        return;
+	    }
+	    
+	    const authorName = this._getChatAuthorName();
+	    
+	    let containerPath = this.currentPath
+	        .map(p => p.displayID) 
+	        .filter(Boolean);
+	            
+	    if (this._activeChatItem?.displayID) {
+	        containerPath.push(this._activeChatItem.displayID);
+	    }
+	    
+	    containerPath = containerPath.length 
+	        ? `apps/${this.currentApp.id}/${containerPath.join('/')}`
+	        : `apps/${this.currentApp.id}`;
+	    
+	    const sendBtn = document.getElementById('send-chat');
+	    if (sendBtn) {
+	        sendBtn.disabled = true;
+	        sendBtn.style.opacity = '0.6';
+	    }
+	    
+	    // ✅ Disable input during upload
+	    input.disabled = true;
+	    input.placeholder = 'Sending...';
+	    document.getElementById('attach-btn')?.setAttribute('disabled', 'true');
+	    document.getElementById('remove-attachment')?.setAttribute('disabled', 'true');
+	    
+	    // ✅ Initialize progress indicator
+	    let progress = null;
+	    
+	    try {
+	        const payload = {
+	            message: message || (attachment ? '[Attachment]' : ''),
+	            author: authorName,
+	            topicname: containerPath
+	        };
+	        
+	        // ✅ Handle attachment with progress tracking
+	        if (attachment) {
+	            progress = this.showUploadProgress(null, 'Preparing file...');
+	            
+	            if (attachment.type === 'image' && attachment.previewUrl?.startsWith('data:')) {
+	                // Already resized - use preview
+	                payload.attachment = {
+	                    name: attachment.name,
+	                    type: attachment.file.type,
+	                    size: attachment.file.size,
+	                    data: attachment.previewUrl,
+	                    thumbnail: attachment.previewUrl
+	                };
+	                progress.update(50, 'File ready • Uploading...');
+	            } else {
+	                // Convert file to base64 with progress simulation
+	                const base64 = await this.fileToBase64WithProgress(attachment.file, (pct) => {
+	                    progress?.update(Math.round(pct * 0.5), `Encoding... ${Math.round(pct * 0.5)}%`);
+	                });
+	                
+	                payload.attachment = {
+	                    name: attachment.name,
+	                    type: attachment.file.type,
+	                    size: attachment.file.size,
+	                    data: base64,
+	                    thumbnail: attachment.previewUrl
+	                };
+	                progress.update(50, 'File ready • Uploading...');
+	            }
+	        }
+	        
+	        // Upload with timeout
+	        progress?.update(60, 'Sending message...');
+	        
+	        const controller = new AbortController();
+	        const timeout = setTimeout(() => controller.abort(), 30000);
+	        
+	        const response = await fetch(`/newauth/api/appschat/${convid}/messages`, {
+	            method: 'POST',
+	            headers: { 'Content-Type': 'application/json' },
+	            body: JSON.stringify(payload),
+	            signal: controller.signal
+	        });
+	        
+	        clearTimeout(timeout);
+	        
+	        if (!response.ok) {
+	            const errorData = await response.text().catch(() => 'Unknown error');
+	            throw new Error(`Server error: ${response.status} - ${errorData}`);
+	        }
+	        
+	        // ✅ Success feedback
+	        progress?.update(100, 'Sent! ✓');
+	        setTimeout(() => progress?.hide(), 400);
+	        
+	        // ✅ Clear state
+	        input.value = '';
+	        this._pendingAttachment = null;
+	        const preview = document.getElementById('attachment-preview');
+	        if (preview) preview.style.display = 'none';
+	        
+	        // ✅ Refresh messages
+	        this.loadChatMessages(convid).then(() => this.scrollChatToBottom());
+	        
+	    } catch (error) {
+	        console.error('Failed to send message:', error);
+	        
+	        // ✅ Error state
+	        if (progress) {
+	            progress.update(null, '❌ Failed to send');
+	            setTimeout(() => progress.hide(), 1500);
+	        } else {
+	            alert('Failed to send message: ' + (error.message || 'Network error'));
+	        }
+	        
+	    } finally {
+	        // ✅ Restore UI state
+	        if (sendBtn) {
+	            sendBtn.disabled = false;
+	            sendBtn.style.opacity = '1';
+	        }
+	        input.disabled = false;
+	        input.placeholder = 'Type a message... ';
+	        document.getElementById('attach-btn')?.removeAttribute('disabled');
+	        document.getElementById('remove-attachment')?.removeAttribute('disabled');
+	        input.focus();
+	    }
+	}
+
+	// Fixed transformDotToCard with proper mobile handling and dot restoration
+	// VERSION: 2.0 - Mobile positioning matches desktop
+	transformDotToCard(dot, item, entityType) {
+	    console.log('=== transformDotToCard called - VERSION 2.0 ===');
+	    console.log('Window inner width:', window.innerWidth);
+	    
+	    const self = this;
+	    
+	    // Prevent multiple rapid transformations (fixes jitter)
+	    if (dot._isTransforming || dot.classList.contains('transformed-card')) {
+	        console.log('Already transforming or transformed, exiting');
+	        return;
+	    }
+	    dot._isTransforming = true;
+	    
+	    // Detect if mobile
+	    const isMobile = window.innerWidth <= 768;
+	    console.log('Is mobile?', isMobile);
+	    
+	    // Store original dot appearance BEFORE transformation
+	    if (!dot.dataset.originalContent) {
+	        dot.dataset.originalContent = dot.innerHTML;
+	        dot.dataset.originalBgColor = dot.style.backgroundColor || '';
+	        dot.dataset.originalBorder = dot.style.border || '';
+	        dot.dataset.originalWidth = dot.style.width || '20px';
+	        dot.dataset.originalHeight = dot.style.height || '20px';
+	    }
+		
+		if (!dot.originalState) {
+		     const computedStyle = window.getComputedStyle(dot);
+		     dot.originalState = {
+		         width: computedStyle.width,
+		         height: computedStyle.height,
+		         backgroundColor: computedStyle.backgroundColor,
+		         borderRadius: computedStyle.borderRadius,
+		         cursor: computedStyle.cursor,
+		         display: computedStyle.display,
+		         alignItems: computedStyle.alignItems,
+		         justifyContent: computedStyle.justifyContent,
+		         fontSize: computedStyle.fontSize,           // IMPORTANT
+		         fontWeight: computedStyle.fontWeight,       // IMPORTANT
+		         color: computedStyle.color,
+		         textAlign: computedStyle.textAlign,
+		         overflow: computedStyle.overflow,
+		         textOverflow: computedStyle.textOverflow,
+		         whiteSpace: computedStyle.whiteSpace,
+				 opacity: computedStyle.opacity 
+		     };
+		 }
+		 dot.style.opacity = '1';
+	    
+	    // Store original position NOW (when transformation happens, dot is in DOM)
+	    if (!dot.originalPosition) {
+	        const rect = dot.getBoundingClientRect();
+	        const canvas = document.getElementById('canvas-area');
+	        if (!canvas) {
+	            console.error('Canvas not found');
+	            return;
+	        }
+	        const canvasRect = canvas.getBoundingClientRect();
+	        
+	        dot.originalPosition = {
+	            left: rect.left - canvasRect.left + canvas.scrollLeft,
+	            top: rect.top - canvasRect.top + canvas.scrollTop,
+	            centerX: rect.left + rect.width / 2,
+	            centerY: rect.top + rect.height / 2
+	        };
+	    }
+	    
+	    // Determine card position based on dot location in viewport
+	    const viewportWidth = window.innerWidth;
+	    const viewportHeight = window.innerHeight;
+	    const dotCenterX = dot.originalPosition.centerX;
+	    const dotCenterY = dot.originalPosition.centerY;
+	    
+	    // Card dimensions
+	    const cardWidth = isMobile ? Math.min(300, viewportWidth - 40) : 280;
+	    const cardPadding = 20; // Safe padding from edges
+	    
+	    // Calculate card position
+	    let cardLeft, cardTop;
+	    let useSafePosition = false;
+		const estimatedCardHeight = 280;
+
+		const dotSize = parseFloat(dot.style.width) || 20;
+
+		if (isMobile) {
+		    const isRightSide = dotCenterX > viewportWidth / 2;
+		    const isBottomSide = dotCenterY > viewportHeight / 2;
+
+		    if (isRightSide && isBottomSide) {
+		        // Bottom-right: anchor right edge to dot right, expand left and up
+		        cardLeft = Math.max(cardPadding, dot.originalPosition.left - cardWidth + dotSize);
+		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		    } else if (isRightSide && !isBottomSide) {
+		        // Top-right: anchor right edge to dot right, expand left and down
+		        cardLeft = Math.max(cardPadding, dot.originalPosition.left - cardWidth + dotSize);
+		        cardTop = dot.originalPosition.top;
+		    } else if (!isRightSide && isBottomSide) {
+		        // Bottom-left: anchor left edge to dot left, expand right and up
+		        cardLeft = Math.min(viewportWidth - cardWidth - cardPadding, dot.originalPosition.left);
+		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		    } else {
+		        // Top-left: anchor left edge to dot left, expand right and down
+		        cardLeft = Math.min(viewportWidth - cardWidth - cardPadding, dot.originalPosition.left);
+		        cardTop = dot.originalPosition.top;
+		    }
+		} else {
+		    const isRightSide = dotCenterX > viewportWidth / 2;
+		    const isBottomSide = dotCenterY > viewportHeight / 2;
+
+		    if (isRightSide && isBottomSide) {
+		        // Bottom-right: anchor right edge to dot right, expand left and up
+		        cardLeft = dot.originalPosition.left - cardWidth + dotSize;
+		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		    } else if (isRightSide && !isBottomSide) {
+		        // Top-right: anchor right edge to dot right, expand left and down
+		        cardLeft = dot.originalPosition.left - cardWidth + dotSize;
+		        cardTop = dot.originalPosition.top;
+		    } else if (!isRightSide && isBottomSide) {
+		        // Bottom-left: anchor left edge to dot left, expand right and up
+		        cardLeft = dot.originalPosition.left;
+		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		    } else {
+		        // Top-left: anchor left edge to dot left, expand right and down
+		        cardLeft = dot.originalPosition.left;
+		        cardTop = dot.originalPosition.top;
+		    }
+		}
+	    
+	    // Create card content (mobile vs desktop)
+	    const cardContent = isMobile 
+	        ? this.createMobileDotCardContent(item, entityType)
+	        : this.createDotCardContent(item, entityType);
+	    
+	    // Transform dot into card
+	    dot.innerHTML = cardContent;
+	    dot.classList.add('transformed-card');
+		
+	
+		const expandBtn = dot.querySelector('.expand-image-btn');
+		if (expandBtn && item.image) {
+		    const handleExpand = (e) => {
+		        console.log(`[EXPAND] 🎯 EVENT: ${e.type} | target: ${e.target.className} | timestamp: ${Date.now()}`);
+		        console.log(`[EXPAND] Before stopPropagation - eventPhase: ${e.eventPhase}`);
+		        e.stopPropagation();
+		        e.preventDefault();
+		        dot._preventCardClose = true;
+		        console.log(`[EXPAND] ✅ SET _preventCardClose = true | dot id: ${dot.id || 'no-id'}`);
+		        
+		        // Auto-reset after safe delay
+		        setTimeout(() => {
+		            console.log(`[EXPAND] 🔁 RESET _preventCardClose to false`);
+		            dot._preventCardClose = false;
+		        }, 500);
+		        
+		        this.showImageOverlay(item.image);
+		    };
+		    
+		    // Attach to ALL relevant events
+		    ['click', 'touchstart', 'mousedown'].forEach(evt => {
+		        expandBtn.addEventListener(evt, handleExpand, { passive: false });
+		    });
+		    
+		    // Image container handler
+		    const imgContainer = dot.querySelector('.entity-image-container');
+		    if (imgContainer) {
+		        const handleImageClick = (e) => {
+		            if (!e.target.closest('.expand-image-btn')) {
+		                console.log(`[IMAGE] 🖼️ EVENT: ${e.type} | target: ${e.target.tagName} | timestamp: ${Date.now()}`);
+		                e.stopPropagation();
+		                e.preventDefault();
+		                dot._preventCardClose = true;
+		                console.log(`[IMAGE] ✅ SET _preventCardClose = true`);
+		                setTimeout(() => dot._preventCardClose = false, 500);
+		                this.showImageOverlay(item.image);
+		            }
+		        };
+		        
+		        ['click', 'touchstart', 'mousedown'].forEach(evt => {
+		            imgContainer.addEventListener(evt, handleImageClick, { passive: false });
+		        });
+		    }
+		}
+		
+	    if (useSafePosition) {
+	        dot.classList.add('safe-mobile-position');
+	    }
+		
+		// handle stepper buttons
+		dot.querySelectorAll('.stepper-btn').forEach(btn => {
+		    btn.addEventListener('click', async (e) => {
+		        e.stopPropagation();
+		        const fieldName = btn.dataset.field;
+		        const currentVal = parseFloat(item[fieldName]) || 0;
+		        const newVal = btn.classList.contains('plus') 
+		            ? currentVal + 1 
+		            : Math.max(0, currentVal - 1);
+		        
+		        // Update item in memory
+		        item[fieldName] = newVal;
+		        
+		        // Update display
+		        const valueEl = dot.querySelector(`.stepper-value[data-field="${fieldName}"]`);
+		        if (valueEl) valueEl.textContent = newVal;
+		        
+		        // Save
+				try {
+				    const entityPath = [
+				        'apps',
+				        this.currentApp.id,
+				        ...this.currentPath.map(p => p.displayID),
+				        item.displayID
+				    ].join('/');
+
+				    await this.db.saveEntityData(entityPath, item, true);
+
+				    if (this._stepperRenderTimer) clearTimeout(this._stepperRenderTimer);
+				    this._stepperRenderTimer = setTimeout(() => {
+				        this.render();
+				    }, 800);
+				} catch (err) {
+				    item[fieldName] = currentVal;
+				    if (valueEl) valueEl.textContent = currentVal;
+				    this.showNotification(`❌ Failed to update ${fieldName}`, 'error');
+				}
+		    });
+		});
+	    
+		dot.style.left = `${cardLeft}px`;
+		dot.style.top = `${cardTop}px`;
+
+	    // Apply card styles with smooth transition
+	    Object.assign(dot.style, {
+	        position: 'absolute',
+	        width: isMobile ? `${cardWidth}px` : `${cardWidth}px`,
+	        maxWidth: isMobile ? 'calc(100vw - 40px)' : 'none',
+	        height: 'auto',
+	        maxHeight: isMobile ? 'none' : 'none',
+	        minWidth: 'unset',
+	        padding: isMobile ? '14px' : '16px',
+	        backgroundColor: 'white',
+	        border: 'none',
+	        borderRadius: isMobile ? '10px' : '12px',
+	        boxShadow: isMobile 
+	            ? '0 4px 20px rgba(0,0,0,0.25)' 
+	            : '0 8px 24px rgba(0,0,0,0.2)',
+	        zIndex: '1001',
+	        cursor: 'default',
+	        fontSize: isMobile ? '13px' : '14px',
+	        color: '#333',
+	        fontWeight: 'normal',
+	        textAlign: 'left',
+	        transition: 'width 0.25s ease-out, height 0.25s ease-out, opacity 0.2s ease-out',
+	        overflow: isMobile ? 'visible' : 'visible',
+	        display: 'block',
+	        alignItems: 'unset',
+	        justifyContent: 'unset',
+	        whiteSpace: 'normal',
+	        opacity: '1',
+	        pointerEvents: 'auto'
+	    });
+	    
+	    // Release transformation lock after transition
+	    setTimeout(() => {
+	        dot._isTransforming = false;
+	    }, 100);
+	    
+
+		
+		if (isMobile) {
+		    const closeHandler = (e) => {
+		        const now = Date.now();
+		        console.log(`\n[CLOSE] 📱 MOBILE EVENT: ${e.type} | target: ${e.target.tagName}.${e.target.className} | time: ${now}`);
+		        
+		        // ✅ CRITICAL FIX: Ignore clicks on image overlay (it's a separate element)
+		        if (e.target.closest('#image-overlay') || e.target.id === 'image-overlay') {
+		            console.log(`[CLOSE] 🛑 CLICK ON IMAGE OVERLAY - IGNORING`);
+		            return;
+		        }
+		        
+		        // Check flag FIRST
+		        if (dot._preventCardClose) {
+		            console.log(`[CLOSE] 🛑 FLAG SET - ABORTING CLOSE (resetting flag)`);
+		            dot._preventCardClose = false;
+		            return;
+		        }
+		        
+		        // Safety checks
+		        if (e.target.closest('.expand-image-btn') || e.target.closest('.entity-image-container')) {
+		            console.log(`[CLOSE] 🛑 TARGET IS EXPAND ELEMENT - ABORTING CLOSE`);
+		            return;
+		        }
+		        
+		        if (!dot.contains(e.target)) {
+		            console.log(`[CLOSE] ✅ TARGET OUTSIDE CARD - CLOSING CARD`);
+		            self.transformCardToDot(dot);
+		            document.removeEventListener('touchstart', closeHandler);
+		            document.removeEventListener('click', closeHandler);
+		        } else {
+		            console.log(`[CLOSE] ℹ️ TARGET INSIDE CARD - NOT CLOSING`);
+		        }
+		    };
+		    
+		    setTimeout(() => {
+		        document.addEventListener('touchstart', closeHandler, { passive: true });
+		        document.addEventListener('click', closeHandler, { passive: true });
+		        dot._closeHandler = closeHandler;
+		        console.log('[INIT] 📲 Mobile close handlers attached');
+		    }, 100);
+		} else {
+		    let leaveTimer;
+		    const mouseLeaveHandler = (e) => {
+		        console.log(`[MOUSE] 🖱️ CATCHING mouseleave event | flag: ${dot._preventCardClose}`);
+		        
+		        // CRITICAL: Check flag FIRST
+		        if (dot._preventCardClose) {
+		            console.log(`[MOUSE] 🛑 FLAG SET - IGNORING mouseleave`);
+		            return;
+		        }
+		        
+		        if (leaveTimer) clearTimeout(leaveTimer);
+		        
+		        leaveTimer = setTimeout(() => {
+		            const rect = dot.getBoundingClientRect();
+					const buffer = 10;
+		            const x = e.clientX;
+		            const y = e.clientY;
+					const isOutside = (
+					            e.clientX < rect.left - buffer ||
+					            e.clientX > rect.right + buffer ||
+					            e.clientY < rect.top - buffer ||
+					            e.clientY > rect.bottom + buffer
+					        );
+		            
+		            console.log(`[MOUSE] Checking position: (${x},${y}) | Card: ${rect.left},${rect.top},${rect.right},${rect.bottom} | Outside: ${isOutside}`);
+		            
+		            if (isOutside) {
+		                console.log(`[MOUSE] ✅ MOUSE OUTSIDE CARD - CLOSING`);
+		                self.transformCardToDot(dot);
+		            }
+		        }, 350);
+		    };
+		    
+		    dot.addEventListener('pointerleave', mouseLeaveHandler);
+		    dot._mouseLeaveHandler = mouseLeaveHandler;
+		    console.log('[INIT] 💻 Desktop mouse handlers attached');
+		}
+	    
+	    // Add action handlers to card buttons
+	    const editBtn = dot.querySelector('.dot-action-btn.edit');
+	    const copyBtn = dot.querySelector('.dot-action-btn.copy');
+	    const deleteBtn = dot.querySelector('.dot-action-btn.delete');
+	    
+	    if (editBtn) {
+	        const editHandler = (e) => {
+	            e.stopPropagation();
+	            e.preventDefault();
+	            this.editItem(item, entityType);
+	            this.transformCardToDot(dot);
+	        };
+	        editBtn.addEventListener('click', editHandler);
+	        if (isMobile) editBtn.addEventListener('touchend', editHandler);
+	    }
+	    
+	    if (copyBtn) {
+	        const copyHandler = (e) => {
+	            e.stopPropagation();
+	            e.preventDefault();
+	            this.duplicateItem(item, entityType);
+	            this.transformCardToDot(dot);
+	        };
+	        copyBtn.addEventListener('click', copyHandler);
+	        if (isMobile) copyBtn.addEventListener('touchend', copyHandler);
+	    }
+	    
+	    if (deleteBtn) {
+	        const deleteHandler = (e) => {
+	            e.stopPropagation();
+	            e.preventDefault();
+	            if (confirm(`Are you sure you want to delete this ${entityType}?`)) {
+	                this.deleteItem(item, entityType);
+	            }
+	            this.transformCardToDot(dot);
+	        };
+	        deleteBtn.addEventListener('click', deleteHandler);
+	        if (isMobile) deleteBtn.addEventListener('touchend', deleteHandler);
+	    }
+		
+
+	}
+
+	// Fixed transformCardToDot with proper restoration
+	transformCardToDot(dot) {
+	    if (!dot.originalPosition || !dot.originalState) {
+	        console.warn('Missing original state or position');
+	        return;
+	    }
+
+	    // Reset transformation flag
+	    dot._isTransforming = false;
+
+	    const __isMobile__ = window.innerWidth <= 768;
+
+	    // Remove event listeners
+	    if (dot._mouseLeaveHandler) {
+	        dot.removeEventListener('mouseleave', dot._mouseLeaveHandler);
+	        delete dot._mouseLeaveHandler;
+	    }
+
+	    if (dot._closeHandler) {
+	        document.removeEventListener('touchstart', dot._closeHandler);
+	        document.removeEventListener('click', dot._closeHandler);
+	        delete dot._closeHandler;
+	    }
+
+	    // Get the label for the dot (3 characters only)
+	    const item = dot.itemData;
+	    const entityType = dot.entityType;
+	    const label = this.getItemLabel(item, entityType) || 'Unnamed';
+	    const displayLabel = label.substring(0, 3).toLowerCase();
+
+	    // Clear card content and restore dot HTML structure
+	    dot.classList.remove('transformed-card');
+	    dot.classList.remove('safe-mobile-position');
+	    
+	    // Restore the original span structure
+	    dot.innerHTML = `
+	        <span class="dot-label">
+	            <span>${displayLabel[0] || ''}</span>
+	            <span>${displayLabel[1] || ''}</span>
+	            <span>${displayLabel[2] || ''}</span>
+	        </span>
+	    `;
+
+	    // Reset styles using saved original state
+	    Object.assign(dot.style, {
+	        position: 'absolute',
+	        left: `${dot.originalPosition.left}px`,
+	        top: `${dot.originalPosition.top}px`,
+	        width: dot.originalState.width,
+	        height: dot.originalState.height,
+	        padding: '0',
+	        backgroundColor: dot.originalState.backgroundColor,
+	        border: 'none',
+	        borderRadius: dot.originalState.borderRadius,
+	        boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
+	        zIndex: '1000',
+	        cursor: dot.originalState.cursor,
+	        fontSize: dot.originalState.fontSize,          // Use saved value
+	        color: dot.originalState.color,                // Use saved value
+	        fontWeight: dot.originalState.fontWeight,      // Use saved value
+	        textAlign: dot.originalState.textAlign,
+	        transition: 'all 0.3s ease',
+	        transform: 'scale(1)',
+	        transformOrigin: 'center',
+	        overflow: dot.originalState.overflow,
+	        display: dot.originalState.display,
+	        alignItems: dot.originalState.alignItems,
+	        justifyContent: dot.originalState.justifyContent,
+	        whiteSpace: dot.originalState.whiteSpace,
+			opacity: dot.originalState.opacity, 
+	        minWidth: 'unset',
+	        maxWidth: 'unset',
+	        pointerEvents: 'auto'
+	    });
+
+	    // Remove transition after animation completes
+	    setTimeout(() => {
+	        if (dot.style.transition) {
+	            dot.style.transition = '';
+	        }
+	    }, 300);
+	}
+
+	createDotCardContent(item, entityType) {
+	    // ✅ GET COLOR FROM ENTITY TYPE (no hardcoded values)
+		
+		// ✅ REPLACE THE IMAGE HTML WITH THUMBNAIL + EXPAND BUTTON
+		const imageHTML = item.image 
+		    ? `<div class="entity-image-container">
+		        <img src="${item.image}" alt="${item.name || 'Entity'}" class="entity-image-thumbnail">
+		        <button class="expand-image-btn" title="View full size">
+		            <!-- Standard fullscreen icon (four arrows) -->
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					    <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+					</svg>
+		        </button>
+		      </div>`
+		    : '';
+
+	    const typeConfig = this.getEntityTypeColor(entityType);
+	    
+	    // Get entity configuration
+	    const entityConfig = this.nativeEntities?.[entityType];
+	    const fields = entityConfig?.fields || [];
+	    
+	    // Build field content with hover tooltips
+	    let fieldHTML = '';
+	    
+	    fields.forEach(field => {
+	        // Skip system/internal fields
+	        if (field.writePermission === 'system' || 
+	            ['ID', 'displayID', 'dotLabel', 'timestamp', 'count', 'hidden', 'hashed', 'parentId', 'path', 'image'].includes(field.name)) {
+	            return;
+	        }
+	        
+	        const value = item[field.name];
+	        if (value === undefined || value === null || value === '') return;
+	        
+	        // Determine field importance
+	        const isPrimary = field.name === 'name' || field.name === 'title';
+	        const isDescription = field.name === 'description';
+	        const cssClass = isPrimary ? 'primary' : (isDescription ? 'description' : '');
+			
+			const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+	        
+	        // Format value
+	        let displayValue = String(value);
+	        if (field.type === 'boolean') {
+	            displayValue = value ? '✓ Yes' : '✗ No';
+	        } else if (field.type === 'number') {
+	            displayValue = Number(value).toLocaleString();
+	        }
+			
+			const isScoringField = 
+			    field.name === sortConfig?.scoreField || 
+			    field.name === sortConfig?.aggregateField;
+
+			if (field.type === 'number' && isScoringField) {
+			    fieldHTML += `
+			        <div class="field-stepper">
+			            <span class="field-label">${field.label || field.name}</span>
+			            <div class="stepper-control">
+			                <button class="stepper-btn minus" data-field="${field.name}" data-value="${value}">−</button>
+			                <span class="stepper-value" data-field="${field.name}">${displayValue}</span>
+			                <button class="stepper-btn plus" data-field="${field.name}" data-value="${value}">+</button>
+			            </div>
+			        </div>
+			    `;
+			} else {
+			    fieldHTML += `
+			        <div class="field-value ${cssClass}" title="${field.label || field.name}">
+			            ${displayValue}
+			        </div>
+			    `;
+			}
+	        
+	    });
+	    
+	    // Build child count
+	    let childCountHTML = '';
+	    const config = this.currentApp.entityConfigs[entityType];
+	    if (config?.childrenField && item[config.childrenField]) {
+	        const childCount = item[config.childrenField].length;
+	        const childType = this.currentApp.hierarchy[this.currentApp.hierarchy.indexOf(entityType) + 1] || 'item';
+	        childCountHTML = `
+	            <div class="dot-info-child-count">
+	                <span class="child-count-icon">🔗</span>
+	                <span>${childCount} ${childType}${childCount !== 1 ? 's' : ''}</span>
+	            </div>
+	        `;
+	    }
+	    
+	    // Build action buttons
+	    const actionsHTML = `
+	        <div class="dot-info-actions">
+	            <button class="dot-action-btn edit" title="Edit">
+	         			<img src="/static/icons/pencil-16.png" width="16" height="16" >
+	            </button>
+	            <button class="dot-action-btn copy" title="Duplicate">
+	                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+	                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+	                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+	                </svg>
+	            </button>
+	            <button class="dot-action-btn delete" title="Delete">
+	                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+	                    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+	                </svg>
+	            </button>
+	        </div>
+	    `;
+	    
+	    // Build complete card HTML
+	    return `
+	        <div class="dot-info-card">
+	            <div class="dot-info-header">
+	                <span class="entity-type-badge" 
+	                      style="background: ${typeConfig.bg}; color: ${typeConfig.color};">
+	                    ${typeConfig.label}
+	                </span>
+	                ${actionsHTML}
+	            </div>
+				${imageHTML}
+	            <div class="dot-info-fields">
+	                ${fieldHTML}
+	            </div>
+	            
+	            ${childCountHTML}
+	        </div>
+	    `;
+	}
+	
+	createMobileDotCardContent(item, entityType) {
+	    // ✅ GET COLOR FROM ENTITY TYPE (no hardcoded values)
+		// ✅ REPLACE THE IMAGE HTML WITH THUMBNAIL + EXPAND BUTTON
+		const imageHTML = item.image 
+		    ? `<div class="entity-image-container">
+		        <img src="${item.image}" alt="${item.name || 'Entity'}" class="entity-image-thumbnail">
+		        <button class="expand-image-btn" title="View full size">
+		            <!-- Standard fullscreen icon (four arrows) -->
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					    <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+					</svg>
+		        </button>
+		      </div>`
+		    : '';
+		 
+	    const typeConfig = this.getEntityTypeColor(entityType);
+	    
+	    // Get entity configuration
+	    const entityConfig = this.nativeEntities?.[entityType];
+	    const fields = entityConfig?.fields || [];
+	    
+	    // Build field content
+	    let fieldHTML = '';
+	    
+	    fields.forEach(field => {
+	        if (field.writePermission === 'system' || 
+	            ['ID', 'displayID', 'dotLabel', 'timestamp', 'count', 'hidden', 'hashed', 'parentId', 'path', 'image'].includes(field.name)) {
+	            return;
+	        }
+	        
+	        const value = item[field.name];
+	        if (value === undefined || value === null || value === '') return;
+	        
+	        const isPrimary = field.name === 'name' || field.name === 'title';
+	        const isDescription = field.name === 'description';
+	        const cssClass = isPrimary ? 'primary' : (isDescription ? 'description' : '');
+	        
+	        let displayValue = String(value);
+	        if (field.type === 'boolean') {
+	            displayValue = value ? '✓ Yes' : '✗ No';
+	        } else if (field.type === 'number') {
+	            displayValue = Number(value).toLocaleString();
+	        }
+	        
+	        fieldHTML += `
+	            <div class="field-value ${cssClass}" title="${field.label || field.name}">
+	                ${displayValue}
+	            </div>
+	        `;
+	    });
+	    
+	    // Build child count
+	    let childCountHTML = '';
+	    const config = this.currentApp.entityConfigs[entityType];
+	    if (config?.childrenField && item[config.childrenField]) {
+	        const childCount = item[config.childrenField].length;
+	        const childType = this.currentApp.hierarchy[this.currentApp.hierarchy.indexOf(entityType) + 1] || 'item';
+	        childCountHTML = `
+	            <div class="dot-info-child-count">
+	                <span class="child-count-icon">🔗</span>
+	                <span>${childCount} ${childType}${childCount !== 1 ? 's' : ''}</span>
+	            </div>
+	        `;
+	    }
+	    
+	    // Mobile actions (stacked vertically)
+	    const actionsHTML = `
+	        <div class="dot-info-actions mobile-actions">
+	            <button class="dot-action-btn edit" title="Edit">
+	                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+	                    <path d="M12 20h9v-9l-9 9-9 9v-9"/>
+	                    <path d="M12 20v-9l-9 9"/>
+	                </svg>
+	            </button>
+	            <button class="dot-action-btn copy" title="Duplicate">
+	                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+	                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+	                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+	                </svg>
+	            </button>
+	            <button class="dot-action-btn delete" title="Delete">
+	                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+	                    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+	                </svg>
+	            </button>
+	        </div>
+	    `;
+	    
+	    // Build complete mobile card HTML
+	    return `
+	        <div class="dot-info-card mobile-card">
+	            <div class="dot-info-header">
+	                <span class="entity-type-badge" 
+	                      style="background: ${typeConfig.bg}; color: ${typeConfig.color};">
+	                    ${typeConfig.label}
+	                </span>
+	                ${actionsHTML}
+	            </div>
+				${imageHTML}
+	            <div class="dot-info-fields">
+	                ${fieldHTML}
+	            </div>
+	            
+	            ${childCountHTML}
+	        </div>
+	    `;
+	}
+	
+	// ✅ ADD THIS METHOD TO YOUR SchemaOrchestrator CLASS
+	showImageOverlay(imageSrc) {
+	    // Remove any existing overlay to prevent duplicates
+	    const existingOverlay = document.getElementById('image-overlay');
+	    if (existingOverlay) existingOverlay.remove();
+	    
+	    // Create overlay container
+	    const overlay = document.createElement('div');
+	    overlay.id = 'image-overlay';
+	    Object.assign(overlay.style, {
+	        position: 'fixed',
+	        top: '0',
+	        left: '0',
+	        width: '100%',
+	        height: '100%',
+	        background: 'rgba(0, 0, 0, 0.92)',
+	        display: 'flex',
+	        justifyContent: 'center',
+	        alignItems: 'center',
+	        zIndex: '2000',
+	        opacity: '0',
+	        transition: 'opacity 0.3s ease',
+	        cursor: 'pointer',
+	        outline: 'none',
+	        tabIndex: '0' // Make focusable for keyboard events
+	    });
+	    
+	    // Create content container
+	    const content = document.createElement('div');
+	    Object.assign(content.style, {
+	        position: 'relative',
+	        maxWidth: '95%',
+	        maxHeight: '95%'
+	    });
+	    
+	    // Create close button
+	    const closeBtn = document.createElement('button');
+	    closeBtn.innerHTML = '&times;';
+	    Object.assign(closeBtn.style, {
+	        position: 'absolute',
+	        top: '15px',
+	        right: '15px',
+	        background: 'rgba(0, 0, 0, 0.5)',
+	        border: 'none',
+	        color: 'white',
+	        width: '36px',
+	        height: '36px',
+	        borderRadius: '50%',
+	        fontSize: '24px',
+	        cursor: 'pointer',
+	        display: 'flex',
+	        alignItems: 'center',
+	        justifyContent: 'center',
+	        zIndex: '10',
+	        transition: 'all 0.2s',
+	        border: '2px solid rgba(255, 255, 255, 0.3)',
+	        WebkitTapHighlightColor: 'transparent'
+	    });
+	    
+	    // Hover effects
+	    closeBtn.addEventListener('mouseenter', () => {
+	        closeBtn.style.background = 'rgba(255, 255, 255, 0.2)';
+	        closeBtn.style.transform = 'scale(1.1)';
+	    });
+	    
+	    closeBtn.addEventListener('mouseleave', () => {
+	        closeBtn.style.background = 'rgba(0, 0, 0, 0.5)';
+	        closeBtn.style.transform = 'scale(1)';
+	    });
+	    
+	    // Create image element
+	    const img = document.createElement('img');
+	    img.src = imageSrc;
+	    Object.assign(img.style, {
+	        maxWidth: '90%',
+	        maxHeight: '90%',
+	        objectFit: 'contain',
+	        borderRadius: '8px',
+	        boxShadow: '0 10px 40px rgba(0, 0, 0, 0.6)',
+	        cursor: 'default',
+	        transition: 'transform 0.3s',
+	        userSelect: 'none'
+	    });
+	    
+	    // Prevent image drag
+	    img.addEventListener('dragstart', (e) => e.preventDefault());
+	    
+	    // Assemble DOM
+	    content.appendChild(closeBtn);
+	    content.appendChild(img);
+	    overlay.appendChild(content);
+	    document.body.appendChild(overlay);
+	    
+	    // Focus overlay for keyboard events
+	    overlay.focus();
+	    
+	    // Fade in
+	    setTimeout(() => { overlay.style.opacity = '1'; }, 10);
+	    
+	    // Close handler
+	    const closeOverlay = () => {
+	        overlay.style.opacity = '0';
+	        // Remove after transition completes
+	        setTimeout(() => {
+	            if (overlay.parentNode) overlay.remove();
+	        }, 300);
+	    };
+	    
+	    // Close button click
+	    closeBtn.addEventListener('click', (e) => {
+	        e.stopPropagation();
+	        closeOverlay();
+	    });
+	    
+	    // Click background to close
+	    overlay.addEventListener('click', (e) => {
+	        if (e.target === overlay) closeOverlay();
+	    });
+	    
+	    // Keyboard navigation
+	    overlay.addEventListener('keydown', (e) => {
+	        if (e.key === 'Escape' || e.key === ' ') {
+	            e.preventDefault();
+	            closeOverlay();
+	        }
+	    });
+	    
+	    // Prevent closing when clicking image
+	    img.addEventListener('click', (e) => e.stopPropagation());
+	    
+	    // Prevent scroll when overlay is open
+	    document.body.style.overflow = 'hidden';
+	    
+	    // Restore scroll on close
+	    const originalOverflow = document.body.style.overflow;
+	    const restoreScroll = () => {
+	        document.body.style.overflow = originalOverflow;
+	        overlay.removeEventListener('transitionend', restoreScroll);
+	    };
+	    
+	    overlay.addEventListener('transitionend', restoreScroll);
+	}
+	
+	// ✅ ADD THIS TO YOUR CLASS 
+	resizeImage(file, maxWidth = 800, maxHeight = 600) {
+	    return new Promise((resolve, reject) => {
+	        const reader = new FileReader();
+	        
+	        reader.onload = (e) => {
+	            const img = new Image();
+	            img.onload = () => {
+	                // Calculate new dimensions while maintaining aspect ratio
+	                let width = img.width;
+	                let height = img.height;
+	                
+	                if (width > height) {
+	                    if (width > maxWidth) {
+	                        height = Math.round(height * maxWidth / width);
+	                        width = maxWidth;
+	                    }
+	                } else {
+	                    if (height > maxHeight) {
+	                        width = Math.round(width * maxHeight / height);
+	                        height = maxHeight;
+	                    }
+	                }
+	                
+	                // Create canvas for resizing
+	                const canvas = document.createElement('canvas');
+	                canvas.width = width;
+	                canvas.height = height;
+	                
+	                const ctx = canvas.getContext('2d');
+	                ctx.drawImage(img, 0, 0, width, height);
+	                
+	                // Convert to base64 with quality compression
+	                const resizedDataUrl = canvas.toDataURL('image/jpeg', 0.85); // 85% quality
+	                
+	                resolve(resizedDataUrl);
+	            };
+	            
+	            img.onerror = reject;
+	            img.src = e.target.result;
+	        };
+	        
+	        reader.onerror = reject;
+	        reader.readAsDataURL(file);
+	    });
+	}
+	
+	
+	// ✅ ADD THIS NEW METHOD - generates consistent colors from entityType name
+	getEntityTypeColor(entityType) {
+	    // Simple hash function for consistent color generation
+	    const hash = entityType.split('').reduce((acc, char) => {
+	        return acc + char.charCodeAt(0);
+	    }, 0);
+	    
+	    // Generate consistent HSL color from hash
+	    const hue = hash % 360;
+	    const saturation = 60 + (hash % 20); // 60-80%
+	    const lightness = 92 + (hash % 5);   // 92-97%
+	    
+	    // Generate contrasting text color
+	    const textColorHue = (hue + 180) % 360;
+	    const textColor = `hsl(${textColorHue}, 70%, 30%)`;
+	    const bgColor = `hsl(${hue}, ${saturation}%, ${lightness}%)`;
+	    
+	    // Generate accent color for borders (darker version)
+	    const accentHue = hue;
+	    const accentSaturation = saturation + 10;
+	    const accentLightness = lightness - 30;
+	    const accentColor = `hsl(${accentHue}, ${accentSaturation}%, ${accentLightness}%)`;
+	    
+	    return {
+	        bg: bgColor,
+	        color: textColor,
+	        accent: accentColor,
+	        label: entityType.toUpperCase()
+	    };
+	}
+	
+	
+	getEntityFields(entityType) {
+	    const entityConfig = this.currentApp.entityConfigs[entityType];
+	    if (entityConfig && entityConfig.fields) {
+	        // Return only field names that belong to this entity
+	        return entityConfig.fields
+	            .filter(field => field.type !== 'system' && field.name !== 'children')
+	            .map(field => field.name);
+	    }
+	    
+	    // Fallback for common entity types
+	    switch (entityType) {
+	        case 'tenant':
+	            return ['name',  'contactemail'];
+	        case 'customer':
+	            return ['name', 'contactemail'];
+	        case 'concern':
+	            return ['name', 'description'];
+	        default:
+	            // Return non-object, non-array fields
+	            return [];
+	    }
+	}
+
+	getChildCountInfo(item, entityType) {
+	    const hierarchy = this.currentApp.hierarchy;
+	    const currentIndex = hierarchy.indexOf(entityType);
+	    
+	    if (currentIndex === -1 || currentIndex >= hierarchy.length - 1) {
+	        return null; // No children or unknown entity
+	    }
+	    
+	    const childEntityType = hierarchy[currentIndex + 1];
+	    const entityConfig = this.currentApp.entityConfigs[entityType];
+	    const childrenField = entityConfig?.childrenField || 'children';
+	    
+	    if (item[childrenField] && Array.isArray(item[childrenField])) {
+	        const count = item[childrenField].length;
+	        const childLabel = childEntityType.charAt(0).toUpperCase() + childEntityType.slice(1);
+	        const pluralLabel = count === 1 ? childLabel : `${childLabel}s`;
+	        return `${count} ${pluralLabel}`;
+	    }
+	    
+	    // Check if there's a count field
+	    if (item.count !== undefined) {
+	        const count = parseInt(item.count) || 0;
+	        const childLabel = childEntityType.charAt(0).toUpperCase() + childEntityType.slice(1);
+	        const pluralLabel = count === 1 ? childLabel : `${childLabel}s`;
+	        return `${count} ${pluralLabel}`;
+	    }
+	    
+	    return null;
+	}
+
+
+
+	
+	// Helper method to add action handlers to mobile card
+	addCardActionHandlers(card, item, entityType) {
+	    const self = this;
+	    
+	    const editBtn = card.querySelector('.dot-action-btn.edit');
+	    const copyBtn = card.querySelector('.dot-action-btn.copy');
+	    const deleteBtn = card.querySelector('.dot-action-btn.delete');
+	    
+	    if (editBtn) {
+	        editBtn.addEventListener('click', (e) => {
+	            e.stopPropagation();
+	            self.hideMobileDotCard();
+	            self.editItem(item, entityType);
+	        });
+	    }
+	    
+	    if (copyBtn) {
+	        copyBtn.addEventListener('click', (e) => {
+	            e.stopPropagation();
+	            self.hideMobileDotCard();
+	            self.duplicateItem(item, entityType);
+	        });
+	    }
+	    
+	    if (deleteBtn) {
+	        deleteBtn.addEventListener('click', (e) => {
+	            e.stopPropagation();
+	            if (confirm(`Are you sure you want to delete this ${entityType}?`)) {
+	                self.hideMobileDotCard();
+	                self.deleteItem(item, entityType);
+	            }
+	        });
+	    }
+	}
+
+
+	// Improved hideMobileDotCard
+	hideMobileDotCard() {
+	    if (this.currentMobileCard) {
+	        this.currentMobileCard.style.animation = 'slideDown 0.3s ease';
+	        setTimeout(() => {
+	            if (this.currentMobileCard) {
+	                this.currentMobileCard.remove();
+	                this.currentMobileCard = null;
+	            }
+	        }, 300);
+	    }
+	    
+	    if (this.currentMobileCardOverlay) {
+	        this.currentMobileCardOverlay.style.animation = 'fadeOut 0.3s ease';
+	        setTimeout(() => {
+	            if (this.currentMobileCardOverlay) {
+	                this.currentMobileCardOverlay.remove();
+	                this.currentMobileCardOverlay = null;
+	            }
+	        }, 300);
+	    }
+	    
+	    this.isShowingMobileCard = false;
+	}
+	deleteItem(item, entityType) {
+	    if (confirm(`Are you sure you want to delete this ${entityType}?`)) {
+	        // Your existing delete logic here
+	        this.hideDotInfoCard();
+	    }
+	}
+	
+	
+	async duplicateItem(item, entityType, deep = false) {
+	    const entityConfig = await this.getEntityConfig(entityType);
+	    if (!entityConfig) throw new Error(`Entity config not found for: ${entityType}`);
+
+	    // Deep clone the item and assign new identity
+	    const newItem = JSON.parse(JSON.stringify(item));
+	    const rawUUID = this.db.generateUUID();
+	    newItem.ID = rawUUID;
+	    newItem.displayID = this.db.hashUUID(rawUUID);
+	    newItem.timestamp = Date.now();
+
+	    if (newItem.name) newItem.name = newItem.name + ' (Copy)';
+	    if (newItem.convid) {
+	        const convid = this.db.generateUUID();
+	        newItem.convid = convid;
+	        try {
+	            await fetch(`/newauth/api/createappschat?convid=${convid}`, {
+	                headers: { 'Content-Type': 'application/json' }
+	            });
+	        } catch (e) {
+	            console.error('Failed to create chat for duplicate:', e);
+	        }
+	    }
+
+	    // ✅ Handle children BEFORE insertion
+	    const appConfig = this.currentApp.entityConfigs[entityType];
+	    if (appConfig?.childrenField) {
+	        if (deep) {
+	            newItem[appConfig.childrenField] = this._reidentifyChildren(
+	                newItem[appConfig.childrenField] || [],
+	                entityType
+	            );
+	        } else {
+	            newItem[appConfig.childrenField] = [];
+	        }
+	    }
+
+	    // Insert into data tree same way addItem does
+	    const isRootLevel = this.currentPath.length === 0;
+	    if (isRootLevel) {
+	        this.data.items.push(newItem);
+	    } else {
+	        const parentDepth = this.currentPath.length - 1;
+	        const parentEntityType = this.currentApp.hierarchy[parentDepth];
+	        const parentConfig = this.currentApp.entityConfigs[parentEntityType];
+	        const childrenField = parentConfig.childrenField;
+
+	        const firstItem = this.data?.items?.[0];
+	        const lastPathEntity = this.currentPath[this.currentPath.length - 1];
+	        const isPartialResponse =
+	            firstItem?.entityType === lastPathEntity.entityType &&
+	            firstItem.displayID === lastPathEntity.displayID;
+
+	        if (isPartialResponse) {
+	            const parent = this.data.items[0];
+	            if (!parent[childrenField]) parent[childrenField] = [];
+	            parent[childrenField].push(newItem);
+	        } else {
+	            let currentItems = this.data.items;
+	            let currentDepth = 0;
+	            while (currentDepth < parentDepth && currentItems) {
+	                const currentEntityType = this.currentApp.hierarchy[currentDepth];
+	                const currentConfig = this.currentApp.entityConfigs[currentEntityType];
+	                const pathItem = this.currentPath[currentDepth];
+	                const foundItem = currentItems.find(i =>
+	                    i.ID === pathItem.id || i.displayID === pathItem.id
+	                );
+	                if (!foundItem) throw new Error(`Could not find ${currentEntityType} in hierarchy`);
+	                currentItems = foundItem[currentConfig.childrenField] || [];
+	                currentDepth++;
+	            }
+	            const parentPathItem = this.currentPath[parentDepth];
+	            const parent = currentItems.find(i =>
+	                i.ID === parentPathItem.id || i.displayID === parentPathItem.id
+	            );
+	            if (!parent) throw new Error(`Could not find parent with ID ${parentPathItem.id}`);
+	            if (!parent[childrenField]) parent[childrenField] = [];
+	            parent[childrenField].push(newItem);
+	        }
+	    }
+
+	    this.render();
+	    this.updateBreadcrumb();
+	    this.markDotAsPending(newItem.ID);
+
+		try {
+		    const entityPath = [
+		        'apps',
+		        this.currentApp.id,
+		        ...this.currentPath.map(p => p.displayID),
+		        newItem.displayID
+		    ].join('/');
+
+		    await this.db.saveEntityData(entityPath, newItem, false); // false = new entity
+		    this.confirmDot(newItem.ID);
+		    this.showNotification(`✅ ${entityConfig.name || entityType} duplicated successfully`, 'success');
+		} catch (error) {
+		    this.rollbackDot(newItem.ID);
+		    this.render();
+		    this.showNotification(`❌ Failed to duplicate: ${error.message}`, 'error');
+		}
+	}
+	
+	_reidentifyChildren(children, parentEntityType) {
+	    const childEntityType = this.currentApp.entityConfigs[parentEntityType]?.childEntity;
+	    if (!childEntityType) return children;
+
+	    return children.map(child => {
+	        const newChild = JSON.parse(JSON.stringify(child));
+	        const rawUUID = this.db.generateUUID();
+	        newChild.ID = rawUUID;
+	        newChild.displayID = this.db.hashUUID(rawUUID);
+	        newChild.timestamp = Date.now();
+
+	        // Recurse into grandchildren
+	        const childConfig = this.currentApp.entityConfigs[childEntityType];
+	        if (childConfig?.childrenField && newChild[childConfig.childrenField]) {
+	            newChild[childConfig.childrenField] = this._reidentifyChildren(
+	                newChild[childConfig.childrenField],
+	                childEntityType
+	            );
+	        }
+
+	        return newChild;
+	    });
+	}
+	
+	canAddItemsAtCurrentLevel() {
+	    const currentDepth = this.currentPath.length;
+	    
+	    // Browser 1 (data owner) - full access
+	    if (this.isDataOwner()) {
+	        return true;
+	    }
+	    
+	    // Browser 2 (shared user) - check writeAccess
+	    if (currentDepth === 0) {
+	        return false; // Can't create at root level
+	    }
+	    
+	    // Get the parent entity that would contain the new item
+	    const parentEntity = this.getParentEntity();
+	    if (!parentEntity) {
+	        return false;
+	    }
+	    
+	    // Check parent's writeAccess policy
+	    const writeAccess = parentEntity.writeAccess || 'owner';
+	    
+	    switch (writeAccess) {
+	        case 'any':
+	            return true;
+	        case 'parent':
+	            // Can add if we have direct access to parent
+	            return this.hasAccessToEntity(parentEntity);
+	        case 'ancestor':
+	            // Can add if we have access to any ancestor
+	            return this.hasAncestorAccess();
+	        case 'owner':
+	        default:
+	            return false;
+	    }
+	}
+
+	getParentEntity() {
+	    if (this.currentPath.length === 0) {
+	        return null; // Root level
+	    }
+	    
+	    // Return the entity at current depth - 1
+	    const parentDepth = this.currentPath.length - 1;
+	    return this.getEntityAtDepth(parentDepth);
+	}
+	
+	// ✅ UPDATED NAVIGATE TO METHOD WITH FULL HISTORY SUPPORT
+	navigateTo(item, entityType) {
+		
+		this.stopVersionPolling();
+		this._pendingRipples?.delete(item.displayID); 
+		
+	    const currentDepth = this.currentPath.length;
+	    const targetDepth = currentDepth + 1;
+	    
+	    // Always update currentPath and render
+	    const newPath = [...this.currentPath, {
+	        id: item.ID,
+	        displayID: item.displayID,
+	        hashed: item.hashed,
+			shortName: this.getShortName(item, entityType),
+	        entityType: entityType
+	    }];
+	    
+		console.log('After navigation - newPath:', newPath);
+	    this.currentPath = newPath;
+		this._updateShareButtonVisibility(); 
+	    this.render();
+		
+	    this.updateBreadcrumb();
+		// In navigateTo or wherever currentPath changes:
+		this._contextBarFlipped = false;
+
+	    
+	    // Create history state with depth information
+	    const historyState = { 
+	        depth: targetDepth,
+	        path: newPath.map(p => ({ id: p.id, entityType: p.entityType }))
+	    };
+	    
+	    // Determine URL to use
+	    if (targetDepth <= 2) {
+	        // Real URL for supported levels (0, 1, 2)
+	        const newUrl = this.getAppUrl(this.currentPath);
+	        window.history.pushState(historyState, '', newUrl);
+	    } else {
+	        // Same URL but different history entry for deeper levels (3+)
+	        const currentUrl = window.location.pathname + window.location.search;
+	        window.history.pushState(historyState, '', currentUrl);
+	    }
+		
+		// After loading customer data
+		console.log('After navigation - currentPath:', this.currentPath);  
+		console.log('After navigation - data.items:', this.data.items);
+	}
+
+
+
+	updateUrl() {
+	    const baseUrl = '/t/apps/';
+	    const appId = this.currentApp?.id || 'custsupport';
+	    
+	    if (this.currentPath.length === 0) {
+	        window.history.pushState({}, '', `${baseUrl}${appId}`);
+	    } else {
+	        const pathIds = this.currentPath.map(item => item.displayID).join('/');
+	        window.history.pushState({}, '', `${baseUrl}${appId}/${pathIds}`);
+	    }
+	}
+
+	updateBreadcrumb() {
+		
+		if (!this.currentApp) {
+	        this.breadcrumb.innerHTML = '<span style="color: #666;">Apps</span>';
+	        return;
+	    }
+			
+	    const self = this;
+	    const context = this.getViewingContext();
+	    const isMobile = window.innerWidth <= 768;
+	    
+	    console.log('updateBreadcrumb - currentPath length:', this.currentPath.length);
+		console.log('Breadcrumb currentPath:', this.currentPath.map(p => ({ id: p.id, displayID: p.displayID, shortName: p.shortName, entityType: p.entityType })));
+	    // Helper: truncate text safely
+	    const truncateText = (text, maxLength) => {
+	        if (!text || text.length <= maxLength) return text;
+	        return text.substring(0, maxLength - 3) + '...';
+	    };
+
+	    // Helper: format breadcrumb segment
+	    const formatSegment = (displayName, displayID, isClickable, dataIndex) => {
+	        const nameLen = isMobile ? 6 : 10;
+	        const idLen = isMobile ? 4 : 8;
+	        const truncatedName = truncateText(displayName, nameLen);
+	        const truncatedID = truncateText(displayID, idLen);
+	        
+	        if (isMobile) {
+	            const clickableStyle = isClickable 
+	                ? `color:#667eea;text-decoration:none;` 
+	                : `color:#999;cursor:not-allowed;`;
+	            return `
+	                <${isClickable ? 'a' : 'span'} 
+	                    ${isClickable ? `href="#" data-index="${dataIndex}"` : ''}
+	                    title="${displayName} (${displayID})"
+	                    style="display:inline-flex;align-items:center;max-width:70px;${clickableStyle}font-size:11px;white-space:nowrap;">
+	                    <span style="font-weight:500;overflow:hidden;text-overflow:ellipsis;">${truncatedName}</span>
+	                    <span style="font-size:9px;color:${isClickable ? '#999' : '#bbb'};margin-left:2px;overflow:hidden;text-overflow:ellipsis;">${truncatedID}</span>
+	                </${isClickable ? 'a' : 'span'}>
+	            `;
+	        } else {
+	            const displayText = `${truncatedName} (${truncatedID})`;
+	            if (isClickable) {
+	                return `<a href="#" data-index="${dataIndex}" title="${displayName} (${displayID})">${displayText}</a>`;
+	            } else {
+	                return `<span style="color:#999;cursor:not-allowed;" title="${displayName} (${displayID})">${displayText}</span>`;
+	            }
+	        }
+	    };
+
+		// Start with Home
+		let html = '<a href="#" data-index="0">Home</a>';
+
+		// Add app name (always clickable for app owners)
+		if (this.currentApp) {
+		    const appName = truncateText(this.currentApp.name, 15);
+		    // ✅ FIXED: App ID always clickable for app owners (any depth)
+		    if (isowner) {
+		        html += ` / <a href="#" data-index="1" title="${this.currentApp.name}">${appName}</a>`;
+		    } else {
+		        html += ` / <span title="${this.currentApp.name}">${appName}</span>`;
+		    }
+		}
+	    // Add path segments
+	    console.log('Current path data for breadcrumb:');
+	    this.currentPath.forEach((seg, idx) => {
+	        console.log(`  Path[${idx}]:`, {shortName: seg.shortName, displayID: seg.displayID, id: seg.id, entityType: seg.entityType });
+	    });
+	    
+	    // Determine if current user is data owner
+	    const isDataOwner = this.isDataOwner();
+	    
+	    this.currentPath.forEach((seg, idx) => {
+	        // Always use displayID for consistent formatting
+	        const displayID = seg.displayID || this.db.hashUUID(seg.id);
+	        const displayName = seg.shortName || displayID;
+
+			// ✅ FINAL CLICKABILITY LOGIC
+			let isClickable = true;
+
+			if (isDataOwner) {
+			    // Browser 1: All path segments are clickable
+			    isClickable = true;
+			} else {
+			    // Browser 2: Only allow navigation back to immediate parent levels
+			    // Don't allow jumping to root/tenant level
+			    if (this.currentPath.length <= 1) {
+			        // At tenant or customer level - no navigation needed
+			        isClickable = false;
+			    } else {
+			        // At concern level or deeper - allow navigation to ancestors EXCEPT tenant
+			        // idx 0 = tenant (never clickable for Browser 2)
+			        // idx >= 1 = customer and below (clickable if within current path)
+			        isClickable = (idx > 0 && idx <= this.currentPath.length - 1);
+			    }
+			}
+
+	        html += ' / ' + formatSegment(displayName, displayID, isClickable, idx + 2);
+	    });
+
+	    // Apply to DOM
+	    const breadcrumb = document.getElementById('breadcrumb');
+	    breadcrumb.innerHTML = html;
+
+	    // Mobile styling
+	    if (isMobile) {
+	        Object.assign(breadcrumb.style, {
+	            padding: '6px 10px',
+	            fontSize: '10px',
+	            gap: '1px',
+	            maxWidth: 'calc(100vw - 20px)',
+	            overflowX: 'auto',
+	            whiteSpace: 'nowrap',
+	            display: 'flex',
+	            alignItems: 'center',
+	            lineHeight: '1'
+	        });
+	        breadcrumb.querySelectorAll('a, span').forEach(el => {
+	            Object.assign(el.style, {
+	                display: 'inline-flex',
+	                alignItems: 'center',
+	                whiteSpace: 'nowrap'
+	            });
+	        });
+	    }
+
+	    // Click handlers
+		breadcrumb.querySelectorAll('a').forEach(link => {
+		    link.addEventListener('click', async (e) => {
+		        e.preventDefault();
+		        const index = parseInt(e.currentTarget.dataset.index, 10);
+		        
+		        const isDataOwner = this.isDataOwner();
+		        const currentPathLength = this.currentPath.length; 
+
+		        // ✅ INDEX 0: HOME - FIXED WITH DIRECT NAVIGATION
+		        if (index === 0) {
+		            if (!this.currentApp) {
+		                console.log('[Breadcrumb] Already at root');
+		                return;
+		            }
+		            
+		            // ✅ CRITICAL FIX: DIRECT NAVIGATION FOR APP OWNERS (NO PUSHSTATE + RELOAD)
+		            if (isowner) {
+		                console.log('[Breadcrumb] App owner clicked Home → Navigating to /t/apps');
+		                // ✅ USE DIRECT ASSIGNMENT - GUARANTEES NAVIGATION
+		                window.location.href = '/t/apps'; 
+		                return; // Prevents any further execution
+		            }
+		            
+		            // ✅ NON-OWNERS: PRESERVED EXACTLY FROM YOUR ORIGINAL CODE (NO CHANGES)
+		            const urlInfo = this.parseUrlForDataFetch();
+		            const savedContexts = this.getLastViewedContext(urlInfo?.appId);
+		            const savedContext = savedContexts?.[0];
+		            
+		            if (savedContext && savedContext.path?.length > 0) {
+		                this.currentPath = [];
+		                for (let i = 0; i < savedContext.path.length; i++) {
+		                    const id = savedContext.path[i];
+		                    let displayID = id;
+		                    if (displayID.includes('-')) {
+		                        displayID = this.db.hashUUID(id);
+		                    }
+		                    const entityType = this.currentApp.hierarchy[i];
+		                    this.currentPath.push({
+		                        id: id,
+		                        displayID: displayID, 
+		                        shortName: this.getShortName({ ID: id, displayID }, entityType) || id.substring(0, 8),
+		                        entityType: entityType
+		                    });
+		                }
+		                
+		                this.updateUrl();
+		                const pathContext = this.currentPath.map(item => item.displayID);
+		                this.db.getAppData(this.currentApp.id, pathContext).then(data => {
+		                    this.data = data;
+		                    console.log('[Breadcrumb] Tenant owner - loaded data for tenant:', savedContext.path[0]);
+		                    this.render();
+		                    this.updateBreadcrumb();
+		                }).catch(error => {
+		                    console.error('[Breadcrumb] Error fetching tenant data:', error);
+		                    this.render();
+		                    this.updateBreadcrumb();
+		                });
+		            } else {
+		                this.currentPath = [];
+		                this.updateUrl();
+		                await this.loadAppSelector();
+		                this.data = { items: [] };
+		                this.render();
+		                this.updateBreadcrumb();
+		            }
+		            return;
+		        }
+		        
+		        // ✅ INDEX 1: APP ID LINK - PRESERVED FROM YOUR WORKING VERSION
+		        if (index === 1 && isowner && this.currentPath.length === 0) {
+		            // App name clicked by owner at root
+		            this.currentPath = [];
+		            this.updateUrl();
+		            this.render();
+		            this.updateBreadcrumb();
+		            return;
+		        }
+		        
+		        // ✅ INDEX ≥ 2: PRESERVED EXACTLY FROM YOUR ORIGINAL CODE
+		        if (index >= 2) {
+		            const targetDepth = index - 1;
+		            
+		            if (targetDepth >= this.currentApp.hierarchy.length) {
+		                console.log('Cannot navigate beyond hierarchy depth');
+		                return;
+		            }
+
+		            if (targetDepth > 0 && targetDepth <= this.currentPath.length) {
+		                this.currentPath = this.currentPath.slice(0, targetDepth);
+		                
+		                const historyState = {
+		                    depth: targetDepth,
+		                    path: this.currentPath.map(p => ({ 
+		                        id: p.id, 
+		                        entityType: p.entityType,
+		                        displayID: p.displayID,
+		                        hashed: p.hashed
+		                    }))
+		                };
+		                
+		                if (targetDepth <= 2) {
+		                    const newUrl = this.getAppUrl(this.currentPath);
+		                    window.history.pushState(historyState, '', newUrl);
+		                } else {
+		                    const currentUrl = window.location.pathname + window.location.search;
+		                    window.history.pushState(historyState, '', currentUrl);
+		                }
+		                
+		                this.render();
+		                this.updateBreadcrumb();
+		            }
+		        }
+		    });
+		});
+	}
+	
+	// ✅ HELPER: Get display ID for item
+	getDisplayIdForItem(itemId, entityType) {
+	    // Try to find the actual item to get its displayID
+	    let currentItems = this.data.items;
+	    for (let i = 0; i < this.currentPath.length; i++) {
+	        const pathItem = this.currentPath[i];
+	        if (pathItem.id === itemId && pathItem.entityType === entityType) {
+	            return pathItem.displayID || itemId;
+	        }
+	    }
+	    return itemId;
+	}
+
+	// ✅ HELPER: Check if item is hashed
+	isItemHashed(itemId, entityType) {
+	    return false; // Adjust based on your needs
+	}
+	
+	openAddDialogForTenant() {
+	    // This uses your existing openAddDialog method
+	    // But ensures it's creating a tenant (root level)
+	    this.currentPath = []; // Ensure we're at root level
+	    this.openAddDialog();
+	}
+	
+	async openAddDialog() {
+	    var self = this;
+	    const nextEntityType = this.getNextEntityType();
+	    if (!nextEntityType) {
+	        alert('Maximum nesting level reached');
+	        return;
+	    }
+	    const entitySchema = await this.getEntityConfig(nextEntityType);
+	    if (!entitySchema) {
+	        alert('Entity schema not found');
+	        return;
+	    }
+
+	    const modal = document.getElementById('add-modal');
+	    const title = document.getElementById('modal-title');
+	    const form = document.getElementById('add-form');
+	    title.textContent = 'Add ' + entitySchema.name;
+	    form.innerHTML = '';
+
+	    // Build form fields
+		// Detect consolidated access control
+		const hasWriteAccess = entitySchema.fields.some(f => f.name === 'writeAccess');
+		const hasReadAccess  = entitySchema.fields.some(f => f.name === 'readAccess');
+		const useAccessControl = hasWriteAccess && hasReadAccess;
+		let accessControlRendered = false;
+
+		// Build form fields
+		entitySchema.fields.forEach(function(field) {
+		    // Skip system fields (writePermission: "system")
+		    if (field.writePermission === 'system') {
+		        return;
+		    }
+
+		    // ── Image field ───────────────────────────────────────────────────
+		    if (field.name === 'image') {
+		        const imageGroup = document.createElement('div');
+		        imageGroup.className = 'form-group image-upload-group';
+		        const hiddenInput = document.createElement('input');
+		        hiddenInput.type = 'hidden';
+		        hiddenInput.name = 'image';
+		        imageGroup.appendChild(hiddenInput);
+		        const label = document.createElement('label');
+		        label.textContent = field.label + (field.mandatory ? ' *' : '');
+		        imageGroup.appendChild(label);
+		        const controlRow = document.createElement('div');
+		        controlRow.className = 'image-control-row';
+		        const urlInput = document.createElement('input');
+		        urlInput.type = 'url';
+		        urlInput.className = 'form-control image-url-input';
+		        urlInput.placeholder = 'Paste image URL or click 📁 to upload';
+		        urlInput.style.flex = '1';
+		        urlInput.style.minWidth = '0';
+		        const uploadBtn = document.createElement('button');
+		        uploadBtn.type = 'button';
+		        uploadBtn.className = 'btn btn-secondary image-upload-btn';
+		        uploadBtn.innerHTML = '📁';
+		        uploadBtn.title = 'Upload image file';
+		        uploadBtn.style.padding = '0 10px';
+		        uploadBtn.style.minWidth = '36px';
+		        const removeBtn = document.createElement('button');
+		        removeBtn.type = 'button';
+		        removeBtn.className = 'btn btn-danger image-remove-btn';
+		        removeBtn.innerHTML = '&times;';
+		        removeBtn.title = 'Remove image';
+		        removeBtn.style.padding = '0 8px';
+		        removeBtn.style.minWidth = '28px';
+		        removeBtn.style.display = 'none';
+		        controlRow.appendChild(urlInput);
+		        controlRow.appendChild(uploadBtn);
+		        controlRow.appendChild(removeBtn);
+		        const previewContainer = document.createElement('div');
+		        previewContainer.className = 'image-preview';
+		        previewContainer.style.marginTop = '8px';
+		        previewContainer.style.display = 'none';
+		        const previewImg = document.createElement('img');
+		        previewImg.style.maxWidth = '100%';
+		        previewImg.style.maxHeight = '100px';
+		        previewImg.style.borderRadius = '4px';
+		        previewImg.style.border = '1px solid #ddd';
+		        previewContainer.appendChild(previewImg);
+		        uploadBtn.addEventListener('click', () => {
+		            const input = document.createElement('input');
+		            input.type = 'file';
+		            input.accept = 'image/*';
+		            if (window.innerWidth <= 768) input.setAttribute('capture', 'environment');
+		            input.onchange = async (e) => {
+		                const file = e.target.files[0];
+		                if (file) {
+		                    try {
+		                        const url = await self.resizeImage(file, 800, 600);
+		                        hiddenInput.value = url;
+		                        urlInput.value = '';
+		                        previewImg.src = url;
+		                        previewContainer.style.display = 'block';
+		                        removeBtn.style.display = 'inline-flex';
+		                    } catch (err) {
+		                        console.error('Image resize failed:', err);
+		                        alert('Failed to process image. Please try again.');
+		                    }
+		                }
+		            };
+		            input.click();
+		        });
+		        urlInput.addEventListener('input', (e) => {
+		            const url = e.target.value.trim();
+		            if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+		                hiddenInput.value = url;
+		                previewImg.src = url;
+		                previewContainer.style.display = 'block';
+		                removeBtn.style.display = 'inline-flex';
+		            } else if (!url) {
+		                hiddenInput.value = '';
+		                previewContainer.style.display = 'none';
+		                removeBtn.style.display = 'none';
+		            }
+		        });
+		        removeBtn.addEventListener('click', (e) => {
+		            e.preventDefault();
+		            hiddenInput.value = '';
+		            urlInput.value = '';
+		            previewContainer.style.display = 'none';
+		            removeBtn.style.display = 'none';
+		            previewImg.src = '';
+		        });
+		        imageGroup.appendChild(controlRow);
+		        imageGroup.appendChild(previewContainer);
+		        form.appendChild(imageGroup);
+		        return;
+		    }
+
+		    // ── Consolidated access control ───────────────────────────────────
+		    if (field.name === 'writeAccess' || field.name === 'readAccess') {
+		        if (useAccessControl && !accessControlRendered) {
+		            accessControlRendered = true;
+
+		            const accessGroup = document.createElement('div');
+		            accessGroup.className = 'form-group';
+		            accessGroup.style.cssText = 'margin-bottom:16px;';
+
+		            const accessLabel = document.createElement('label');
+		            accessLabel.style.cssText = 'display:block;margin-bottom:8px;font-weight:600;font-size:13px;color:#444;';
+		            accessLabel.textContent = 'Access';
+		            accessGroup.appendChild(accessLabel);
+
+		            const accessOptions = [
+		                { value: 'private',  readAccess: 'owner', writeAccess: 'owner', icon: '🔒', label: 'Private',       desc: 'Only you can access this' },
+		                { value: 'self',     readAccess: 'self',  writeAccess: 'owner', icon: '👁',  label: 'Own data only', desc: 'Each person sees only their own data' },
+		                { value: 'readonly', readAccess: 'any',   writeAccess: 'owner', icon: '👥',  label: 'Read only',     desc: 'Anyone with the link can view all' },
+		                { value: 'open',     readAccess: 'any',   writeAccess: 'any',   icon: '✏️',  label: 'Open',          desc: 'Anyone can view and add' },
+		            ];
+
+		            const pillContainer = document.createElement('div');
+		            pillContainer.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+
+		            const hiddenRead  = document.createElement('input');
+		            hiddenRead.type   = 'hidden';
+		            hiddenRead.name   = 'readAccess';
+		            hiddenRead.value  = 'owner';
+
+		            const hiddenWrite = document.createElement('input');
+		            hiddenWrite.type  = 'hidden';
+		            hiddenWrite.name  = 'writeAccess';
+		            hiddenWrite.value = 'owner';
+
+		            function renderPills(lockedToPrivate) {
+		                pillContainer.innerHTML = '';
+
+		                if (lockedToPrivate) {
+		                    const lockedEl = document.createElement('div');
+		                    lockedEl.style.cssText = `
+		                        display:flex;align-items:center;gap:10px;
+		                        padding:10px 14px;
+		                        background:#f8f8f8;
+		                        border:1px solid #e0e0e0;
+		                        border-radius:8px;
+		                        font-size:13px;color:#555;
+		                    `;
+		                    lockedEl.innerHTML = `
+		                        <span style="font-size:18px;">🔒</span>
+		                        <div>
+		                            <div style="font-weight:600;color:#333;">Private — only you can access this</div>
+		                            <div style="font-size:11px;color:#888;margin-top:2px;">
+		                                You can change sharing settings after creation
+		                            </div>
+		                        </div>
+		                    `;
+		                    pillContainer.appendChild(lockedEl);
+		                    hiddenRead.value  = 'owner';
+		                    hiddenWrite.value = 'owner';
+		                    return;
+		                }
+
+		                accessOptions.forEach((opt, i) => {
+		                    const isSelected = i === 0;
+		                    const pill = document.createElement('div');
+		                    pill.dataset.accessValue = opt.value;
+		                    pill.style.cssText = `
+		                        display:flex;align-items:center;gap:10px;
+		                        padding:10px 14px;
+		                        border-radius:8px;
+		                        border:2px solid ${isSelected ? '#6c5ce7' : '#e0e0e0'};
+		                        background:${isSelected ? '#faf8ff' : '#fff'};
+		                        cursor:pointer;
+		                        transition:all 0.15s;
+		                    `;
+		                    pill.innerHTML = `
+		                        <span style="font-size:18px;min-width:24px;text-align:center;">${opt.icon}</span>
+		                        <div style="flex:1;">
+		                            <div style="font-size:13px;font-weight:600;
+		                                color:${isSelected ? '#6c5ce7' : '#333'};">
+		                                ${opt.label}
+		                            </div>
+		                            <div style="font-size:11px;color:#888;margin-top:1px;">
+		                                ${opt.desc}
+		                            </div>
+		                        </div>
+		                        <div class="access-radio" style="
+		                            width:16px;height:16px;border-radius:50%;
+		                            border:2px solid ${isSelected ? '#6c5ce7' : '#ccc'};
+		                            background:${isSelected ? '#6c5ce7' : 'transparent'};
+		                            flex-shrink:0;
+		                            display:flex;align-items:center;justify-content:center;
+		                        ">
+		                            ${isSelected ? '<div style="width:6px;height:6px;border-radius:50%;background:white;"></div>' : ''}
+		                        </div>
+		                    `;
+
+		                    pill.addEventListener('click', () => {
+		                        // Deselect all
+		                        pillContainer.querySelectorAll('[data-access-value]').forEach(p => {
+		                            p.style.border     = '2px solid #e0e0e0';
+		                            p.style.background = '#fff';
+		                            const t = p.querySelector('div > div:first-child');
+		                            if (t) t.style.color = '#333';
+		                            const r = p.querySelector('.access-radio');
+		                            if (r) {
+		                                r.style.border     = '2px solid #ccc';
+		                                r.style.background = 'transparent';
+		                                r.innerHTML        = '';
+		                            }
+		                        });
+		                        // Select this
+		                        pill.style.border     = '2px solid #6c5ce7';
+		                        pill.style.background = '#faf8ff';
+		                        const t = pill.querySelector('div > div:first-child');
+		                        if (t) t.style.color = '#6c5ce7';
+		                        const r = pill.querySelector('.access-radio');
+		                        if (r) {
+		                            r.style.border     = '2px solid #6c5ce7';
+		                            r.style.background = '#6c5ce7';
+		                            r.innerHTML        = '<div style="width:6px;height:6px;border-radius:50%;background:white;"></div>';
+		                        }
+		                        hiddenRead.value  = opt.readAccess;
+		                        hiddenWrite.value = opt.writeAccess;
+		                    });
+
+		                    pillContainer.appendChild(pill);
+		                });
+		            }
+
+		            // Default — unlocked (ext.js can override for specific entities)
+		            renderPills(false);
+
+		            accessGroup.appendChild(pillContainer);
+		            accessGroup.appendChild(hiddenRead);
+		            accessGroup.appendChild(hiddenWrite);
+
+		            // Expose renderPills so ext.js can call it to lock
+		            accessGroup._lockToPrivate = () => renderPills(true);
+
+		            form.appendChild(accessGroup);
+		        }
+		        return; // skip individual rendering for both fields
+		    }
+
+		    // ── Standard fields ───────────────────────────────────────────────
+		    const context = self.getViewingContext();
+		    const canEdit = self.canEditField(field, context);
+
+		    const group = document.createElement('div');
+		    group.className = 'form-group';
+		    const label = document.createElement('label');
+		    label.textContent = field.label + (field.mandatory ? ' *' : '');
+
+		    if (field.writePermission !== 'any') {
+		        const permIndicator = document.createElement('span');
+		        permIndicator.textContent = ' 🔒';
+		        permIndicator.title = `Write permission: ${field.writePermission}`;
+		        permIndicator.style.cursor = 'help';
+		        label.appendChild(permIndicator);
+		    }
+
+		    group.appendChild(label);
+
+		    let input;
+		    if (field.name === 'ID') {
+		        input = document.createElement('input');
+		        input.type = 'text';
+		        input.value = 'Auto-generated';
+		        input.disabled = true;
+		        input.style.backgroundColor = '#e8f4f8';
+		        input.style.border = '1px solid #b3d9e8';
+		        const indicator = document.createElement('span');
+		        indicator.textContent = ' 🔒 System Generated';
+		        indicator.style.color = '#17a2b8';
+		        indicator.style.fontSize = '12px';
+		        indicator.style.marginLeft = '5px';
+		        label.appendChild(indicator);
+		        input.title = 'This ID will be automatically generated as a UUID';
+		    } else if (field.type === 'select') {
+		        input = document.createElement('select');
+		        if (!field.mandatory) {
+		            const emptyOption = document.createElement('option');
+		            emptyOption.value = '';
+		            emptyOption.textContent = '-- Select --';
+		            input.appendChild(emptyOption);
+		        }
+		        if (field.options && Array.isArray(field.options)) {
+		            field.options.forEach(option => {
+		                const opt = document.createElement('option');
+		                opt.value = option;
+		                opt.textContent = option;
+		                input.appendChild(opt);
+		            });
+		        }
+		        if (!canEdit) {
+		            input.disabled = true;
+		            input.style.backgroundColor = '#f5f5f5';
+		        }
+		    } else if (field.type === 'textarea') {
+		        input = document.createElement('textarea');
+		        if (!canEdit) {
+		            input.disabled = true;
+		            input.style.backgroundColor = '#f5f5f5';
+		        }
+		    } else if (field.type === 'checkbox') {
+		        const checkboxContainer = document.createElement('div');
+		        checkboxContainer.style.display = 'flex';
+		        checkboxContainer.style.alignItems = 'center';
+		        checkboxContainer.style.gap = '8px';
+		        input = document.createElement('input');
+		        input.type = 'checkbox';
+		        input.id = 'field-' + field.name;
+		        const checkboxLabel = document.createElement('label');
+		        checkboxLabel.htmlFor = 'field-' + field.name;
+		        checkboxLabel.textContent = field.label;
+		        checkboxContainer.appendChild(input);
+		        checkboxContainer.appendChild(checkboxLabel);
+		        group.appendChild(checkboxContainer);
+		        if (!canEdit) {
+		            input.disabled = true;
+		            checkboxLabel.style.color = '#999';
+		        }
+		        form.appendChild(group);
+		        return;
+		    } else {
+		        input = document.createElement('input');
+		        input.type = field.type;
+		        if (!canEdit) {
+		            input.disabled = true;
+		            input.style.backgroundColor = '#f5f5f5';
+		        }
+		    }
+
+		    if (field.name !== 'ID') {
+		        input.name = field.name;
+		        input.required = field.mandatory && canEdit;
+		    }
+
+		    if (field.type !== 'checkbox') {
+		        group.appendChild(input);
+		        form.appendChild(group);
+		    }
+		});
+
+	    // ✅ ADD REAL-TIME DOTLABEL FUNCTIONALITY HERE
+	    const nameInput = form.querySelector('input[name="name"]');
+	    const dotLabelInput = form.querySelector('input[name="dotLabel"]');
+	    
+	    if (nameInput && dotLabelInput) {
+	        // Add reset button
+	        const resetBtn = document.createElement('button');
+	        resetBtn.type = 'button';
+	        resetBtn.textContent = '↺';
+	        resetBtn.title = 'Reset to auto-generated from name';
+			resetBtn.className = 'dotlabel-reset-btn';
+	        resetBtn.style.cssText = 'margin-left: 5px; padding: 2px 6px; font-size: 12px; cursor: pointer; background: #f0f0f0; border: 1px solid #ddd; border-radius: 3px;';
+	        
+	        // Insert reset button after dotLabel input
+	        const dotLabelGroup = form.querySelector('.form-group input[name="dotLabel"]').parentElement;
+	        dotLabelGroup.style.display = 'flex';
+	        dotLabelGroup.style.alignItems = 'center';
+	        dotLabelGroup.style.gap = '5px';
+	        dotLabelGroup.appendChild(resetBtn);
+	        
+	        // Real-time update
+	        nameInput.addEventListener('input', function(e) {
+	            if (!dotLabelInput.dataset.userModified) {
+	                let candidateLabel = e.target.value.substring(0, 3).toUpperCase();
+	                if (candidateLabel.length < 3) {
+	                    candidateLabel = candidateLabel.padEnd(3, 'X');
+	                }
+	                dotLabelInput.value = candidateLabel;
+	            }
+	        });
+	        
+	        // Track manual changes
+	        dotLabelInput.addEventListener('focus', function() {
+	            dotLabelInput.dataset.userModified = 'true';
+	        });
+	        
+	        // Reset functionality
+	        resetBtn.addEventListener('click', function(e) {
+	            e.preventDefault();
+	            dotLabelInput.dataset.userModified = 'false';
+	            let candidateLabel = nameInput.value.substring(0, 3).toUpperCase();
+	            if (candidateLabel.length < 3) {
+	                candidateLabel = candidateLabel.padEnd(3, 'X');
+	            }
+	            dotLabelInput.value = candidateLabel;
+	        });
+	    }
+
+	    // Add buttons
+	    const buttonGroup = document.createElement('div');
+	    buttonGroup.style.marginTop = '20px';
+
+	    const submitBtn = document.createElement('button');
+	    submitBtn.id = 'add-submit-btn';
+	    submitBtn.type = 'submit';
+	    submitBtn.className = 'btn btn-primary';
+	    submitBtn.textContent = 'Add ' + entitySchema.name;
+
+	    const cancelBtn = document.createElement('button');
+	    cancelBtn.type = 'button';
+	    cancelBtn.className = 'btn btn-secondary';
+	    cancelBtn.textContent = 'Cancel';
+	    cancelBtn.addEventListener('click', function() { modal.style.display = 'none'; });
+
+	    buttonGroup.appendChild(submitBtn);
+	    buttonGroup.appendChild(cancelBtn);
+	    form.appendChild(buttonGroup);
+
+	    // Handle form submission
+	    form.onsubmit = async function(e) {
+	        e.preventDefault();
+
+	        // Disable button
+	        submitBtn.disabled = true;
+	        submitBtn.style.opacity = '0.6';
+	        submitBtn.textContent = 'Saving...';
+
+	        try {
+	            await self.addItem(nextEntityType, form);
+	            modal.style.display = 'none';
+	            submitBtn.disabled = false;
+	            submitBtn.style.opacity = '1';
+	            submitBtn.textContent = 'Add ' + entitySchema.name;
+	        } catch (error) {
+	            console.error('Error during add:', error);
+	            alert('Failed to add item: ' + (error.message || 'Unknown error'));
+	            submitBtn.disabled = false;
+	            submitBtn.style.opacity = '1';
+	            submitBtn.textContent = 'Add ' + entitySchema.name;
+	        }
+	    };
+
+		this._injectImportButton(nextEntityType);
+	    modal.style.display = 'block';
+	}
+	
+	_injectImportButton(entityType) {
+	    const modal = document.getElementById('add-modal');
+	    if (!modal) return;
+	    if (!this.isDataOwner()) return; // data owners only
+
+	    // Don't add twice
+	    if (modal.querySelector('.import-csv-btn')) return;
+
+	    const modalTitle = document.getElementById('modal-title');
+	    if (!modalTitle) return;
+
+	    // Wrap title in flex container if not already
+	    modalTitle.style.cssText = 'display:flex; justify-content:space-between; align-items:center;';
+
+	    const btn = document.createElement('button');
+	    btn.className = 'import-csv-btn';
+	    btn.title = 'Import from CSV';
+	    btn.style.cssText = `
+	        background: none; border: 1px solid #6c5ce7; border-radius: 6px;
+	        padding: 4px 10px; font-size: 12px; color: #6c5ce7; cursor: pointer;
+	        display: flex; align-items: center; gap: 4px; font-weight: 600;
+	    `;
+	    btn.innerHTML = `
+	        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" 
+	             stroke="currentColor" stroke-width="2">
+	            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+	            <polyline points="17 8 12 3 7 8"/>
+	            <line x1="12" y1="3" x2="12" y2="15"/>
+	        </svg>
+	        Import CSV
+	    `;
+	    btn.onclick = (e) => {
+	        e.preventDefault();
+	        e.stopPropagation();
+	        this._triggerCSVImport(entityType);
+	    };
+	    modalTitle.appendChild(btn);
+	}
+	
+
+	
+	_triggerCSVImport(entityType) {
+	    const input = document.createElement('input');
+		const MAX_FILE_SIZE_MB = 5;
+	    input.type = 'file';
+	    input.accept = '.csv,text/csv';
+	    input.style.display = 'none';
+	    document.body.appendChild(input);
+
+	    input.onchange = async (e) => {
+	        const file = e.target.files?.[0];
+	        document.body.removeChild(input);
+	        if (!file) return;
+			
+			if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+			    this.showNotification(`❌ File too large. Maximum size is ${MAX_FILE_SIZE_MB}MB`, 'error');
+			    return;
+			}
+
+	        // Validate file type
+	        if (!file.name.endsWith('.csv') && file.type !== 'text/csv') {
+	            this.showNotification('❌ Please select a valid CSV file', 'error');
+	            return;
+	        }
+
+	        try {
+	            const text = await file.text();
+	            await this._processCSVImport(text, entityType);
+	        } catch (err) {
+	            this.showNotification(`❌ Failed to read file: ${err.message}`, 'error');
+	        }
+	    };
+
+	    input.click();
+	}
+	
+	_parseCSV(text) {
+	    const lines = text.trim().split(/\r?\n/);
+	    if (lines.length < 2) throw new Error('CSV must have a header row and at least one data row');
+		
+    // Parse headers
+	    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+
+	    // Parse rows
+	    const rows = [];
+	    for (let i = 1; i < lines.length; i++) {
+	        const line = lines[i].trim();
+	        if (!line) continue;
+
+	        // Handle quoted commas
+	        const values = [];
+	        let current = '';
+	        let inQuotes = false;
+	        for (const char of line) {
+	            if (char === '"') {
+	                inQuotes = !inQuotes;
+	            } else if (char === ',' && !inQuotes) {
+	                values.push(current.trim());
+	                current = '';
+	            } else {
+	                current += char;
+	            }
+	        }
+	        values.push(current.trim());
+
+	        const row = {};
+	        headers.forEach((header, idx) => {
+	            row[header] = values[idx] !== undefined ? values[idx].replace(/^"|"$/g, '') : '';
+	        });
+	        rows.push(row);
+	    }
+
+	    return { headers, rows };
+	}
+	
+	async _validateCSV(headers, rows, entityType) {
+	    const errors = [];
+	    const warnings = [];
+
+	    const nativeEntities = await this.db.getNativeEntities();
+	    const entityConfig = nativeEntities[entityType];
+	    if (!entityConfig) {
+	        errors.push(`No entity config found for ${entityType}`);
+	        return { valid: false, errors, warnings, levels: [] };
+	    }
+
+	    // ✅ Build levels dynamically from hierarchy and actual headers
+	    const levels = this._buildImportLevels(entityType, headers);
+
+	    // ✅ Map headers to their level
+	    headers.forEach(header => {
+	        for (let i = levels.length - 1; i >= 0; i--) {
+	            if (header.startsWith(levels[i].prefix)) {
+	                const fieldName = header.slice(levels[i].prefix.length);
+	                if (!levels[i].fields) levels[i].fields = [];
+	                levels[i].fields.push(fieldName);
+	                break;
+	            }
+	        }
+	    });
+
+	    // Ensure fields array exists on all levels
+	    levels.forEach(l => { if (!l.fields) l.fields = []; });
+
+	    // ✅ Validate mandatory fields and warn on unknown fields per level
+	    for (const level of levels) {
+	        const config = nativeEntities[level.entityType];
+	        if (!config) {
+	            errors.push(`No native entity config found for "${level.entityType}"`);
+	            continue;
+	        }
+
+	        // Check mandatory fields are present as columns
+	        const mandatoryFields = config.fields
+	            .filter(f =>
+	                f.mandatory &&
+	                !['ID', 'displayID', 'timestamp', 'hidden', 'hashed', 'dotLabel', 'description'].includes(f.name)
+	            )
+	            .map(f => f.name);
+
+	        mandatoryFields.forEach(field => {
+	            if (!level.fields.includes(field)) {
+	                errors.push(
+	                    `Missing mandatory column: "${level.prefix}${field}" ` +
+	                    `for entity "${level.entityType}"`
+	                );
+	            }
+	        });
+
+	        // Warn on unrecognised fields
+	        level.fields.forEach(field => {
+	            const known = config.fields.some(f => f.name === field);
+	            if (!known) {
+	                warnings.push(
+	                    `Unknown field "${level.prefix}${field}" ` +
+	                    `for entity "${level.entityType}" — will be ignored`
+	                );
+	            }
+	        });
+	    }
+
+	    if (errors.length > 0) return { valid: false, errors, warnings, levels };
+
+	    // ✅ Validate data rows — type checking
+	    for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+	        const row = rows[rowIdx];
+	        const rowNum = rowIdx + 2; // 1-indexed + header row offset
+
+	        for (const level of levels) {
+	            const config = nativeEntities[level.entityType];
+	            config.fields.forEach(field => {
+	                const colName = level.prefix + field.name;
+	                const value = row[colName];
+	                if (value === undefined || value === '') return;
+
+	                if (field.type === 'number' && isNaN(parseFloat(value))) {
+	                    errors.push(
+	                        `Row ${rowNum}: "${colName}" must be a number, got "${value}"`
+	                    );
+	                }
+	                if (field.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+	                    errors.push(
+	                        `Row ${rowNum}: "${colName}" must be a valid email, got "${value}"`
+	                    );
+	                }
+	            });
+	        }
+	    }
+
+	    return { valid: errors.length === 0, errors, warnings, levels };
+	}
+	
+	async _processCSVImport(text, entityType) {
+	    let parsed;
+	    try {
+	        parsed = this._parseCSV(text);
+	    } catch (err) {
+	        this.showNotification(`❌ Invalid CSV: ${err.message}`, 'error');
+	        return;
+	    }
+
+	    const { headers, rows } = parsed;
+		
+		const MAX_ROWS = 1000;
+		if (rows.length > MAX_ROWS) {
+		    this.showNotification(`❌ Too many rows. Maximum is ${MAX_ROWS} rows per import`, 'error');
+		    return;
+		}
+
+	    const validation = await this._validateCSV(headers, rows, entityType);
+
+	    if (!validation.valid) {
+	        this._showImportErrorModal(validation.errors, validation.warnings);
+	        return;
+	    }
+
+	    // Build preview items
+	    const nativeEntities = await this.db.getNativeEntities();
+	    const previewItems = this._buildImportItems(rows, validation.levels, nativeEntities, entityType);
+
+	    this._showImportPreviewModal(previewItems, validation.warnings, entityType, validation.levels);
+	}
+	
+	_buildImportItems(rows, levels, nativeEntities, entityType) {
+	    const rootLevel = levels[0];
+	    const childLevel = levels[1];
+	    const grandchildLevel = levels[2];
+
+	    // Get current items at this level for upsert matching
+	    const existingItems = this._getCurrentLevelItems();
+
+	    // ✅ Group rows by root item name
+	    // Multiple rows with the same root name = one root item with multiple children
+	    const rootMap = new Map();
+
+	    rows.forEach(row => {
+	        const rootName = row[rootLevel.prefix + 'name'] || row['name'];
+	        if (!rootName) return;
+
+	        if (!rootMap.has(rootName)) {
+	            // Upsert matching: displayID first, then name
+	            const displayID = row['displayID'];
+	            const existing = displayID
+	                ? existingItems.find(i => i.displayID === displayID)
+	                : existingItems.find(i => i.name === rootName);
+
+	            // Build root item fields from all non-prefixed columns
+	            const config = nativeEntities[rootLevel.entityType];
+	            const fields = {};
+	            config.fields.forEach(field => {
+	                if (['ID', 'displayID', 'timestamp', 'hidden', 'hashed', 'dotLabel', 'description'].includes(field.name)) return;
+	                const value = row[field.name]; // no prefix for root level
+	                if (value !== undefined && value !== '') {
+	                    fields[field.name] = field.type === 'number'
+	                        ? parseFloat(value)
+	                        : value;
+	                }
+	            });
+
+	            rootMap.set(rootName, {
+	                isUpdate: !!existing,
+	                existingItem: existing || null,
+	                fields,
+	                childRows: [],
+	                entityType: rootLevel.entityType
+	            });
+	        }
+
+	        // ✅ Collect child row if child columns exist in this row
+	        if (childLevel) {
+	            const childName = row[childLevel.prefix + 'name'];
+	            if (childName) {
+	                rootMap.get(rootName).childRows.push(row);
+	            }
+	        }
+	    });
+
+	    // ✅ Build preview items array
+	    const items = [];
+
+	    for (const [name, entry] of rootMap) {
+	        const children = [];
+
+	        if (childLevel && entry.childRows.length > 0) {
+	            const childConfig = nativeEntities[childLevel.entityType];
+	            const childrenField = this.currentApp.entityConfigs[rootLevel.entityType]?.childrenField;
+
+	            // Existing children of this item for upsert matching
+	            const existingChildItems = entry.existingItem?.[childrenField] || [];
+
+	            // ✅ Group child rows by child name (for grandchild aggregation)
+	            const childMap = new Map();
+
+	            entry.childRows.forEach(childRow => {
+	                const childName = childRow[childLevel.prefix + 'name'];
+	                if (!childName) return;
+
+	                if (!childMap.has(childName)) {
+	                    const childDisplayID = childRow[childLevel.prefix + 'displayID'];
+	                    const existingChild = childDisplayID
+	                        ? existingChildItems.find(c => c.displayID === childDisplayID)
+	                        : existingChildItems.find(c => c.name === childName);
+
+	                    // Build child fields
+	                    const childFields = {};
+	                    childConfig.fields.forEach(field => {
+	                        if (['ID', 'displayID', 'timestamp', 'hidden', 'hashed'].includes(field.name)) return;
+	                        const value = childRow[childLevel.prefix + field.name];
+	                        if (value !== undefined && value !== '') {
+	                            childFields[field.name] = field.type === 'number'
+	                                ? parseFloat(value)
+	                                : value;
+	                        }
+	                    });
+
+	                    childMap.set(childName, {
+	                        isUpdate: !!existingChild,
+	                        existingItem: existingChild || null,
+	                        fields: childFields,
+	                        grandchildRows: [],
+	                        entityType: childLevel.entityType
+	                    });
+	                }
+
+	                // Collect grandchild rows if grandchild columns exist
+	                if (grandchildLevel) {
+	                    const grandchildName = childRow[grandchildLevel.prefix + 'name'];
+	                    if (grandchildName) {
+	                        childMap.get(childName).grandchildRows.push(childRow);
+	                    }
+	                }
+	            });
+
+	            // ✅ Build children array from childMap
+	            for (const [childName, childEntry] of childMap) {
+	                const grandchildren = [];
+
+	                if (grandchildLevel && childEntry.grandchildRows.length > 0) {
+	                    const grandchildConfig = nativeEntities[grandchildLevel.entityType];
+	                    const grandchildrenField =
+	                        this.currentApp.entityConfigs[childLevel.entityType]?.childrenField;
+	                    const existingGrandchildren =
+	                        childEntry.existingItem?.[grandchildrenField] || [];
+
+	                    childEntry.grandchildRows.forEach(gcRow => {
+	                        const gcName = gcRow[grandchildLevel.prefix + 'name'];
+	                        if (!gcName) return;
+
+	                        const gcDisplayID = gcRow[grandchildLevel.prefix + 'displayID'];
+	                        const existingGC = gcDisplayID
+	                            ? existingGrandchildren.find(g => g.displayID === gcDisplayID)
+	                            : existingGrandchildren.find(g => g.name === gcName);
+
+	                        const gcFields = {};
+	                        grandchildConfig.fields.forEach(field => {
+	                            if (['ID', 'displayID', 'timestamp', 'hidden', 'hashed'].includes(field.name)) return;
+	                            const value = gcRow[grandchildLevel.prefix + field.name];
+	                            if (value !== undefined && value !== '') {
+	                                gcFields[field.name] = field.type === 'number'
+	                                    ? parseFloat(value)
+	                                    : value;
+	                            }
+	                        });
+
+	                        grandchildren.push({
+	                            isUpdate: !!existingGC,
+	                            existingItem: existingGC || null,
+	                            fields: gcFields,
+	                            entityType: grandchildLevel.entityType
+	                        });
+	                    });
+	                }
+
+	                children.push({
+	                    ...childEntry,
+	                    children: grandchildren
+	                });
+	            }
+	        }
+
+	        items.push({
+	            isUpdate: entry.isUpdate,
+	            existingItem: entry.existingItem,
+	            fields: entry.fields,
+	            children,
+	            entityType: rootLevel.entityType
+	        });
+	    }
+
+	    return items;
+	}
+	
+	_showImportPreviewModal(previewItems, warnings, entityType, levels) {
+	    // Remove existing
+	    document.querySelector('.csv-import-overlay')?.remove();
+
+	    const insertCount = previewItems.filter(i => !i.isUpdate).length;
+	    const updateCount = previewItems.filter(i => i.isUpdate).length;
+	    const childCount = previewItems.reduce((sum, i) => sum + i.children.length, 0);
+
+	    const overlay = document.createElement('div');
+	    overlay.className = 'csv-import-overlay';
+	    overlay.style.cssText = `
+	        position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+	        z-index: 10001; display: flex; align-items: center; justify-content: center;
+	    `;
+
+	    const modal = document.createElement('div');
+	    modal.style.cssText = `
+	        background: white; border-radius: 12px; padding: 24px;
+	        width: 600px; max-width: 95vw; max-height: 80vh;
+	        overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+	        position: relative;
+	    `;
+
+	    // Header
+	    modal.innerHTML = `
+	        <h2 style="margin:0 0 4px 0; font-size:18px;">📋 Import Preview</h2>
+	        <p style="color:#666; font-size:13px; margin:0 0 16px 0;">
+	            Review before importing. This cannot be undone.
+	        </p>
+	    `;
+
+	    // Summary bar
+	    const summary = document.createElement('div');
+	    summary.style.cssText = `
+	        display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;
+	    `;
+	    const pill = (label, color) => `
+	        <span style="padding:4px 12px; border-radius:20px; font-size:12px;
+	                     font-weight:600; background:${color}; color:white;">
+	            ${label}
+	        </span>`;
+	    summary.innerHTML =
+	        pill(`${insertCount} new`, '#00b894') +
+	        (updateCount > 0 ? pill(`${updateCount} updates`, '#6c5ce7') : '') +
+	        (childCount > 0 ? pill(`${childCount} child rows`, '#0984e3') : '') +
+	        (warnings.length > 0 ? pill(`${warnings.length} warnings`, '#fdcb6e') : '');
+	    modal.appendChild(summary);
+
+	    // Warnings
+	    if (warnings.length > 0) {
+	        const warnBox = document.createElement('div');
+	        warnBox.style.cssText = `
+	            background: #fff9e6; border: 1px solid #fdcb6e; border-radius: 8px;
+	            padding: 10px 14px; margin-bottom: 16px; font-size: 12px; color: #636e72;
+	        `;
+	        warnBox.innerHTML = warnings.map(w => `⚠️ ${w}`).join('<br>');
+	        modal.appendChild(warnBox);
+	    }
+
+	    // Preview table
+	    const table = document.createElement('table');
+	    table.style.cssText = `
+	        width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 20px;
+	    `;
+
+	    // Build headers from first item fields
+	    const fieldNames = previewItems.length > 0 ? Object.keys(previewItems[0].fields) : [];
+	    table.innerHTML = `
+	        <thead>
+	            <tr style="background:#f8f8f8; border-bottom: 2px solid #eee;">
+	                <th style="padding:8px; text-align:left; color:#636e72; font-size:11px;">STATUS</th>
+	                ${fieldNames.map(f => `
+	                    <th style="padding:8px; text-align:left; color:#636e72; font-size:11px;">
+	                        ${f.toUpperCase()}
+	                    </th>`).join('')}
+	                ${levels[1] ? `<th style="padding:8px; text-align:left; color:#636e72; font-size:11px;">CHILDREN</th>` : ''}
+	            </tr>
+	        </thead>
+	    `;
+
+	    const tbody = document.createElement('tbody');
+	    previewItems.forEach(item => {
+	        const tr = document.createElement('tr');
+	        tr.style.cssText = `border-bottom: 1px solid #f0f0f0;
+	            background: ${item.isUpdate ? '#f0f4ff' : 'white'};`;
+
+	        const statusBadge = item.isUpdate
+	            ? `<span style="background:#6c5ce7;color:white;padding:2px 8px;
+	                           border-radius:10px;font-size:11px;font-weight:600;">UPDATE</span>`
+	            : `<span style="background:#00b894;color:white;padding:2px 8px;
+	                           border-radius:10px;font-size:11px;font-weight:600;">NEW</span>`;
+
+	        tr.innerHTML = `
+	            <td style="padding:8px;">${statusBadge}</td>
+	            ${fieldNames.map(f => `
+	                <td style="padding:8px; color:#2d3436;">
+	                    ${item.fields[f] !== undefined ? item.fields[f] : '—'}
+	                </td>`).join('')}
+	            ${levels[1] ? `
+	                <td style="padding:8px; color:#636e72; font-size:12px;">
+	                    ${item.children.length > 0
+	                        ? item.children.map(c =>
+	                            `<span style="display:block;">
+	                                ${c.isUpdate ? '↻' : '+'} ${c.fields.name || '—'}
+	                            </span>`).join('')
+	                        : '—'}
+	                </td>` : ''}
+	        `;
+	        tbody.appendChild(tr);
+	    });
+	    table.appendChild(tbody);
+	    modal.appendChild(table);
+
+	    // Actions
+	    const actions = document.createElement('div');
+	    actions.style.cssText = 'display:flex; gap:10px; justify-content:flex-end;';
+
+	    const cancelBtn = document.createElement('button');
+	    cancelBtn.textContent = 'Cancel';
+	    cancelBtn.style.cssText = `
+	        padding:9px 20px; border-radius:8px; font-size:14px; cursor:pointer;
+	        border:1px solid #ddd; background:#f0f0f0; font-weight:600;
+	    `;
+	    cancelBtn.onclick = () => overlay.remove();
+
+	    const confirmBtn = document.createElement('button');
+	    confirmBtn.textContent = `Import ${previewItems.length} items`;
+	    confirmBtn.style.cssText = `
+	        padding:9px 20px; border-radius:8px; font-size:14px; cursor:pointer;
+	        border:none; background:#6c5ce7; color:white; font-weight:600;
+	    `;
+	    confirmBtn.onclick = async () => {
+	        overlay.remove();
+	        await this._executeImport(previewItems, entityType, levels);
+	    };
+
+	    actions.appendChild(cancelBtn);
+	    actions.appendChild(confirmBtn);
+	    modal.appendChild(actions);
+
+	    overlay.appendChild(modal);
+	    document.body.appendChild(overlay);
+	}
+	
+	_showImportErrorModal(errors, warnings) {
+	    document.querySelector('.csv-import-overlay')?.remove();
+
+	    const overlay = document.createElement('div');
+	    overlay.className = 'csv-import-overlay';
+	    overlay.style.cssText = `
+	        position:fixed; inset:0; background:rgba(0,0,0,0.5);
+	        z-index:10001; display:flex; align-items:center; justify-content:center;
+	    `;
+
+	    const modal = document.createElement('div');
+	    modal.style.cssText = `
+	        background:white; border-radius:12px; padding:24px;
+	        width:500px; max-width:95vw; max-height:75vh; overflow-y:auto;
+	        box-shadow:0 20px 60px rgba(0,0,0,0.3);
+	    `;
+	    modal.innerHTML = `
+	        <h2 style="margin:0 0 4px 0; font-size:18px; color:#e17055;">
+	            ❌ Validation Failed
+	        </h2>
+	        <p style="color:#666; font-size:13px; margin:0 0 16px 0;">
+	            Fix these errors in your CSV and try again.
+	        </p>
+	        <div style="background:#fff5f5; border:1px solid #fab1a0; border-radius:8px;
+	                    padding:12px 16px; margin-bottom:16px; font-size:13px; color:#d63031;">
+	            ${errors.map(e => `<div style="margin-bottom:4px;">• ${e}</div>`).join('')}
+	        </div>
+	        ${warnings.length > 0 ? `
+	        <div style="background:#fff9e6; border:1px solid #fdcb6e; border-radius:8px;
+	                    padding:12px 16px; margin-bottom:16px; font-size:13px; color:#636e72;">
+	            ${warnings.map(w => `<div style="margin-bottom:4px;">⚠️ ${w}</div>`).join('')}
+	        </div>` : ''}
+	        <div style="display:flex; justify-content:flex-end;">
+	            <button onclick="this.closest('.csv-import-overlay').remove()"
+	                    style="padding:9px 20px; border-radius:8px; font-size:14px;
+	                           cursor:pointer; border:none; background:#e17055;
+	                           color:white; font-weight:600;">
+	                Close
+	            </button>
+	        </div>
+	    `;
+	    overlay.appendChild(modal);
+	    document.body.appendChild(overlay);
+	}
+	
+
+	async _executeImport(previewItems, entityType, levels) {
+	    console.log('[_executeImport] START', { previewItems, entityType, levels });
+
+	    try {
+	        const nativeEntities = await this.db.getNativeEntities();
+	        const childrenField = this.currentApp.entityConfigs[entityType]?.childrenField;
+	        const childEntityType = levels[1]?.entityType;
+
+	        let insertCount = 0;
+	        let updateCount = 0;
+	        const entitiesToSave = [];
+
+	        for (const previewItem of previewItems) {
+	            console.log('[_executeImport] processing:', previewItem.fields.name, 'isUpdate:', previewItem.isUpdate);
+	            let targetItem;
+
+	            if (previewItem.isUpdate) {
+	                targetItem = previewItem.existingItem;
+	                Object.assign(targetItem, previewItem.fields);
+	                targetItem.timestamp = Date.now();
+	                previewItem._targetItem = targetItem;
+	                updateCount++;
+	            } else {
+	                targetItem = {
+	                    ...previewItem.fields,
+	                    entityType,
+	                    timestamp: Date.now(),
+	                    hidden: false,
+	                    hashed: false,
+	                    writeAccess: 'owner',
+	                    readAccess: 'owner'
+	                };
+	                const rawUUID = this.db.generateUUID();
+	                targetItem.ID = rawUUID;
+	                targetItem.displayID = this.db.hashUUID(rawUUID);
+	                this.ensureBaseEntityFields(targetItem, entityType, nativeEntities[entityType]);
+	                this.processItemID(targetItem, entityType);
+	                this._insertItemIntoTree(targetItem);
+	                previewItem._targetItem = targetItem;
+	                insertCount++;
+	            }
+
+	            console.log('[_executeImport] targetItem ready:', targetItem?.ID);
+	            console.log('[_executeImport] children count:', previewItem.children?.length);
+
+	            // ✅ Build entity path
+	            const entityPath = [
+	                'apps',
+	                this.currentApp.id,
+	                ...this.currentPath.map(p => p.displayID),
+	                targetItem.displayID
+	            ].join('/');
+
+	            entitiesToSave.push({
+	                path: entityPath,
+	                data: targetItem,
+	                isUpdate: previewItem.isUpdate
+	            });
+
+	            // ✅ Handle children
+	            if (previewItem.children?.length > 0 && childrenField && childEntityType) {
+	                if (!targetItem[childrenField]) targetItem[childrenField] = [];
+
+	                for (const previewChild of previewItem.children) {
+	                    console.log('[_executeImport] processing child:', previewChild.fields.name);
+
+	                    if (previewChild.isUpdate) {
+	                        Object.assign(previewChild.existingItem, previewChild.fields);
+	                        previewChild.existingItem.timestamp = Date.now();
+	                        previewChild._targetItem = previewChild.existingItem;
+	                    } else {
+	                        const newChild = {
+	                            ...previewChild.fields,
+	                            entityType: childEntityType,
+	                            timestamp: Date.now(),
+	                            hidden: false,
+	                            hashed: false,
+	                            writeAccess: 'owner',
+	                            readAccess: 'owner'
+	                        };
+	                        const rawUUID = this.db.generateUUID();
+	                        newChild.ID = rawUUID;
+	                        newChild.displayID = this.db.hashUUID(rawUUID);
+	                        this.ensureBaseEntityFields(
+	                            newChild, childEntityType, nativeEntities[childEntityType]
+	                        );
+	                        targetItem[childrenField].push(newChild);
+	                        previewChild._targetItem = newChild; // ✅ store reference
+	                    }
+
+	                    // ✅ Add child to batch
+	                    const childItem = previewChild._targetItem;
+	                    if (childItem) {
+	                        entitiesToSave.push({
+	                            path: entityPath + '/' + childItem.displayID,
+	                            data: childItem,
+	                            isUpdate: previewChild.isUpdate
+	                        });
+	                    }
+	                }
+	            }
+
+	            console.log('[_executeImport] item done:', targetItem?.ID);
+	        }
+
+	        console.log('[_executeImport] loop complete — insertCount:', insertCount, 'updateCount:', updateCount);
+	        console.log('[_executeImport] entitiesToSave:', entitiesToSave.length);
+
+	        // ✅ Render optimistically before network call
+	        this.render();
+	        this.updateBreadcrumb();
+
+	        // ✅ ONE network call for entire import
+			await this.db.saveEntitiesBatch(entitiesToSave, (current, total) => {
+			    this.showNotification(`⏳ Saving batch ${current} of ${total}...`, 'info');
+			});
+
+	        this.showNotification(
+	            `✅ Import complete — ${insertCount} added, ${updateCount} updated`,
+	            'success'
+	        );
+			//Close Add dialog
+			document.getElementById('add-modal').style.display = 'none';
+	    } catch (err) {
+	        console.error('[_executeImport] ERROR:', err);
+	        console.error('[_executeImport] Stack:', err.stack);
+	        this.render();
+	        this.showNotification(`❌ Import failed: ${err.message}`, 'error');
+			//Close Add dialog
+			document.getElementById('add-modal').style.display = 'none';
+	    }
+	}
+	
+	_getCurrentLevelItems() {
+	    if (this.currentPath.length === 0) return this.data?.items || [];
+
+	    const firstItem = this.data?.items?.[0];
+	    const lastPathEntity = this.currentPath[this.currentPath.length - 1];
+	    const isPartial = firstItem?.entityType === lastPathEntity.entityType &&
+	                      firstItem?.displayID === lastPathEntity.displayID;
+
+	    if (isPartial) {
+	        const entityType = this.currentApp.hierarchy[this.currentPath.length - 1];
+	        const config = this.currentApp.entityConfigs[entityType];
+	        return firstItem[config.childrenField] || [];
+	    }
+
+	    // Navigate full tree
+	    let items = this.data.items;
+	    for (let i = 0; i < this.currentPath.length; i++) {
+	        const entityType = this.currentApp.hierarchy[i];
+	        const config = this.currentApp.entityConfigs[entityType];
+	        const pathItem = this.currentPath[i];
+	        const found = items.find(it => it.ID === pathItem.id || it.displayID === pathItem.id);
+	        if (!found) return [];
+	        if (i === this.currentPath.length - 1) {
+	            return found[config.childrenField] || [];
+	        }
+	        items = found[config.childrenField] || [];
+	    }
+	    return [];
+	}
+	
+	_insertItemIntoTree(item) {
+	    if (this.currentPath.length === 0) {
+	        this.data.items.push(item);
+	        return;
+	    }
+
+	    const parentDepth = this.currentPath.length - 1;
+	    const parentEntityType = this.currentApp.hierarchy[parentDepth];
+	    const parentConfig = this.currentApp.entityConfigs[parentEntityType];
+	    const childrenField = parentConfig.childrenField;
+
+	    const firstItem = this.data?.items?.[0];
+	    const lastPathEntity = this.currentPath[this.currentPath.length - 1];
+	    const isPartial = firstItem?.entityType === lastPathEntity.entityType &&
+	                      firstItem?.displayID === lastPathEntity.displayID;
+
+	    if (isPartial) {
+	        if (!firstItem[childrenField]) firstItem[childrenField] = [];
+	        firstItem[childrenField].push(item);
+	        return;
+	    }
+
+	    let currentItems = this.data.items;
+	    for (let i = 0; i < parentDepth; i++) {
+	        const et = this.currentApp.hierarchy[i];
+	        const cfg = this.currentApp.entityConfigs[et];
+	        const pathItem = this.currentPath[i];
+	        const found = currentItems.find(it => it.ID === pathItem.id || it.displayID === pathItem.id);
+	        if (!found) return;
+	        currentItems = found[cfg.childrenField] || [];
+	    }
+
+	    const parentPathItem = this.currentPath[parentDepth];
+	    const parent = currentItems.find(it =>
+	        it.ID === parentPathItem.id || it.displayID === parentPathItem.id
+	    );
+	    if (!parent) return;
+	    if (!parent[childrenField]) parent[childrenField] = [];
+	    parent[childrenField].push(item);
+	}
+
+	_buildImportLevels(entityType, headers) {
+	    const levels = [];
+	    let currentEntityType = entityType;
+	    let currentPrefix = '';
+
+	    while (currentEntityType) {
+	        levels.push({
+	            entityType: currentEntityType,
+	            prefix: currentPrefix
+	        });
+
+	        const childEntity = this.currentApp.entityConfigs[currentEntityType]?.childEntity;
+	        if (!childEntity) break;
+
+	        const childrenField = this.currentApp.entityConfigs[currentEntityType]?.childrenField;
+	        const nextPrefix = currentPrefix + childrenField + '.';
+
+	        // Only go deeper if headers actually contain this prefix
+	        if (!headers.some(h => h.startsWith(nextPrefix))) break;
+
+	        // Depth limit
+	        if (levels.length >= 3) break;
+
+	        currentPrefix = nextPrefix;
+	        currentEntityType = childEntity;
+	    }
+
+	    return levels;
+	}
+	// Update the addItem method in SchemaOrchestrator to send emails
+
+	async addItem(entityType, form) {
+	    if (!this.currentApp) {
+	        throw new Error('App not initialized - cannot add items');
+	    }
+
+	    const formData = new FormData(form);
+	    const newItem = { timestamp: Date.now(), entityType: entityType };
+	    let parentItem = null;
+
+	    // ✅ Get entity config
+	    const entityConfig = await this.getEntityConfig(entityType);
+	    if (!entityConfig) {
+	        throw new Error(`Entity config not found for: ${entityType}`);
+	    }
+
+	    // ✅ Generate UUID if ID field exists
+	    const hasIDField = entityConfig.fields.some(f => f.name === 'ID');
+	    if (hasIDField) {
+	        const rawUUID = this.db.generateUUID();
+	        newItem.ID = rawUUID;
+	        newItem.displayID = this.db.hashUUID(rawUUID);
+	        newItem.timestamp = Date.now();
+	        newItem.hidden = false;
+	        newItem.hashed = false;
+	        newItem.writeAccess = 'owner';
+	        newItem.readAccess = 'owner';
+	    }
+
+	    // ✅ Process form data
+	    const context = this.getViewingContext();
+	    for (let [key, value] of formData.entries()) {
+	        if (key !== 'ID') {
+	            const fieldConfig = entityConfig.fields.find(f => f.name === key);
+	            if (fieldConfig && this.canEditField(fieldConfig, context)) {
+	                newItem[key] = value;
+	            }
+	        }
+	    }
+
+	    // ✅ Handle checkboxes
+	    const checkboxes = form.querySelectorAll('input[type="checkbox"]');
+	    checkboxes.forEach(cb => {
+	        const fieldConfig = entityConfig.fields.find(f => f.name === cb.name);
+	        if (fieldConfig && this.canEditField(fieldConfig, context)) {
+	            newItem[cb.name] = cb.checked;
+	        }
+	    });
+
+	    // ✅ Ensure base entity fields
+	    this.ensureBaseEntityFields(newItem, entityType, entityConfig);
+	    const shortName = this.getShortName(newItem, entityType);
+	    this.processItemID(newItem, entityType);
+	    const entityDisplayName = entityConfig.name || entityType;
+
+	    // ✅ Context flags
+	    const isRootLevel = (this.currentPath.length === 0);
+
+	    // ✅ Create convid if needed
+	    const hasConvidField = entityConfig.fields.some(field => field.name === 'convid');
+	    if (hasConvidField) {
+	        const convid = this.db.generateUUID();
+	        newItem.convid = convid;
+	        try {
+	            await fetch(`/newauth/api/createappschat?convid=${convid}`, {
+	                headers: { 'Content-Type': 'application/json' }
+	            });
+	            console.log('Chat created for', entityType, 'with convid:', convid);
+	        } catch (error) {
+	            console.error('Failed to create chat:', error);
+	        }
+	    }
+
+		// ✅ OPTIMISTICALLY ADD TO UI
+		if (isRootLevel) {
+		    this.data.items.push(newItem);
+		} else {
+		    const parentDepth = this.currentPath.length - 1;
+		    const parentEntityType = this.currentApp.hierarchy[parentDepth];
+		    const parentConfig = this.currentApp.entityConfigs[parentEntityType];
+		    const childrenField = parentConfig?.childrenField;
+
+		    if (!childrenField) {
+		        throw new Error(`No children field configured for ${parentEntityType}`);
+		    }
+
+		    let parent = null;
+
+		    if (parentDepth === 0) {
+		        // ✅ Parent is root entity — always items[0] regardless of distributed
+		        parent = this.data.items[0];
+		    } else {
+		        // ✅ Parent is deeper — traverse from root
+		        // With distributed storage, items[0] IS the current path entity
+		        // With embedded storage, we need to traverse the tree
+		        const lastPathEntity = this.currentPath[this.currentPath.length - 1];
+		        const firstItem = this.data?.items?.[0];
+		        
+		        const isCurrentEntity = firstItem && (
+		            firstItem.ID === lastPathEntity.id ||
+		            firstItem.displayID === lastPathEntity.displayID ||
+		            firstItem.displayID === lastPathEntity.id
+		        );
+
+		        if (isCurrentEntity) {
+		            // ✅ Distributed — items[0] is the current entity, parent is items[0]
+		            parent = firstItem;
+		        } else {
+		            // ✅ Embedded — traverse tree to find parent
+		            let currentItems = this.data.items;
+		            let currentDepth = 0;
+
+		            while (currentDepth < parentDepth && currentItems) {
+		                const currentEntityType = this.currentApp.hierarchy[currentDepth];
+		                const currentConfig = this.currentApp.entityConfigs[currentEntityType];
+		                const currentChildrenField = currentConfig?.childrenField;
+		                const pathItem = this.currentPath[currentDepth];
+		                const foundItem = currentItems.find(item =>
+		                    item.ID === pathItem.id || item.displayID === pathItem.id
+		                );
+		                if (!foundItem) {
+		                    throw new Error(`Could not find ${currentEntityType} with ID ${pathItem.id}`);
+		                }
+		                currentItems = foundItem[currentChildrenField] || [];
+		                currentDepth++;
+		            }
+
+		            const parentPathItem = this.currentPath[parentDepth];
+		            parent = currentItems?.find(item =>
+		                item.ID === parentPathItem.id || item.displayID === parentPathItem.id
+		            );
+		        }
+		    }
+
+		    if (!parent) {
+		        throw new Error(`Could not find parent ${parentEntityType}`);
+		    }
+
+		    // ✅ Single push - no duplicate
+		    if (!parent[childrenField]) parent[childrenField] = [];
+		    parent[childrenField].push(newItem);
+		    parentItem = parent;
+		}
+
+	    // ✅ Render immediately with pending state
+	    this.render();
+	    this.updateBreadcrumb();
+
+	    this.markDotAsPending(newItem.ID);
+
+	    // ✅ Close modal
+	    document.getElementById('add-modal').style.display = 'none';
+
+	    try {
+	        let skipEndNotification = false;
+
+	        // ✅ Send welcome email for root level
+	        if (isRootLevel) {
+	            try {
+	                const appUrl = this.getAppUrl([{
+	                    id: newItem.ID,
+	                    asuuid: true,
+	                    hashed: newItem.hashed,
+	                    displayID: newItem.displayID
+	                }]);
+	                await this.sendTenantWelcomeEmail(newItem, appUrl);
+	                console.log('Welcome email sent to tenant:', newItem.contactemail);
+	            } catch (error) {
+	                console.error('Failed to send tenant welcome email:', error);
+	            }
+	        }
+
+	        // ✅ UNIVERSAL SAVE - same path for everyone
+	        const entityPath = [
+	            'apps',
+	            this.currentApp.id,
+	            ...this.currentPath.map(p => p.displayID),
+	            newItem.displayID
+	        ].join('/');
+
+	        console.log('[TTT addItem] newItem before save:', JSON.stringify(newItem).substring(0, 300));
+	        await this.db.saveEntityData(entityPath, newItem, false);
+
+
+	        // ✅ Post-save: root level nav/animation
+	        if (isRootLevel) {
+				
+				if (!isowner) {
+				    this.saveLastViewedContext(this.currentApp.id, [newItem.ID]); // hashed for non-owner
+				} 
+
+	            this.confirmDot(newItem.ID);
+	            const dot = document.querySelector(`.dot[data-id="${newItem.ID}"]`);
+	            if (dot) {
+	                await new Promise(resolve => setTimeout(resolve, 700));
+	                dot.style.transform = 'scale(1.5)';
+	                dot.style.boxShadow = '0 12px 35px rgba(102, 126, 234, 0.6)';
+	                dot.style.transition = 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
+	                await new Promise(resolve => setTimeout(resolve, 500));
+	                dot.style.boxShadow = '0 12px 35px rgba(102, 126, 234, 0.3)';
+	                await new Promise(resolve => setTimeout(resolve, 250));
+	                dot.style.boxShadow = '0 12px 35px rgba(102, 126, 234, 0.6)';
+	                await new Promise(resolve => setTimeout(resolve, 350));
+	            }
+
+	            this.currentPath = [{
+	                id: newItem.ID,
+	                displayID: newItem.displayID,
+	                shortName: newItem.name || newItem.orgname || 'New ' + entityDisplayName,
+	                hashed: newItem.hashed,
+	                entityType: entityType
+	            }];
+
+	            window.history.pushState({}, '', this.getAppUrl(this.currentPath));
+
+	            try {
+	                const freshData = await this.db.getAppData(
+	                    this.currentApp.id, [this.currentPath[0].displayID]
+	                );
+	                this.data = freshData;
+	            } catch (error) {
+	                console.warn('Failed to fetch fresh tenant data:', error);
+	            }
+
+	            this.render();
+	            this.updateBreadcrumb();
+
+	            this.showNotification(
+	                `✅ ${entityDisplayName} "${newItem.name || 'New Tenant'}" created! Welcome email sent to ${newItem.contactemail}`,
+	                'success'
+	            );
+	            skipEndNotification = true;
+	           // return;
+	        }
+
+	        // ✅ Post-save: notification email for direct children of root
+	        const isDirectChildOfRoot = (this.currentPath.length === 1);
+	        if (isDirectChildOfRoot && newItem.contactemail) {
+	            try {
+	                const pathWithNew = [...this.currentPath, {
+	                    id: newItem.ID,
+	                    hashed: newItem.hashed,
+	                    displayID: newItem.displayID,
+	                    shortName: shortName
+	                }];
+	                const appUrl = this.getAppUrl(pathWithNew);
+	                const parentName = this.currentPath[0].shortName || 'Organization';
+	                await this.sendSubtenantNotificationEmail(newItem, parentName, appUrl);
+	                console.log('Notification email sent:', newItem.contactemail);
+	            } catch (error) {
+	                console.error('Failed to send notification email:', error);
+	            }
+	        }
+
+	        // ✅ Success notification
+	        if (!skipEndNotification) {
+	            const isDirectChild = (this.currentPath.length === 1);
+	            let successMessage;
+	            if (isDirectChild && newItem.contactemail) {
+	                successMessage = `✅ ${entityDisplayName} added successfully! Notification email sent to ${newItem.contactemail}`;
+	            } else {
+	                const parentName = parentItem
+	                    ? (parentItem.name || parentItem.shortName || 'Parent')
+	                    : 'Parent';
+	                successMessage = `✅ ${entityDisplayName} added to ${parentName}!`;
+	            }
+	            this.showNotification(successMessage);
+	            setTimeout(() => this.confirmDot(newItem.ID), 100);
+	        }
+
+	    } catch (error) {
+	        console.error('Error during add:', error);
+	        this.rollbackDot(newItem.ID);
+	        this.render();
+	        this.updateBreadcrumb();
+	        this.showNotification(`❌ Failed to save: ${error.message || 'Unknown error'}`, 'error');
+	    }
+	}
+	
+	_showPendingOverlay(timeoutMs = 8000) {
+	    this._hidePendingOverlay();
+	    
+	    // ✅ CANCELLATION TOKEN - each save operation gets a unique ID
+	    const operationId = Date.now();
+	    this._currentOperationId = operationId;
+	    
+	    const overlay = document.createElement('div');
+	    overlay.id = 'pending-overlay';
+	    overlay.style.cssText = `
+	        position: fixed;
+	        top: 0; left: 0;
+	        width: 100%; height: 100%;
+	        background: rgba(0,0,0,0.05);
+	        z-index: 9999;
+	        cursor: wait;
+	    `;
+	    
+	    const progressBar = document.createElement('div');
+	    progressBar.id = 'pending-progress';
+	    progressBar.style.cssText = `
+	        position: absolute;
+	        top: 0; left: 0;
+	        height: 3px;
+	        width: 0%;
+	        background: linear-gradient(90deg, #6c5ce7, #a29bfe);
+	        transition: width ${timeoutMs}ms linear;
+	    `;
+	    overlay.appendChild(progressBar);
+	    document.body.appendChild(overlay);
+	    
+	    requestAnimationFrame(() => {
+	        progressBar.style.width = '90%';
+	    });
+	    
+	    this._pendingOverlayTimeout = setTimeout(() => {
+	        console.warn('[PendingOverlay] Timeout - unlocking UI, but server still in flight');
+	        this._timedOutOperationId = operationId; // ← remember which op timed out
+	        this._hidePendingOverlay(false, true);   // ← isTimeout = true
+	        this.showNotification(
+	            '⚠️ Still saving in background... avoid making changes until confirmed.',
+	            'warning'
+	        );
+	    }, timeoutMs);
+	    
+	    return operationId; // ← caller stores this
+	}
+
+	_hidePendingOverlay(success = true, isTimeout = false) {
+	    if (this._pendingOverlayTimeout) {
+	        clearTimeout(this._pendingOverlayTimeout);
+	        this._pendingOverlayTimeout = null;
+	    }
+	    
+	    const overlay = document.getElementById('pending-overlay');
+	    if (!overlay) return;
+	    
+	    const progressBar = document.getElementById('pending-progress');
+	    
+	    if (isTimeout) {
+	        // ✅ ORANGE - still in flight
+	        if (progressBar) {
+	            progressBar.style.transition = 'width 0.2s ease';
+	            progressBar.style.width = '100%';
+	            progressBar.style.background = '#f39c12';
+	        }
+	        setTimeout(() => overlay.remove(), 300);
+	    } else if (success) {
+	        // ✅ GREEN FLASH
+	        if (progressBar) {
+	            progressBar.style.transition = 'width 0.2s ease';
+	            progressBar.style.width = '100%';
+	            progressBar.style.background = 'linear-gradient(90deg, #00b894, #55efc4)';
+	        }
+	        setTimeout(() => overlay.remove(), 250);
+	    } else {
+	        // ✅ RED FLASH
+	        if (progressBar) {
+	            progressBar.style.transition = 'width 0.1s ease';
+	            progressBar.style.width = '100%';
+	            progressBar.style.background = '#e53935';
+	        }
+	        setTimeout(() => overlay.remove(), 200);
+	    }
+	}
+	
+	async editItem(item, entityType) {
+	    const entityConfig = await this.getEntityConfig(entityType);
+	    if (!entityConfig) {
+	        throw new Error(`Entity config not found for: ${entityType}`);
+	    }
+
+	    // Build modal with pre-populated form
+	    const modal = document.getElementById('add-modal');
+	    const modalTitle = document.getElementById('modal-title');
+	    const form = document.getElementById('add-form');
+
+	    modalTitle.textContent = `Edit ${entityConfig.name || entityType}`;
+	    form.innerHTML = '';
+
+	    const context = this.getViewingContext();
+
+	    // Build fields — same as addItem form but pre-populated
+	    entityConfig.fields.forEach(field => {
+	        // Skip system/internal fields
+	        if (['ID', 'displayID', 'timestamp', 'hidden', 'hashed', 'convid'].includes(field.name)) return;
+	        if (field.writePermission === 'system') return;
+	        if (!this.canEditField(field, context)) return;
+
+	        const group = document.createElement('div');
+	        group.className = 'form-group';
+
+	        const label = document.createElement('label');
+	        label.textContent = field.label + (field.mandatory ? ' *' : '');
+	        group.appendChild(label);
+
+	        let input;
+	        if (field.type === 'textarea') {
+	            input = document.createElement('textarea');
+	            input.value = item[field.name] || '';
+	        } else if (field.type === 'select' && Array.isArray(field.options)) {
+	            input = document.createElement('select');
+	            input.innerHTML = field.options.map(o =>
+	                `<option value="${o}" ${item[field.name] === o ? 'selected' : ''}>${o}</option>`
+	            ).join('');
+	        } else if (field.type === 'checkbox') {
+	            input = document.createElement('input');
+	            input.type = 'checkbox';
+	            input.checked = !!item[field.name];
+	        } else {
+	            input = document.createElement('input');
+	            input.type = field.type === 'email' ? 'email' : field.type === 'url' ? 'url' : 'text';
+	            input.value = item[field.name] || '';
+	            input.placeholder = field.label;
+	        }
+	        input.name = field.name;
+	        group.appendChild(input);
+	        form.appendChild(group);
+	    });
+
+	    // Save button
+	    const saveBtn = document.createElement('button');
+	    saveBtn.className = 'btn btn-primary';
+	    saveBtn.textContent = 'Save Changes';
+	    saveBtn.onclick = async (e) => {
+	        e.preventDefault();
+
+	        // Apply form values back onto the existing item object in-place
+	        entityConfig.fields.forEach(field => {
+	            if (!this.canEditField(field, context)) return;
+	            if (['ID', 'displayID', 'timestamp', 'hidden', 'hashed', 'convid'].includes(field.name)) return;
+	            if (field.writePermission === 'system') return;
+
+	            const input = form.querySelector(`[name="${field.name}"]`);
+	            if (!input) return;
+
+	            if (field.type === 'checkbox') {
+	                item[field.name] = input.checked;
+	            } else {
+	                item[field.name] = input.value;
+	            }
+	        });
+
+	        // Re-process display fields
+	        this.ensureBaseEntityFields(item, entityType, entityConfig);
+	        this.processItemID(item, entityType);
+
+	        modal.style.display = 'none';
+	        this.render();
+	        this.updateBreadcrumb();
+	        this.markDotAsPending(item.ID);
+
+			try {
+			    // ✅ UNIVERSAL SAVE - direct path write, isUpdate=true
+			    const entityPath = [
+			        'apps',
+			        this.currentApp.id,
+			        ...this.currentPath.map(p => p.displayID),
+			        item.displayID
+			    ].join('/');
+
+			    console.log('[editItem] saving to path:', entityPath);
+			    await this.db.saveEntityData(entityPath, item, true); // true = update/upsert
+			    
+			    this.confirmDot(item.ID);
+			    this.showNotification(`✅ ${entityConfig.name || entityType} updated successfully`, 'success');
+			} catch (error) {
+			    console.error('Error during edit:', error);
+			    this.rollbackDot(item.ID);
+			    this.showNotification(`❌ Failed to save changes: ${error.message || 'Unknown error'}`, 'error');
+			}
+	    };
+
+	    form.appendChild(saveBtn);
+	    modal.style.display = 'block';
+	}
+	
+	markDotAsPending(itemId, timeoutMs = 8000) {
+	    // ✅ START OVERLAY
+	    this._showPendingOverlay(timeoutMs);
+	    
+	    setTimeout(() => {
+	        const dots = document.querySelectorAll('.dot');
+	        const targetDot = Array.from(dots).find(dot => {
+	            const item = dot.itemData;
+	            if (!item) return false;
+	            return item.ID === itemId || item.displayID === itemId;
+	        });
+	        if (targetDot) {
+	            targetDot.classList.add('dot-pending');
+	        }
+	    }, 100);
+	}
+
+	confirmDot(itemId) {
+	    // ✅ END OVERLAY - success
+	    this._hidePendingOverlay(true);
+	    
+	    const dots = document.querySelectorAll('.dot');
+	    const targetDot = Array.from(dots).find(dot => {
+	        const item = dot.itemData;
+	        if (!item) return false;
+	        return item.ID === itemId || item.displayID === itemId;
+	    });
+	    if (targetDot) {
+	        targetDot.classList.remove('dot-pending');
+	        targetDot.style.animation = '';
+	        targetDot.style.boxShadow = '0 0 12px rgba(102, 126, 234, 0.6)';
+	        setTimeout(() => {
+	            targetDot.style.boxShadow = '';
+	        }, 1000);
+	    }
+	}
+
+	rollbackDot(itemId) {
+	    // ✅ END OVERLAY - error
+	    this._hidePendingOverlay(false);
+	    
+	    const removeItem = (items) => {
+	        for (let i = items.length - 1; i >= 0; i--) {
+	            const matchesRealId = items[i].ID === itemId;
+	            const matchesDisplayId = items[i].displayID === itemId;
+	            if (matchesRealId || matchesDisplayId) {
+	                items.splice(i, 1);
+	                return true;
+	            }
+	            const config = this.currentApp.entityConfigs;
+	            for (const entityType in config) {
+	                const field = config[entityType].childrenField;
+	                if (items[i][field] && removeItem(items[i][field])) {
+	                    return true;
+	                }
+	            }
+	        }
+	        return false;
+	    };
+	    removeItem(this.data.items);
+	}
+	// ✅ NEW METHOD: Ensure ALL base entity fields are properly set
+	ensureBaseEntityFields(item, entityType, entityConfig) {
+	    // Ensure dotLabel is set (first 3 characters of name)
+	    if (!item.dotLabel) {
+	        item.dotLabel = this.generateUniqueDotLabel(item.name, entityType);
+	    }
+	    
+	    // Ensure other base fields have defaults
+	    if (item.hidden === undefined) item.hidden = false;
+	    if (item.hashed === undefined) item.hashed = false;
+	    if (item.writeAccess === undefined) item.writeAccess = 'owner';
+	    if (item.readAccess === undefined) item.readAccess = 'owner';
+	    if (!item.timestamp) item.timestamp = Date.now();
+	    
+		if (!item.dotLabel && item.name) {
+	        item.dotLabel = item.name.substring(0, 3).toUpperCase();
+	    }
+	    // ✅ HANDLE METADATA & CONFIGURATION
+	    this.ensureMetadataFields(item, entityType, entityConfig);
+	    
+	    // ✅ HANDLE RELATIONSHIP FIELDS  
+	    this.ensureRelationshipFields(item, entityType);
+	}
+
+	ensureMetadataFields(item, entityType, entityConfig) {
+	    if (!item.metadata) item.metadata = {};
+
+	    // ✅ Color is still needed for dot rendering
+	    if (!item.metadata.displayConfig) {
+	        item.metadata.displayConfig = {
+	            priority: 1,
+	            color: this.getDotColor(item, entityType)
+	        };
+	    } else if (!item.metadata.displayConfig.color) {
+	        item.metadata.displayConfig.color = this.getDotColor(item, entityType);
+	    }
+	}
+
+	// ✅ NEW METHOD: Handle relationship fields
+	ensureRelationshipFields(item, entityType) {
+	    // parentId - set based on current context
+	    const currentDepth = this.currentPath.length;
+	    if (currentDepth > 0) {
+	        // Get the immediate parent ID from current path
+	        const parentItem = this.currentPath[currentDepth - 1];
+	        if (parentItem && parentItem.id) {
+	            item.parentId = parentItem.id;
+	        }
+	    } else {
+	        // Root level items have no parent
+	        item.parentId = null;
+	    }
+	    
+	    // path - full path from root including this new item
+	    const newPath = [];
+	    this.currentPath.forEach(pathItem => {
+	        if (pathItem.id) {
+	            newPath.push(pathItem.id);
+	        }
+	    });
+	    // Add this item's ID to the path
+	    if (item.ID) {
+	        newPath.push(item.ID);
+	    }
+	    item.path = newPath;
+	}
+
+	// ✅ NEW METHOD: Generate unique dot labels with duplicate prevention
+	generateUniqueDotLabel(baseName, entityType) {
+	    let candidateLabel = baseName.substring(0, 3).toUpperCase();
+	    let counter = 1;
+	    
+	    // Check against existing items at this level
+	    const existingLabels = this.getExistingDotLabelsAtCurrentLevel();
+	    
+	    while (existingLabels.has(candidateLabel)) {
+	        if (counter <= 26) {
+	            candidateLabel = baseName.substring(0, 2).toUpperCase() + String.fromCharCode(64 + counter);
+	        } else {
+	            candidateLabel = baseName.substring(0, 2).toUpperCase() + (counter - 26);
+	        }
+	        counter++;
+	        
+	        if (counter > 100) {
+	            candidateLabel = Math.random().toString(36).substr(2, 3).toUpperCase();
+	            break;
+	        }
+	    }
+	    
+	    return candidateLabel;
+	}
+
+	// ✅ NEW METHOD: Get existing dot labels at current navigation level
+	getExistingDotLabelsAtCurrentLevel() {
+	    const existingLabels = new Set();
+	    if (this.data && this.data.items) {
+	        const currentDepth = this.currentPath.length;
+	        const relevantItems = this.getItemsAtDepth(currentDepth);
+	        
+	        relevantItems.forEach(item => {
+	            if (item.dotLabel) {
+	                existingLabels.add(item.dotLabel);
+	            }
+	        });
+	    }
+	    return existingLabels;
+	}
+
+	// ✅ NEW METHOD: Get all items at a specific depth in the hierarchy
+	getItemsAtDepth(depth) {
+	    if (depth === 0) {
+	        return this.data.items || [];
+	    }
+	    
+	    // Navigate to the correct depth
+	    let currentItems = this.data.items;
+	    for (let i = 0; i < depth; i++) {
+	        if (!currentItems || currentItems.length === 0) {
+	            return [];
+	        }
+	        
+	        const entityType = this.currentApp.hierarchy[i];
+	        const config = this.currentApp.entityConfigs[entityType];
+	        const childrenField = config.childrenField;
+	        
+	        // Flatten all children at this level
+	        const nextItems = [];
+	        currentItems.forEach(item => {
+	            if (item[childrenField] && Array.isArray(item[childrenField])) {
+	                nextItems.push(...item[childrenField]);
+	            }
+	        });
+	        
+	        currentItems = nextItems;
+	    }
+	    
+	    return currentItems;
+	}
+	
+
+	startVersionPolling() {
+		
+		if (this.db.useLocalStorage) return;
+		
+	    const newSessionToken = `${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+	    this.pollingSessionToken = newSessionToken;
+	    this.stopVersionPolling(); // Clear any existing
+	    // ✅ CRITICAL: Track window focus state (covers OS-level app switch)
+	    this.isWindowFocused = true;
+	    
+	    // ✅ TRACK LAST POLL TIME FOR SLEEP DETECTION
+	    this.lastPollTime = Date.now();
+	    
+	    // ✅ RECURSIVE POLL FUNCTION (setTimeout-based)
+	    const pollForUpdates = async () => {
+	        // Session validity check
+	        if (this.pollingSessionToken !== newSessionToken || !this.isPollingActive) return;
+	        
+	        // ✅ SLEEP/WAKE DETECTION: Large time gap = wake event
+	        const now = Date.now();
+	        const timeSinceLast = now - this.lastPollTime;
+	        if (timeSinceLast > 30000) { // >30s gap
+	            console.log(`[VersionPoll] 💤 Wake detected after ${Math.round(timeSinceLast/1000)}s`);
+	            // Optional: Force refresh on wake
+	            // await this.refreshCurrentView(false);
+	        }
+	        this.lastPollTime = now;
+	        
+	        try {
+				const currentPathStr = this.currentPath.map(p => p.displayID).join('/');
+				const params = new URLSearchParams({ _: Date.now() });
+				if (currentPathStr) params.set('path', currentPathStr);
+				const url = `/newauth/api/getappdataversion/${encodeURIComponent(this.currentApp.id)}?${params.toString()}`;
+				 
+	            const response = await fetch(url, {
+	                method: 'GET',
+	                headers: { 'Content-Type': 'application/json' },
+	                credentials: 'include'
+	            });
+	            
+	            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+	            
+				const pollData = await response.json();
+				const serverTimestamp = pollData.timestamp;
+				const changes = pollData.changes || [];
+
+				if (isNaN(serverTimestamp)) throw new Error('Invalid timestamp');
+
+				console.log(`[VersionPoll] path=${currentPathStr} | server=${serverTimestamp} | client=${this.lastKnownTimestamp} | changes=${changes.length}`);
+
+				if (this.lastKnownTimestamp === 0 && serverTimestamp > 0) {
+				    this.lastKnownTimestamp = serverTimestamp;
+				    console.log('[VersionPoll] Baseline set:', serverTimestamp);
+				}
+				else if (serverTimestamp > this.lastKnownTimestamp) {
+				    console.log(`[VersionPoll] ✅ CHANGE: ${this.lastKnownTimestamp} → ${serverTimestamp} |`, changes);
+
+				    const myPath = `${this.currentApp.id}/${currentPathStr}`;
+				    const currentItems = this.getCurrentData();
+
+				    let needsRender = false;
+				    let needsFullRefresh = false;
+				    this._pendingRipples = this._pendingRipples || new Map();
+
+				    changes.forEach(origin => {
+				        const originParts = origin.split('/');
+
+				        const affectedItems = currentItems?.filter(item =>
+				            originParts.includes(item.displayID)
+				        ) || [];
+
+				        if (affectedItems.length > 0) {
+				            affectedItems.forEach(affectedItem => {
+				                const entityType = this.currentApp.hierarchy[this.currentPath.length];
+				                const childrenField = this.currentApp.entityConfigs[entityType]?.childrenField;
+				                const children = affectedItem[childrenField] || [];
+				                const targetChildDisplayID = originParts[this.currentPath.length + 2];
+				                const targetChild = children.find(c => c.displayID === targetChildDisplayID);
+				                if (targetChild) targetChild.timestamp = Date.now();
+
+				                this._pendingRipples.set(affectedItem.displayID, Date.now() + 10000);
+				                console.log(`[VersionPoll] → RIPPLE queued for`, affectedItem.displayID);
+				            });
+				            needsRender = true;
+
+				        } else if (origin.startsWith(myPath)) {
+				            console.log('[VersionPoll] → PULSE', origin);
+				            this._pulseDeepActivity(origin);
+
+				        } else {
+				            console.log('[VersionPoll] → FULL REFRESH triggered by', origin);
+				            needsFullRefresh = true;
+				        }
+				    });
+
+				    if (needsFullRefresh) {
+				        if (await this.refreshCurrentView(false)) {
+				            this.lastKnownTimestamp = serverTimestamp;
+				        }
+				    } else if (needsRender) {
+				        this._isBoostRender = true;
+				        this.lastKnownTimestamp = serverTimestamp;
+				        this.render();
+				        this._isBoostRender = false;
+				    } else {
+				        this.lastKnownTimestamp = serverTimestamp;
+				    }
+				}
+	        } catch (error) {
+	            console.warn('[VersionPoll] Error:', error.message);
+	        } finally {
+	            // ✅ CRITICAL FIX: Check BOTH visibilityState AND window focus
+	            // visibilityState covers tab visibility + browser minimize
+	            // isWindowFocused covers OS-level app switch (browser covered by other apps)
+	            const isPageVisible = document.visibilityState === 'visible';
+	            const shouldPoll = (
+	                this.pollingSessionToken === newSessionToken && 
+	                this.isPollingActive && 
+	                isPageVisible && 
+	                this.isWindowFocused
+	            );
+	            
+	            if (shouldPoll) {
+	                this.versionPollTimeout = setTimeout(pollForUpdates, 8000);
+	            } else {
+	                // Log why we're pausing (debugging)
+	                if (!isPageVisible) console.log('[VersionPoll] ⏸️ Paused: page not visible (visibilityState=', document.visibilityState, ')');
+	                if (!this.isWindowFocused) console.log('[VersionPoll] ⏸️ Paused: window not focused');
+	            }
+	        }
+	    };
+	    
+	    // ✅ VISIBILITY CHANGE HANDLER (covers tab switch + browser minimize)
+	    this.handleVisibilityChange = () => {
+	        if (document.visibilityState !== 'visible') {
+	            if (this.versionPollTimeout) {
+	                clearTimeout(this.versionPollTimeout);
+	                this.versionPollTimeout = null;
+	            }
+	            console.log(`[VersionPoll] ⏸️ Paused: visibilityState=${document.visibilityState}`);
+	        } else if (this.isPollingActive && this.isWindowFocused) {
+	            console.log('[VersionPoll] ▶️ Resumed: page visible');
+	            this.versionPollTimeout = setTimeout(pollForUpdates, 0);
+	        }
+	    };
+	    document.addEventListener('visibilitychange', this.handleVisibilityChange);
+	    
+	    // ✅ WINDOW FOCUS HANDLER (covers OS-level app switch - CRITICAL FIX)
+	    this.handleWindowBlur = () => {
+	        this.isWindowFocused = false;
+	        if (this.versionPollTimeout) {
+	            clearTimeout(this.versionPollTimeout);
+	            this.versionPollTimeout = null;
+	        }
+	        console.log('[VersionPoll] ⏸️ Paused: window blurred (OS app switch)');
+	    };
+	    
+	    this.handleWindowFocus = () => {
+	        this.isWindowFocused = true;
+	        if (this.isPollingActive && document.visibilityState === 'visible') {
+	            console.log('[VersionPoll] ▶️ Resumed: window focused');
+	            this.versionPollTimeout = setTimeout(pollForUpdates, 0);
+	        }
+	    };
+	    
+	    window.addEventListener('blur', this.handleWindowBlur);
+	    window.addEventListener('focus', this.handleWindowFocus);
+	    
+	    // ✅ START POLLING
+	    this.isPollingActive = true;
+	    this.isWindowFocused = true; // Reset focus state
+	    this.versionPollTimeout = setTimeout(pollForUpdates, 0);
+	    
+	    console.log('[VersionPoll] Started session', newSessionToken);
+	}
+
+	stopVersionPolling() {
+	    if (this.versionPollTimeout) {
+	        clearTimeout(this.versionPollTimeout);
+	        this.versionPollTimeout = null;
+	    }
+	    
+	    // ✅ REMOVE ALL EVENT LISTENERS (critical for cleanup)
+	    if (this.handleVisibilityChange) {
+	        document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+	        this.handleVisibilityChange = null;
+	    }
+	    if (this.handleWindowBlur) {
+	        window.removeEventListener('blur', this.handleWindowBlur);
+	        this.handleWindowBlur = null;
+	    }
+	    if (this.handleWindowFocus) {
+	        window.removeEventListener('focus', this.handleWindowFocus);
+	        this.handleWindowFocus = null;
+	    }
+	    
+	    this.isPollingActive = false;
+	    this.lastKnownTimestamp = 0;
+	    this.isWindowFocused = true; // Reset for next start
+	    console.log('[VersionPoll] Stopped');
+	}
+
+	_boostEntityScore(changeOrigin) {
+	    if (!changeOrigin) return;
+	    const parts = changeOrigin.split('/');
+	    // The entity at current depth + 1 is what needs boosting
+	    const targetDisplayID = parts[this.currentPath.length + 1];
+	    if (!targetDisplayID) return;
+	    
+	    // Find and boost the entity in local data
+	    const items = this.getCurrentData();
+	    const item = items?.find(i => i.displayID === targetDisplayID);
+	    if (item) {
+	        item._boostedAt = Date.now();
+	        console.log('[boost] Boosted:', item.name || targetDisplayID);
+	        this.render();
+	    }
+	}
+
+	_pulseDeepActivity(changeOrigin) {
+	    if (!changeOrigin) return;
+	    const parts = changeOrigin.split('/');
+	    const targetDisplayID = parts[this.currentPath.length + 1];
+	    if (!targetDisplayID) return;
+	    
+	    const dot = Array.from(document.querySelectorAll('.dot'))
+	        .find(d => d.itemData?.displayID === targetDisplayID);
+	    
+	    if (dot) {
+	        dot.classList.add('dot-deep-activity');
+	        setTimeout(() => dot.classList.remove('dot-deep-activity'), 3000);
+	        console.log('[pulse] Deep activity on:', targetDisplayID);
+	    }
+	}
+
+	async refreshCurrentView(showNotification = true) {
+	    console.log('[Refresh] CALLED - _isRefreshing:', this._isRefreshing);
+	    
+	    if (this._isRefreshing) {
+	        console.warn('[Refresh] Skipped - already in progress');
+	        return false;
+	    }
+	    this._isRefreshing = true;
+	    console.log('[Refresh] STARTED - _isRefreshing set to true');
+	    
+	    try {
+	        const pathContext = this.currentPath.map(item => item.displayID);
+	       
+			const freshPartial = await this.db.getAppData(
+			    this.currentApp.id, 
+			    pathContext,
+			    { bypassCache: true } // ✅ Signal to bypass cache
+			);
+			console.log('[Refresh] Fresh data received - items:', freshPartial?.items?.length);
+
+	        
+	        if (this.isDataOwner() && this._hasFullDataStructure()) {
+	            this._mergePartialIntoFullData(freshPartial, pathContext);
+	            console.log('[Refresh] Merged update');
+	        } else {
+	            this.data = freshPartial;
+	            console.log('[Refresh] Replaced data');
+	        }
+	        
+	        const canvas = document.getElementById('canvas-area');
+	        if (canvas) void canvas.offsetWidth;
+	        
+	        console.log('[Refresh] Calling render()');
+	        this.render();
+	        console.log('[Refresh] render() completed');
+	        
+	        this.updateBreadcrumb();
+	        
+	        if (showNotification) {
+	            this.showNotification('🕗 View updated', 'info', 1200);
+	        }
+	        
+			if (this.currentPath.length > 0 && !this.isPollingActive) {
+	            console.log('[Refresh] Polling was stopped - restarting');
+	            this.startVersionPolling();
+	        }
+	        console.log('[Refresh] SUCCESS - returning true');
+	        return true;
+	        
+	    } catch (error) {
+	        console.error('[refreshCurrentView] Failed:', error);
+	        if (showNotification) {
+	            this.showNotification('Update failed. Refresh manually.', 'error');
+	        }
+	        console.log('[Refresh] FAILED - returning false');
+	        return false;
+	    } finally {
+	        this._isRefreshing = false;
+	        console.log('[Refresh] FINALLY - _isRefreshing reset to false');
+	    }
+	}
+
+	
+	/**
+	 * Show notification to user
+	 */
+	showNotification(message, type = 'success', duration = 3000) {
+	    // Remove existing notification if any
+	    const existing = document.getElementById('notification-toast');
+	    if (existing) existing.remove();
+	    
+	    const toast = document.createElement('div');
+	    toast.id = 'notification-toast';
+	    toast.style.cssText = `
+	        position: fixed;
+	        bottom: 30px;
+	        left: 50%;
+	        transform: translateX(-50%);
+	        color: white;
+	        padding: 16px 24px;
+	        border-radius: 8px;
+	        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+	        font-size: 15px;
+	        font-weight: 500;
+	        z-index: 10000;
+	        animation: slideUp 0.3s ease;
+	    `;
+	    
+	    // ✅ Set background based on notification type
+	    if (type === 'error') {
+	        toast.style.background = 'linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%)'; // Red gradient for errors
+	    } else {
+	        toast.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'; // Original purple for success
+	    }
+	    
+	    toast.textContent = message;
+	    
+	    // Add animation
+	    const style = document.createElement('style');
+	    style.textContent = `
+	        @keyframes slideUp {
+	            from { transform: translateX(-50%) translateY(20px); opacity: 0; }
+	            to { transform: translateX(-50%) translateY(0); opacity: 1; }
+	        }
+	    `;
+	    document.head.appendChild(style);
+	    
+	    document.body.appendChild(toast);
+	    
+	    // Auto remove after duration
+	    setTimeout(() => {
+	        toast.style.animation = 'slideUp 0.3s ease reverse';
+	        setTimeout(() => toast.remove(), 300);
+	    }, duration);
+	}
+	
+	processItemID(item, entityType) {
+	    if (!item.ID) return;
+	    
+	    // ✅ KEY FIX: Check if ID is already hashed by checking length/format
+	    // Real UUIDs are 36 characters, hashed IDs are shorter (like 12-15 chars)
+	    const isProbablyRealUUID = item.ID.length === 36 && item.ID.includes('-');
+	    
+	    if (!item.displayID) {
+	        if (isProbablyRealUUID) {
+	            // ID is real UUID - hash it for display
+	            item.displayID = this.db.hashUUID(item.ID);
+	            item.hashed = false; // Real item, just displaying hashed ID
+	        } else {
+	            // ID is already hashed - use as-is for display
+	            item.displayID = item.ID;
+	            item.hashed = true; // This is a hashed ID
+	        }
+	    } else {
+	        // Server provided displayID - trust it
+	        item.hashed = !isProbablyRealUUID;
+	    }
+	    
+	    console.log('ProcessItemId complete - ID:', item.ID, 'displayID:', item.displayID, 'hashed:', item.hashed);
+	}
+	
+	getUserLoginStatus() {
+		// Implement your user authentication check
+		// This could check localStorage, session, cookies, etc.
+		const userData = localStorage.getItem('userloggedin');
+		return userData ? JSON.parse(userData) : null;
+	}
+
+	async openSchemaManager() {
+
+		var self = this;
+
+		document.getElementById('schema-modal').style.display = 'block';
+
+		await this.loadAppSchemas();
+
+		await this.loadNativeEntities();
+
+
+		// Set up button handlers
+
+		document.getElementById('add-app-schema').onclick = function() { self.createAppSchema(); };
+
+		document.getElementById('add-native-entity').onclick = function() { self.createNativeEntity(); };
+
+
+
+
+		// Tab switching handlers (enhanced to include JSON tab)
+
+		document.querySelectorAll('.tab').forEach(function(tab) {
+
+			tab.addEventListener('click', function(e) {
+
+				document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+
+				document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+
+				e.target.classList.add('active');
+
+				document.getElementById(e.target.dataset.tab).classList.add('active');
+
+			});
+
+		});
+
+
+
+		// Close handler
+
+		document.getElementById('close-schema-modal').onclick = function() {
+
+			document.getElementById('schema-modal').style.display = 'none';
+
+		};
+
+
+
+		// Load the initial content
+
+		await this.loadAppSchemas();
+
+		await this.loadNativeEntities();
+
+	}
+
+
+
+	async loadAppSchemas() {
+
+		var self = this;
+
+		const container = document.getElementById('app-schemas-list');
+
+		const schemas = await this.db.getAppSchemas();
+
+		container.innerHTML = '';
+
+
+
+		schemas.forEach(function(schema) {
+
+			const card = document.createElement('div');
+
+			card.className = 'schema-card';
+
+			card.innerHTML = '<div class="schema-card-header">' +
+
+				'<h3>' + schema.name + '</h3>' +
+
+				'<div>' +
+
+				'<button class="btn btn-primary" style="margin-right: 10px;">Edit</button>' +
+
+				'<button class="btn btn-danger">Delete</button>' +
+
+				'</div>' +
+
+				'</div>' +
+
+				'<p style="color: #666; margin-bottom: 10px;">' + schema.description + '</p>' +
+
+				'<p style="color: #999; font-size: 13px;">' +
+
+				'<strong>Hierarchy:</strong> ' + schema.hierarchy.join(' → ') +
+
+				'</p>';
+
+			card.querySelector('.btn-primary').onclick = function() { self.editAppSchema(schema); };
+
+			card.querySelector('.btn-danger').onclick = async function() {
+
+				if (confirm('Delete app schema "' + schema.name + '"?')) {
+
+					await self.db.deleteAppSchema(schema.id);
+
+					await self.loadAppSchemas();
+
+				}
+
+			};
+
+			container.appendChild(card);
+
+		});
+
+	}
+
+
+
+	async loadNativeEntities() {
+
+		var self = this;
+
+		const container = document.getElementById('native-entities-list');
+
+		const entities = await this.db.getNativeEntities();
+
+		container.innerHTML = '';
+
+
+
+		Object.keys(entities).forEach(function(key) {
+
+			const entity = entities[key];
+			if (!entity || !entity.name || !Array.isArray(entity.fields)) return;
+
+			const card = document.createElement('div');
+
+			card.className = 'entity-item';
+
+			card.innerHTML = '<div class="entity-header">' +
+
+				'<div>' +
+
+				'<h4>' + entity.name + '</h4>' +
+
+				'<p style="color: #666; font-size: 13px;">' + entity.description + '</p>' +
+
+				'</div>' +
+
+				'<div>' +
+
+				'<button class="btn btn-primary" style="margin-right: 10px;">Edit</button>' +
+
+				'<button class="btn btn-danger">Delete</button>' +
+
+				'</div>' +
+
+				'</div>' +
+
+				'<div class="field-list">' +
+
+				'<strong>Fields (' + entity.fields.length + '):</strong> ' +
+
+				entity.fields.map(function(f) { return f.label; }).join(', ') +
+
+				'</div>';
+
+			card.querySelector('.btn-primary').onclick = function() { self.editNativeEntity(key, entity); };
+
+			card.querySelector('.btn-danger').onclick = async function() {
+
+				if (confirm('Delete entity "' + entity.name + '"?')) {
+
+					await self.db.deleteNativeEntity(key);
+
+					await self.loadNativeEntities();
+
+				}
+
+			};
+
+			container.appendChild(card);
+
+		});
+
+	}
+
+
+
+	createAppSchema() {
+
+		this.editAppSchema({
+
+			id: 'new_' + Date.now(),
+
+			name: 'New App',
+
+			description: '',
+
+			hierarchy: [],
+
+			entityConfigs: {}
+
+		});
+
+	}
+
+
+
+	async editAppSchema(schema) {
+
+		var self = this;
+
+		const modal = document.getElementById('app-schema-editor-modal');
+
+		const title = document.getElementById('app-schema-editor-title');
+
+		const content = document.getElementById('app-schema-editor-content');
+
+		title.textContent = schema.id.startsWith('new_') ? 'Create App Schema' : 'Edit App Schema';
+
+
+
+		const entities = await this.db.getNativeEntities();
+
+		const entityKeys = Object.keys(entities);
+
+
+
+		content.innerHTML = '<div class="form-group">' +
+
+			'<label>App ID</label>' +
+
+			'<input type="text" id="schema-id" required placeholder="e.g. hr-support">' +
+
+			'</div>' +
+
+			'<div class="form-group">' +
+
+			'<label>App Name</label>' +
+
+			'<input type="text" id="schema-name" value="' + schema.name + '">' +
+
+			'</div>' +
+
+			'<div class="form-group">' +
+
+			'<label>Description</label>' +
+
+			'<textarea id="schema-description">' + schema.description + '</textarea>' +
+
+			'</div>' +
+
+			'<div class="form-group">' +
+
+			'<label>Hierarchy (in order)</label>' +
+
+			'<div id="hierarchy-list"></div>' +
+
+			'<select id="add-hierarchy-entity" style="margin-top: 10px;">' +
+
+			'<option value="">-- Add Entity --</option>' +
+
+			entityKeys.map(function(key) { return '<option value="' + key + '">' + entities[key].name + '</option>'; }).join('') +
+
+			'</select>' +
+
+			'</div>' +
+
+			'<div class="form-group">' +
+
+			'<label>Sort Configuration</label>' +
+
+			'<div id="sort-config-list"></div>' +
+
+			'</div>' +
+
+			'<div style="margin-top: 20px;">' +
+
+			'<button class="btn btn-primary" id="save-app-schema">Save</button>' +
+
+			'<button class="btn btn-secondary" id="cancel-app-schema">Cancel</button>' +
+
+			'</div>';
+
+
+
+		// Render hierarchy list
+
+		const hierarchyList = content.querySelector('#hierarchy-list');
+
+		const updateHierarchyList = function() {
+
+			hierarchyList.innerHTML = '';
+
+			schema.hierarchy.forEach(function(entityType, index) {
+
+				const item = document.createElement('div');
+
+				item.style.cssText = 'display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #f5f5f5; margin-bottom: 5px; border-radius: 4px;';
+
+				item.innerHTML = '<span>' + (index + 1) + '. ' + (entities[entityType] ? entities[entityType].name : entityType) + '</span>' +
+
+					'<div>' +
+
+					(index > 0 ? '<button class="btn-secondary" style="padding: 4px 8px; margin-right: 5px;">↑</button>' : '') +
+
+					(index < schema.hierarchy.length - 1 ? '<button class="btn-secondary" style="padding: 4px 8px; margin-right: 5px;">↓</button>' : '') +
+
+					'<button class="btn-danger" style="padding: 4px 8px;">Remove</button>' +
+
+					'</div>';
+
+
+
+				const buttons = item.querySelectorAll('button');
+
+				let btnIndex = 0;
+
+				if (index > 0) {
+
+					buttons[btnIndex++].onclick = function() {
+
+						var temp = schema.hierarchy[index];
+
+						schema.hierarchy[index] = schema.hierarchy[index - 1];
+
+						schema.hierarchy[index - 1] = temp;
+
+						updateHierarchyList();
+
+						updateSortConfigs();
+
+					};
+
+				}
+
+				if (index < schema.hierarchy.length - 1) {
+
+					buttons[btnIndex++].onclick = function() {
+
+						var temp = schema.hierarchy[index];
+
+						schema.hierarchy[index] = schema.hierarchy[index + 1];
+
+						schema.hierarchy[index + 1] = temp;
+
+						updateHierarchyList();
+
+						updateSortConfigs();
+
+					};
+
+				}
+
+				buttons[btnIndex].onclick = function() {
+
+					schema.hierarchy.splice(index, 1);
+
+					updateHierarchyList();
+
+					updateSortConfigs();
+
+				};
+
+				hierarchyList.appendChild(item);
+
+			});
+
+		};
+
+
+
+		// Replace the entire sort config rendering section in editAppSchema
+
+		const updateSortConfigs = function() {
+
+			const sortConfigList = content.querySelector('#sort-config-list');
+
+			sortConfigList.innerHTML = '';
+
+
+
+			schema.hierarchy.forEach(function(entityType, index) {
+
+				const nextEntity = index < schema.hierarchy.length - 1 ? schema.hierarchy[index + 1] : null;
+
+
+
+				if (nextEntity) { // Only for entities that have children
+
+					const config = schema.entityConfigs[entityType] || {};
+
+					const sortConfig = config.sortConfig || { type: 'count' };
+
+
+
+					const sortDiv = document.createElement('div');
+
+					sortDiv.style.cssText = 'border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; border-radius: 4px;';
+
+					sortDiv.innerHTML = '<h4>' + (entities[entityType] ? entities[entityType].name : entityType) + '</h4>' +
+
+						'<p style="color: #666; font-size: 12px; margin-bottom: 10px;">' +
+
+						'This dot size is determined by: <strong>children in ' + (entities[nextEntity] ? entities[nextEntity].name : nextEntity) + 's</strong>' +
+
+						'</p>' +
+
+						'<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">' +
+
+						'<div>' +
+
+						'<label style="font-size: 12px;">Sort Method</label>' +
+
+						'<select data-entity="' + entityType + '" data-prop="type" style="width: 100%; padding: 6px;">' +
+
+						'<option value="count" ' + (sortConfig.type === 'count' ? 'selected' : '') + '>Count of ' + nextEntity + 's</option>' +
+
+						'<option value="aggregate" ' + (sortConfig.type === 'aggregate' ? 'selected' : '') + '>Aggregate ' + nextEntity + ' data</option>' +
+
+						'</select>' +
+
+						'</div>' +
+
+						'<div class="aggregate-fields-' + entityType + '" style="display: ' + (sortConfig.type === 'aggregate' ? 'block' : 'none') + ';">' +
+
+						'<label style="font-size: 12px;">Function</label>' +
+
+						'<select data-entity="' + entityType + '" data-prop="aggregateFunction" style="width: 100%; padding: 6px;">' +
+
+						'<option value="sum" ' + (sortConfig.aggregateFunction === 'sum' ? 'selected' : '') + '>Sum</option>' +
+
+						'<option value="avg" ' + (sortConfig.aggregateFunction === 'avg' ? 'selected' : '') + '>Average</option>' +
+
+						'<option value="max" ' + (sortConfig.aggregateFunction === 'max' ? 'selected' : '') + '>Max</option>' +
+
+						'<option value="min" ' + (sortConfig.aggregateFunction === 'min' ? 'selected' : '') + '>Min</option>' +
+
+						'</select>' +
+
+						'</div>' +
+
+						'<div class="aggregate-fields-' + entityType + '" style="grid-column: 1 / -1; display: ' + (sortConfig.type === 'aggregate' ? 'block' : 'none') + ';">' +
+
+						'<label style="font-size: 12px;">Field to Aggregate (in ' + nextEntity + ')</label>' +
+
+						'<input type="text" data-entity="' + entityType + '" data-prop="aggregateField" ' +
+
+						'value="' + (sortConfig.aggregateField || '') + '" ' +
+
+						'placeholder="e.g., count, amount, priority" ' +
+
+						'style="width: 100%; padding: 6px;">' +
+
+						'</div>' +
+
+						'</div>';
+
+
+
+					// Add dynamic show/hide for aggregate fields
+
+					const typeSelect = sortDiv.querySelector('select[data-entity="' + entityType + '"][data-prop="type"]');
+
+					typeSelect.addEventListener('change', function(e) {
+
+						const aggregateFields = sortDiv.querySelectorAll('.aggregate-fields-' + entityType);
+
+						aggregateFields.forEach(function(field) {
+
+							field.style.display = e.target.value === 'aggregate' ? 'block' : 'none';
+
+						});
+
+					});
+
+
+
+					sortConfigList.appendChild(sortDiv);
+
+				}
+
+			});
+
+
+
+			// Add event listeners for sort config changes
+
+			sortConfigList.querySelectorAll('select[data-entity], input[data-entity]').forEach(function(input) {
+
+				input.addEventListener('change', function(e) {
+
+					const entityType = e.target.dataset.entity;
+
+					const prop = e.target.dataset.prop;
+
+					const value = e.target.value;
+
+
+
+					if (!schema.entityConfigs[entityType]) {
+
+						schema.entityConfigs[entityType] = {};
+
+					}
+
+					if (!schema.entityConfigs[entityType].sortConfig) {
+
+						schema.entityConfigs[entityType].sortConfig = {};
+
+					}
+
+					schema.entityConfigs[entityType].sortConfig[prop] = value;
+
+				});
+
+			});
+
+		};
+
+
+
+		updateHierarchyList();
+
+		updateSortConfigs();
+
+
+
+		// Add hierarchy entity
+
+		content.querySelector('#add-hierarchy-entity').onchange = function(e) {
+
+			if (e.target.value && !schema.hierarchy.includes(e.target.value)) {
+
+				schema.hierarchy.push(e.target.value);
+
+				if (!schema.entityConfigs[e.target.value]) {
+
+					const entity = entities[e.target.value];
+
+					const labelField = entity.fields.find(function(f) { return f.name.includes('name'); }) ? entity.fields.find(function(f) { return f.name.includes('name'); }).name : entity.fields[0].name;
+
+					const idField = entity.fields.find(function(f) { return f.name.includes('id'); }) ? entity.fields.find(function(f) { return f.name.includes('id'); }).name : entity.fields[0].name;
+
+					schema.entityConfigs[e.target.value] = {
+
+						labelField: labelField,
+
+						idField: idField,
+
+						childEntity: null,
+
+						childrenField: e.target.value + 's'
+
+					};
+
+				}
+
+				updateHierarchyList();
+
+				updateSortConfigs();
+
+				e.target.value = '';
+
+			}
+
+		};
+
+
+
+		// Save handler
+
+		content.querySelector('#save-app-schema').onclick = async function() {
+		  const idInput = content.querySelector('#schema-id');
+		  const nameInput = content.querySelector('#schema-name');
+
+		  /* ----- basic inline validation ----- */
+		  let ok = true;
+		  [idInput, nameInput].forEach(inp => inp.classList.remove('input-error'));
+
+		  if (!idInput.value.trim()) {
+		    idInput.classList.add('input-error');
+		    ok = false;
+		  }
+		  if (!nameInput.value.trim()) {
+		    nameInput.classList.add('input-error');
+		    ok = false;
+		  }
+
+		  if (!ok) return;   // stop here – user sees red borders
+
+		  /* ----- proceed with save ----- */
+		  schema.id        = idInput.value.trim();
+		  schema.name      = nameInput.value.trim();
+		  schema.description = content.querySelector('#schema-description').value.trim();
+		  
+		  schema.hierarchy.forEach(function (entityType, index) {
+		      const nextEntity =
+		        index < schema.hierarchy.length - 1
+		          ? schema.hierarchy[index + 1]
+		          : null;
+
+		      if (!schema.entityConfigs[entityType]) {
+		        schema.entityConfigs[entityType] = {};
+		      }
+
+		      schema.entityConfigs[entityType].childrenField =
+		        nextEntity ? nextEntity.toLowerCase() + 's' : null;
+		    });
+
+		  await self.db.saveAppSchema(schema);
+		  modal.style.display = 'none';
+		  await self.loadAppSchemas();
+		};
+
+
+
+		content.querySelector('#cancel-app-schema').onclick = function() { modal.style.display = 'none'; };
+
+		modal.style.display = 'block';
+
+	}
+
+
+
+	getBaseEntityFields() {
+	    return [
+	        { name: 'ID', label: 'ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	        { name: 'displayID', label: 'Display ID', type: 'text', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	        { name: 'name', label: 'Name', type: 'text', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	        { name: 'dotLabel', label: 'Dot Label', type: 'text', mandatory: true, writePermission: 'any', dataSource: 'manual' },
+	        { name: 'timestamp', label: 'Timestamp', type: 'number', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	        { name: 'count', label: 'Count', type: 'number', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	        { name: 'hidden', label: 'Hidden', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	        { name: 'hashed', label: 'Hashed', type: 'checkbox', mandatory: false, writePermission: 'system', dataSource: 'manual' },
+	        { name: 'image', label: 'Image URL', type: 'url', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	        { name: 'website', label: 'Website URL', type: 'url', mandatory: false, writePermission: 'any', dataSource: 'manual' },
+	        { name: 'writeAccess', label: 'Write Access', type: 'select', mandatory: false, writePermission: 'root', dataSource: 'manual', 
+	          options: ['owner', 'parent', 'ancestor', 'any'] },
+	        { name: 'readAccess', label: 'Read Access', type: 'select', mandatory: false, writePermission: 'root', dataSource: 'manual',
+	          options: ['owner', 'parent', 'ancestor', 'any'] }
+	    ];
+	}
+
+	createNativeEntity() {
+	    const baseEntity = {
+	        name: 'New Entity',
+	        description: '',
+	        fields: this.getBaseEntityFields()
+	    };
+	    this.editNativeEntity('new_entity_' + Date.now(), baseEntity);
+	}
+
+
+
+	editNativeEntity(key, entity) {
+		const modal = document.getElementById('entity-editor-modal');
+		const title = document.getElementById('entity-editor-title');
+		const content = document.getElementById('entity-editor-content');
+		title.textContent = key.startsWith('new_') ? 'Create Native Entity' : 'Edit Native Entity';
+
+		content.innerHTML =
+			'<div class="form-group">' +
+			'<label>Entity Key</label>' +
+			'<input type="text" id="entity-key" value="' + key + '" ' + (!key.startsWith('new_') ? 'readonly' : '') + '>' +
+			'</div>' +
+			'<div class="form-group">' +
+			'<label>Entity Name</label>' +
+			'<input type="text" id="entity-name" value="' + entity.name + '">' +
+			'</div>' +
+			'<div class="form-group">' +
+			'<label>Description</label>' +
+			'<textarea id="entity-description">' + entity.description + '</textarea>' +
+			'</div>' +
+			'<div class="form-group">' +
+			'<label>Fields</label>' +
+			'<div id="entity-fields-list"></div>' +
+			'<button class="btn btn-primary" id="add-entity-field" style="margin-top: 10px;">+ Add Field</button>' +
+			'</div>' +
+			'<div style="margin-top: 20px;">' +
+			'<button class="btn btn-primary" id="save-entity">Save</button>' +
+			'<button class="btn btn-secondary" id="cancel-entity">Cancel</button>' +
+			'</div>';
+
+		const fieldsList = content.querySelector('#entity-fields-list');
+		// Inside editNativeEntity(), replace the field rendering section with:
+		const renderFields = function() {
+		    fieldsList.innerHTML = '';
+		    entity.fields.forEach(function(field, index) {
+		        const fieldDiv = document.createElement('div');
+		        fieldDiv.className = 'field-item';
+		        
+		        // System ID field (read-only)
+		        if (field.name === 'ID') {
+		            fieldDiv.innerHTML = `
+		                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr auto; gap: 10px; align-items: end;">
+		                    <div><label style="font-size: 12px;">Name</label>
+		                        <input type="text" value="ID" readonly style="background-color: #e8f4f8;"></div>
+		                    <div><label style="font-size: 12px;">Label</label>
+		                        <input type="text" value="ID" readonly style="background-color: #e8f4f8;"></div>
+		                    <div><label style="font-size: 12px;">Type</label>
+		                        <select disabled style="background-color: #e8f4f8;"><option>Text</option></select></div>
+		                    <div><label style="font-size: 12px;">Write Permission</label>
+		                        <select disabled style="background-color: #e8f4f8;"><option>system</option></select></div>
+		                    <div><label style="font-size: 12px;">Data Source</label>
+		                        <select disabled style="background-color: #e8f4f8;"><option>manual</option></select></div>
+		                    <button class="btn-danger" disabled>System Field</button>
+		                </div>
+		                <div style="margin-top: 5px; font-size: 11px; color: #17a2b8;">🔒 System-generated unique identifier</div>
+		            `;
+		        } 
+		        // Regular fields
+		        else {
+		            const writePermissionOptions = `
+		                <option value="any" ${field.writePermission === 'any' ? 'selected' : ''}>Any User</option>
+		                <option value="parent" ${field.writePermission === 'parent' ? 'selected' : ''}>Parent Only</option>
+		                <option value="root" ${field.writePermission === 'root' ? 'selected' : ''}>Root Tenant</option>
+		                <option value="owner" ${field.writePermission === 'owner' ? 'selected' : ''}>App Owner</option>
+		                <option value="system" ${field.writePermission === 'system' ? 'selected' : ''}>System Only</option>
+		            `;
+		            
+		            const dataSourceOptions = `
+		                <option value="manual" ${field.dataSource === 'manual' ? 'selected' : ''}>Manual Input</option>
+		                <option value="web" ${field.dataSource === 'web' ? 'selected' : ''}>Web API</option>
+		                <option value="api" ${field.dataSource === 'api' ? 'selected' : ''}>Internal API</option>
+		            `;
+		            
+		            fieldDiv.innerHTML = `
+		                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr auto; gap: 10px; align-items: end;">
+		                    <div><label style="font-size: 12px;">Name</label>
+		                        <input type="text" value="${field.name}" data-index="${index}" data-prop="name"></div>
+		                    <div><label style="font-size: 12px;">Label</label>
+		                        <input type="text" value="${field.label}" data-index="${index}" data-prop="label"></div>
+		                    <div><label style="font-size: 12px;">Type</label>
+		                        <select data-index="${index}" data-prop="type">
+		                            <option value="text" ${field.type === 'text' ? 'selected' : ''}>Text</option>
+		                            <option value="textarea" ${field.type === 'textarea' ? 'selected' : ''}>Textarea</option>
+		                            <option value="email" ${field.type === 'email' ? 'selected' : ''}>Email</option>
+		                            <option value="checkbox" ${field.type === 'checkbox' ? 'selected' : ''}>Checkbox</option>
+		                            <option value="select" ${field.type === 'select' ? 'selected' : ''}>Select</option>
+		                        </select></div>
+		                    <div><label style="font-size: 12px;">Write Permission</label>
+		                        <select data-index="${index}" data-prop="writePermission">${writePermissionOptions}</select></div>
+		                    <div><label style="font-size: 12px;">Data Source</label>
+		                        <select data-index="${index}" data-prop="dataSource">${dataSourceOptions}</select></div>
+		                    <button class="btn-danger" data-index="${index}">Remove</button>
+		                </div>
+		                ${field.type === 'select' ? `
+		                <div style="margin-top: 5px;">
+		                    <label style="font-size: 12px;">Options (comma-separated)</label>
+		                    <input type="text" value="${field.options ? field.options.join(', ') : ''}" 
+		                           data-index="${index}" data-prop="optionsStr" placeholder="Option1, Option2, Option3"
+		                           style="width: 100%; padding: 4px; margin-top: 2px;">
+		                </div>` : ''}
+		                <div style="margin-top: 5px; display: flex; gap: 10px; align-items: center;">
+		                    <label style="font-size: 12px; display: flex; align-items: center; gap: 5px;">
+		                        <input type="checkbox" ${field.mandatory ? 'checked' : ''} data-index="${index}" data-prop="mandatory">
+		                        Required
+		                    </label>
+		                </div>
+		            `;
+		            
+		            // Handle option input for select fields
+		            const optionsInput = fieldDiv.querySelector(`[data-prop="optionsStr"]`);
+		            if (optionsInput) {
+		                optionsInput.onchange = function(e) {
+		                    const idx = parseInt(e.target.dataset.index);
+		                    const values = e.target.value.split(',').map(v => v.trim()).filter(v => v);
+		                    entity.fields[idx].options = values;
+		                };
+		            }
+		        }
+		        
+		        // Add change handlers for editable fields
+		        if (field.name !== 'ID') {
+		            fieldDiv.querySelectorAll('input[data-prop], select[data-prop]').forEach(function(input) {
+		                input.onchange = function(e) {
+		                    const idx = parseInt(e.target.dataset.index);
+		                    const prop = e.target.dataset.prop;
+		                    if (prop === 'mandatory') {
+		                        entity.fields[idx][prop] = e.target.checked;
+		                    } else if (prop === 'optionsStr') {
+		                        // Handled separately above
+		                    } else {
+		                        entity.fields[idx][prop] = e.target.value;
+		                    }
+		                };
+		            });
+		            
+		            fieldDiv.querySelector('button').onclick = function() {
+		                entity.fields.splice(index, 1);
+		                renderFields();
+		            };
+		        }
+		        
+		        fieldsList.appendChild(fieldDiv);
+		    });
+		};
+
+		renderFields();
+
+		content.querySelector('#add-entity-field').onclick = () => {
+			// Don't allow adding ID field manually
+			entity.fields.push({ name: 'newfield', label: 'New Field', type: 'text', mandatory: false });
+			renderFields();
+		};
+
+		content.querySelector('#save-entity').onclick = async () => {
+			const newKey = content.querySelector('#entity-key').value;
+			entity.name = content.querySelector('#entity-name').value;
+			entity.description = content.querySelector('#entity-description').value;
+			if (newKey !== key) await this.db.deleteNativeEntity(key);
+			await this.db.saveNativeEntity(newKey, entity);
+			modal.style.display = 'none';
+			await this.loadNativeEntities();
+		};
+
+		content.querySelector('#cancel-entity').onclick = function() { modal.style.display = 'none'; };
+		modal.style.display = 'block';
+	}
+}
+
+
+
+function displayapprootaccesssmessage() {
+	var div = document.createElement("div");
+	div.id = "notification-div";
+	div.style.position = "fixed";
+	div.style.bottom = "25px";
+	div.style.width = "80%";
+	div.style.left = "10%";
+	div.style.right = "10%";
+	div.style.backgroundColor = "#fafafa";
+	div.style.color = "#787878";
+	div.style.textAlign = "center";
+	div.style.fontSize = "18px";
+	div.style.padding = "10px";
+	div.style.border = "1px solid #ccc";
+	div.style.borderRadius = "20px";
+	div.innerHTML = "Access to this page is retricted.";
+	document.body.appendChild(div);
+	//alert('No data');
+
+}
+
+// Also handle the canvas area height calculation
+	function updateCanvasHeight() {
+	    const header = document.querySelector('.app-header');
+	    const breadcrumb = document.getElementById('breadcrumb');
+	    const headerHeight = header ? header.offsetHeight : 0;
+	    const breadcrumbHeight = breadcrumb ? breadcrumb.offsetHeight : 0;
+	    const totalHeaderHeight = headerHeight + breadcrumbHeight;
+	    
+	    const canvasArea = document.getElementById('canvas-area');
+	    if (canvasArea) {
+	        canvasArea.style.height = `calc(100vh - ${totalHeaderHeight}px)`;
+	        canvasArea.style.height = `calc(var(--vh, 1vh) * 100 - ${totalHeaderHeight}px)`;
+	    }
+	}
+
+
+
+// Initialize when DOM is ready
+
+if (typeof window !== 'undefined') {
+
+	window.SchemaOrchestrator = SchemaOrchestrator;
+
+	window.DatabaseService = DatabaseService;
+	
+	console.log('schema orchestrator loaded');
+	
+	// At the very top
+	let originalRender = SchemaOrchestrator.prototype.render;
+	SchemaOrchestrator.prototype.render = function() {
+	    console.log('RENDER CALLED FROM:', new Error().stack.split('\n')[2]);
+	    return originalRender.call(this);
+	};
+
+}
+
+/* ============================================================
+   COMPOSITE ENTITY EXTENSION
+   Adds support for two new hierarchy slot types:
+   
+   Sequential:  [ent1, ent2, ent3[]]
+     → Declared as: { type: 'sequential', entities: ['ent1', 'ent2', {name:'ent3', multiple:true}] }
+     → Dot named by ent1. Steps filled in order (wizard-style).
+     → Dot states: pending → partial (some steps done) → confirmed
+   
+   Parallel:    {ent1, ent2, ent3}
+     → Declared as: { type: 'parallel', entities: ['ent1', 'ent2', 'ent3'] }
+     → Dot named by ent1. All entities filled at once in a single form.
+     → Dot states: pending → confirmed (atomic)
+   
+   Naming convention: first entity in the collection names the dot.
+   Storage shape on each item: item._composite = { ent1:{}, ent2:{}, ent3:[] }
+   ============================================================ */
+
+(function() {
+
+  /* ----------------------------------------------------------
+     CompositeEntityHelper — pure utilities, no DOM coupling
+     ---------------------------------------------------------- */
+  class CompositeEntityHelper {
+
+    /** Returns true if a hierarchy slot is a composite descriptor */
+    static isComposite(slot) {
+      return slot !== null &&
+             typeof slot === 'object' &&
+             (slot.type === 'sequential' || slot.type === 'parallel') &&
+             Array.isArray(slot.entities) &&
+             slot.entities.length > 0;
+    }
+
+    /** Normalise an entity entry inside a composite to {name, multiple} */
+    static normaliseEntry(entry) {
+      if (typeof entry === 'string') return { name: entry, multiple: false };
+      if (typeof entry === 'object' && entry.name) return { name: entry.name, multiple: !!entry.multiple };
+      throw new Error('Invalid composite entity entry: ' + JSON.stringify(entry));
+    }
+
+    /** The "primary" entity — first in the list — names the dot */
+    static primaryEntity(slot) {
+      if (!this.isComposite(slot)) return slot; // plain string
+      return this.normaliseEntry(slot.entities[0]).name;
+    }
+
+    /**
+     * Derive the dot label from a composite item.
+     * Falls back gracefully through dotLabel → name → displayID.
+     */
+    static getDotLabel(item, slot, entityConfigs) {
+      const primary = this.primaryEntity(slot);
+      const cfg = entityConfigs?.[primary];
+      const labelField = cfg?.labelField || 'name';
+      // If composite data is nested under _composite, look there first
+      const source = item._composite?.[primary] || item;
+      return (item.dotLabel || source[labelField] || source.dotLabel || source.name || source.displayID || '?').substring(0, 3);
+    }
+
+    /**
+     * Determine completion state of a composite item.
+     * Returns: 'empty' | 'partial' | 'complete'
+     */
+    static getCompletionState(item, slot) {
+      if (!this.isComposite(slot)) return 'complete';
+      const composite = item._composite || {};
+      const entries = slot.entities.map(e => this.normaliseEntry(e));
+      let filled = 0;
+      for (const entry of entries) {
+        const data = composite[entry.name];
+        if (entry.multiple) {
+          if (Array.isArray(data) && data.length > 0) filled++;
+        } else {
+          if (data && typeof data === 'object' && Object.keys(data).length > 0) filled++;
+        }
+      }
+      if (filled === 0) return 'empty';
+      if (filled < entries.length) return 'partial';
+      return 'complete';
+    }
+
+    /**
+     * Return the index of the next unfilled step for a sequential composite.
+     * Returns -1 if all steps are complete.
+     */
+    static nextSequentialStep(item, slot) {
+      if (!this.isComposite(slot) || slot.type !== 'sequential') return -1;
+      const composite = item._composite || {};
+      const entries = slot.entities.map(e => this.normaliseEntry(e));
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const data = composite[entry.name];
+        if (entry.multiple) {
+          if (!Array.isArray(data) || data.length === 0) return i;
+        } else {
+          if (!data || typeof data !== 'object' || Object.keys(data).length === 0) return i;
+        }
+      }
+      return -1; // all complete
+    }
+
+    /**
+     * Merge new sub-entity data into an item's _composite map.
+     * Returns a shallow-mutated copy of item (does not deep-clone the whole tree).
+     */
+    static mergeCompositeData(item, entityName, data, multiple) {
+      if (!item._composite) item._composite = {};
+      if (multiple) {
+        if (!Array.isArray(item._composite[entityName])) item._composite[entityName] = [];
+        item._composite[entityName].push(data);
+      } else {
+        item._composite[entityName] = data;
+      }
+      return item;
+    }
+
+    /**
+     * Build a flat summary object from a composite item's _composite data.
+     * Useful for rendering the dot info card.
+     */
+    static flatSummary(item, slot, entityConfigs) {
+      if (!this.isComposite(slot)) return {};
+      const composite = item._composite || {};
+      const summary = {};
+      for (const rawEntry of slot.entities) {
+        const entry = this.normaliseEntry(rawEntry);
+        const cfg = entityConfigs?.[entry.name];
+        const data = composite[entry.name];
+        if (!data) continue;
+        const labelField = cfg?.labelField || 'name';
+        if (entry.multiple && Array.isArray(data)) {
+          summary[entry.name] = data.map(d => d[labelField] || d.name || '—').join(', ');
+        } else if (data) {
+          summary[entry.name] = data[labelField] || data.name || '—';
+        }
+      }
+      return summary;
+    }
+  }
+
+  /* ----------------------------------------------------------
+     CSS: new dot states for composite entities
+     dot-partial: wizard started but not finished
+     ---------------------------------------------------------- */
+  const COMPOSITE_CSS = `
+    .dot-partial {
+      animation: dot-partial-pulse 2s ease-in-out infinite !important;
+      box-shadow: 0 0 0 3px rgba(255, 193, 7, 0.5) !important;
+    }
+    @keyframes dot-partial-pulse {
+      0%, 100% { box-shadow: 0 0 0 3px rgba(255, 193, 7, 0.5); }
+      50%       { box-shadow: 0 0 0 7px rgba(255, 193, 7, 0.2); }
+    }
+    .dot-composite-badge {
+      position: absolute;
+      top: -4px;
+      right: -4px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 1.5px solid white;
+      font-size: 7px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+    .dot-composite-badge.sequential { background: #6c5ce7; }
+    .dot-composite-badge.parallel   { background: #00b894; }
+    .dot-composite-badge.partial    { background: #fdcb6e; }
+
+    /* Composite wizard/parallel modal overlay */
+    .composite-modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 10000;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .composite-modal {
+      background: white;
+      border-radius: 12px;
+      padding: 24px;
+      width: 520px;
+      max-width: 95vw;
+      max-height: 85vh;
+      overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      position: relative;
+    }
+    .composite-modal h2 { margin: 0 0 4px 0; font-size: 20px; }
+    .composite-modal .composite-subtitle { color: #666; font-size: 13px; margin-bottom: 20px; }
+    .composite-steps {
+      display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap;
+    }
+    .composite-step-pill {
+      padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
+      border: 1.5px solid #ddd; color: #999; background: #f8f8f8;
+      transition: all 0.2s;
+    }
+    .composite-step-pill.done   { background: #00b894; color: white; border-color: #00b894; }
+    .composite-step-pill.active { background: #6c5ce7; color: white; border-color: #6c5ce7; }
+    .composite-step-pill.partial{ background: #fdcb6e; color: #333; border-color: #fdcb6e; }
+    .composite-section { margin-bottom: 20px; }
+    .composite-section h3 { font-size: 15px; margin: 0 0 12px 0; color: #2d3436; }
+    .composite-field { margin-bottom: 12px; }
+    .composite-field label { display: block; font-size: 13px; color: #636e72; margin-bottom: 4px; }
+    .composite-field input, .composite-field textarea, .composite-field select {
+      width: 100%; padding: 8px 10px; border: 1px solid #ddd;
+      border-radius: 6px; font-size: 14px; box-sizing: border-box;
+    }
+    .composite-field input:focus, .composite-field textarea:focus, .composite-field select:focus {
+      outline: none; border-color: #6c5ce7;
+    }
+    .composite-list-items { margin-bottom: 8px; }
+    .composite-list-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 10px; background: #f0f0f0; border-radius: 6px; margin-bottom: 4px;
+      font-size: 13px;
+    }
+    .composite-list-item button {
+      background: none; border: none; color: #e74c3c; cursor: pointer; font-size: 16px;
+    }
+    .composite-actions {
+      display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;
+    }
+    .composite-btn {
+      padding: 9px 20px; border-radius: 8px; font-size: 14px;
+      cursor: pointer; border: none; font-weight: 600;
+    }
+    .composite-btn.primary { background: #6c5ce7; color: white; }
+    .composite-btn.primary:hover { background: #5a4bd1; }
+    .composite-btn.secondary { background: #f0f0f0; color: #333; }
+    .composite-btn.secondary:hover { background: #e0e0e0; }
+    .composite-btn.success { background: #00b894; color: white; }
+    .composite-btn.success:hover { background: #00a381; }
+    .composite-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .composite-close-btn {
+      position: absolute; top: 16px; right: 16px;
+      background: none; border: none; font-size: 22px; cursor: pointer; color: #aaa;
+    }
+    .composite-close-btn:hover { color: #333; }
+  `;
+
+  function injectCompositeCSS() {
+    if (document.getElementById('composite-entity-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'composite-entity-styles';
+    style.textContent = COMPOSITE_CSS;
+    document.head.appendChild(style);
+  }
+
+  /* ----------------------------------------------------------
+     Patch DatabaseService.createCustomSchema
+     to handle composite slots in the hierarchy array.
+     
+     Composite slot example in the hierarchy array:
+       { type: 'sequential', entities: ['ticket', {name:'attachment', multiple:true}] }
+       { type: 'parallel', entities: ['address', 'contact'] }
+     
+     createCustomSchema already iterates hierarchy[i] to build entityConfigs.
+     We patch it to understand composite slots.
+     ---------------------------------------------------------- */
+  const _origCreateCustomSchema = DatabaseService.prototype.createCustomSchema;
+  DatabaseService.prototype.createCustomSchema = function(id, name, desc, hierarchy, entityConfigInput) {
+    // Expand composite slots: for each composite slot, register each sub-entity
+    // in entityConfigs but tag the slot with compositeType.
+    const entityConfigs = {};
+
+    hierarchy.forEach((slot, idx) => {
+      const nextSlot = idx < hierarchy.length - 1 ? hierarchy[idx + 1] : null;
+
+      if (CompositeEntityHelper.isComposite(slot)) {
+        // ── Composite slot ──────────────────────────────────────────
+        const primaryName = CompositeEntityHelper.primaryEntity(slot);
+        const childSlot = nextSlot;
+        const childPrimary = childSlot ? CompositeEntityHelper.primaryEntity(childSlot) : null;
+        const childrenField = childPrimary ? childPrimary + 's' : null;
+
+        // Register an entityConfig keyed by primaryName that covers the whole composite
+        const inputCfg = entityConfigInput?.[primaryName] || {};
+        entityConfigs[primaryName] = {
+          labelField:     inputCfg.labelField   || 'name',
+          idField:        inputCfg.idField       || 'ID',
+          childEntity:    childPrimary,
+          childrenField:  childrenField,
+          isComposite:    true,
+          compositeType:  slot.type,                    // 'sequential' | 'parallel'
+          compositeSlot:  slot,                         // full descriptor for runtime use
+        };
+        if (inputCfg.sortConfig) entityConfigs[primaryName].sortConfig = inputCfg.sortConfig;
+        else if (childrenField) entityConfigs[primaryName].sortConfig = { type: 'count' };
+
+        // Also register each sub-entity individually so form-building can look them up
+        for (const rawEntry of slot.entities) {
+          const entry = CompositeEntityHelper.normaliseEntry(rawEntry);
+          if (entry.name === primaryName) continue; // already handled above as primary
+          const subCfg = entityConfigInput?.[entry.name] || {};
+          entityConfigs[entry.name] = {
+            labelField:        subCfg.labelField || 'name',
+            idField:           subCfg.idField    || 'ID',
+            childEntity:       null,
+            childrenField:     null,
+            isCompositeChild:  true,
+            multiple:          entry.multiple,
+            parentComposite:   primaryName,
+          };
+        }
+      } else {
+        // ── Plain entity slot (existing behaviour) ─────────────────
+        const nextPrimary = nextSlot ? CompositeEntityHelper.primaryEntity(nextSlot) : null;
+        const childrenField = nextPrimary ? nextPrimary + 's' : null;
+        const inputCfg = entityConfigInput?.[slot] || { labelField: slot + '_name', idField: slot + '_id' };
+
+        entityConfigs[slot] = {
+          labelField:    inputCfg.labelField,
+          idField:       inputCfg.idField,
+          childEntity:   nextPrimary,
+          childrenField: childrenField,
+        };
+        if (inputCfg.sortConfig) {
+          entityConfigs[slot].sortConfig = inputCfg.sortConfig;
+        } else if (childrenField) {
+          entityConfigs[slot].sortConfig = { type: inputCfg.sortType || 'count' };
+          if (inputCfg.sortType === 'aggregate' && inputCfg.aggregateField) {
+            entityConfigs[slot].sortConfig.aggregateField  = inputCfg.aggregateField;
+            entityConfigs[slot].sortConfig.aggregateFunction = inputCfg.aggregateFunction || 'sum';
+          }
+        }
+      }
+    });
+
+    return { id, name, description: desc, hierarchy, entityConfigs };
+  };
+  
+  /* patch transformDotToCard to inject the button directly into the card DOM after it runs*/
+  
+  const _origTransformDotToCard = SchemaOrchestrator.prototype.transformDotToCard;
+  SchemaOrchestrator.prototype.transformDotToCard = function(dot, item, entityType) {
+    _origTransformDotToCard.call(this, dot, item, entityType);
+
+    // After the card is in the DOM, check if we need to add the Mark Complete button
+    const level = this.currentPath.length;
+    const slot = this.currentApp?.hierarchy?.[level];
+    if (!slot || !CompositeEntityHelper.isComposite(slot)) return;
+
+    const state = CompositeEntityHelper.getCompletionState(item, slot);
+    if (state !== 'partial') return;
+
+    // Find the card that was just created
+    const card = document.querySelector('.dot-info-card');
+    if (!card) return;
+
+    const btn = document.createElement('button');
+    btn.textContent = '✓ Mark as Complete';
+    btn.style.cssText = 'width:100%;margin-top:10px;padding:7px 12px;background:#00b894;' +
+      'color:white;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;';
+    btn.onclick = async () => {
+      item._compositeForceComplete = true;
+      try {
+        await this.db.saveAppData(this.currentApp.id, this.data);
+        this.confirmDot(item.ID);
+        this.hideDotInfoCard?.();
+        this.showNotification?.('✅ Marked as complete', 'success');
+        this.render();
+      } catch(e) {
+        this.showNotification?.('❌ Failed to save: ' + e.message, 'error');
+      }
+    };
+
+    card.appendChild(btn);
+  };
+
+  /* ----------------------------------------------------------
+     Patch: _getCurrentEntityType — handle composite hierarchy slots
+     ---------------------------------------------------------- */
+  const _origGetCurrentEntityType = SchemaOrchestrator.prototype._getCurrentEntityType;
+  SchemaOrchestrator.prototype._getCurrentEntityType = function() {
+    const result = _origGetCurrentEntityType ? _origGetCurrentEntityType.call(this) : null;
+    if (!this.currentApp) return result;
+    const level = this.currentPath.length;
+    const slot = this.currentApp.hierarchy?.[level];
+    if (slot && CompositeEntityHelper.isComposite(slot)) {
+      return CompositeEntityHelper.primaryEntity(slot);
+    }
+    return result;
+  };
+
+  /* ----------------------------------------------------------
+     Patch: markDotAsPending / markDotAsPartial / confirmDot
+     to handle composite state transitions
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype.markDotAsPartial = function(itemId) {
+    setTimeout(() => {
+      const dots = document.querySelectorAll('.dot');
+      const dot = Array.from(dots).find(d => {
+        const data = d.itemData;
+        return data && (data.ID === itemId || data.displayID === itemId);
+      });
+      if (dot) {
+        dot.classList.remove('dot-pending');
+        dot.classList.add('dot-partial');
+        // update badge
+        const badge = dot.querySelector('.dot-composite-badge');
+        if (badge) badge.classList.add('partial');
+      }
+    }, 100);
+  };
+
+  /* ----------------------------------------------------------
+     Composite UI: buildCompositeForm
+     Builds form fields for a single sub-entity inside the modal.
+     Returns a <div> element.
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype._buildCompositeSubForm = async function(entityName, existingData) {
+    const config = await this.db.getNativeEntities();
+    const entityConfig = config?.[entityName];
+    const wrapper = document.createElement('div');
+    wrapper.className = 'composite-section';
+
+    const title = document.createElement('h3');
+    title.textContent = entityConfig?.name || entityName.charAt(0).toUpperCase() + entityName.slice(1);
+    wrapper.appendChild(title);
+
+    if (!entityConfig?.fields) {
+      const msg = document.createElement('p');
+      msg.style.color = '#999';
+      msg.textContent = 'No fields configured for ' + entityName;
+      wrapper.appendChild(msg);
+      return wrapper;
+    }
+
+    for (const field of entityConfig.fields) {
+      // Skip system / ID fields
+      if (['ID', 'displayID', 'timestamp', 'hidden', 'hashed'].includes(field.name)) continue;
+
+      const group = document.createElement('div');
+      group.className = 'composite-field';
+
+      const label = document.createElement('label');
+      label.textContent = field.label + (field.mandatory ? ' *' : '');
+      group.appendChild(label);
+
+      let input;
+      if (field.type === 'textarea') {
+        input = document.createElement('textarea');
+        input.rows = 3;
+        input.value = existingData?.[field.name] || '';
+      } else if (field.type === 'select' && Array.isArray(field.options)) {
+        input = document.createElement('select');
+        input.innerHTML = '<option value="">— select —</option>' +
+          field.options.map(o => `<option value="${o}" ${existingData?.[field.name]===o?'selected':''}>${o}</option>`).join('');
+      } else if (field.type === 'checkbox') {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!existingData?.[field.name];
+      } else {
+        input = document.createElement('input');
+        input.type = field.type === 'email' ? 'email' : field.type === 'url' ? 'url' : 'text';
+        input.value = existingData?.[field.name] || '';
+        input.placeholder = field.label;
+      }
+      input.name = field.name;
+      input.dataset.mandatory = field.mandatory ? 'true' : 'false';
+      group.appendChild(input);
+      wrapper.appendChild(group);
+    }
+
+    return wrapper;
+  };
+
+  /* ----------------------------------------------------------
+     Composite UI: collectFormData
+     Scrapes all inputs from a sub-form wrapper element.
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype._collectCompositeSubFormData = function(wrapper) {
+    const data = {};
+    wrapper.querySelectorAll('input, textarea, select').forEach(el => {
+      if (!el.name) return;
+      data[el.name] = el.type === 'checkbox' ? el.checked : el.value;
+    });
+    return data;
+  };
+
+  /* ----------------------------------------------------------
+     Composite UI: validateSubForm
+     Returns an array of missing required field names.
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype._validateCompositeSubForm = function(wrapper) {
+    const missing = [];
+    wrapper.querySelectorAll('[data-mandatory="true"]').forEach(el => {
+      const isEmpty = el.type === 'checkbox' ? false : !el.value.trim();
+      if (isEmpty) missing.push(el.name);
+    });
+    return missing;
+  };
+
+  /* ----------------------------------------------------------
+     Composite UI: openCompositeModal
+     Main entry point. Opens the sequential wizard OR the
+     parallel all-at-once form depending on compositeType.
+     
+     @param slot        — the composite slot descriptor
+     @param item        — the data item being completed (already in data tree)
+     @param onComplete  — callback(item) fired when all steps are done
+     @param onClose     — callback fired when modal is closed without completing
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype.openCompositeModal = async function(slot, item, onComplete, onClose) {
+    injectCompositeCSS();
+
+    // Remove any existing composite modal
+    document.querySelector('.composite-modal-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'composite-modal-overlay';
+    const modal = document.createElement('div');
+    modal.className = 'composite-modal';
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const close = () => {
+      overlay.remove();
+      onClose?.();
+    };
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'composite-close-btn';
+    closeBtn.textContent = '×';
+    closeBtn.onclick = close;
+    modal.appendChild(closeBtn);
+
+    if (slot.type === 'parallel') {
+      await this._renderParallelCompositeForm(modal, slot, item, onComplete, close);
+    } else {
+      await this._renderSequentialCompositeWizard(modal, slot, item, onComplete, close);
+    }
+  };
+
+  /* ----------------------------------------------------------
+     Parallel composite form
+     All sub-entities rendered at once, single submit.
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype._renderParallelCompositeForm = async function(modal, slot, item, onComplete, close) {
+    const primaryName = CompositeEntityHelper.primaryEntity(slot);
+    const entities = slot.entities.map(e => CompositeEntityHelper.normaliseEntry(e));
+
+    const h2 = document.createElement('h2');
+    h2.textContent = '✏️ Complete Details';
+    modal.appendChild(h2);
+
+    const sub = document.createElement('div');
+    sub.className = 'composite-subtitle';
+    sub.textContent = 'Fill in all sections below, then save.';
+    modal.appendChild(sub);
+
+    // Build sub-forms for all entities simultaneously
+    const subFormWrappers = {};
+    for (const entry of entities) {
+      const existing = item._composite?.[entry.name] || {};
+      const wrapper = await this._buildCompositeSubForm(entry.name, existing);
+      subFormWrappers[entry.name] = wrapper;
+      modal.appendChild(wrapper);
+
+      // If multiple (list), add an "+ Add another" pattern
+      if (entry.multiple) {
+        wrapper._isMultiple = true;
+        wrapper._entries = Array.isArray(item._composite?.[entry.name]) ? [...item._composite[entry.name]] : [];
+        this._wrapMultipleSection(wrapper, entry.name, wrapper._entries);
+      }
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'composite-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'composite-btn secondary';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = close;
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'composite-btn success';
+    saveBtn.textContent = '💾 Save All';
+    saveBtn.onclick = async () => {
+      // Validate all sub-forms
+      let hasError = false;
+      for (const [entName, wrapper] of Object.entries(subFormWrappers)) {
+        const missing = this._validateCompositeSubForm(wrapper);
+        if (missing.length > 0) {
+          this.showNotification?.(`Please fill required fields in ${entName}: ${missing.join(', ')}`, 'error');
+          hasError = true;
+          break;
+        }
+      }
+      if (hasError) return;
+
+      // Merge all data
+      if (!item._composite) item._composite = {};
+      for (const entry of entities) {
+        const wrapper = subFormWrappers[entry.name];
+        if (entry.multiple) {
+          item._composite[entry.name] = wrapper._entries || [];
+        } else {
+          item._composite[entry.name] = this._collectCompositeSubFormData(wrapper);
+        }
+      }
+
+      // Persist
+      try {
+        await this.db.saveAppData(this.currentApp.id, this.data);
+        close();
+        onComplete?.(item);
+        this.confirmDot(item.ID);
+        this.showNotification?.('✅ All details saved!', 'success');
+      } catch (err) {
+        this.showNotification?.('❌ Failed to save: ' + err.message, 'error');
+      }
+    };
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    modal.appendChild(actions);
+  };
+
+  /* ----------------------------------------------------------
+     Sequential composite wizard
+     One step at a time, Next/Back navigation.
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype._renderSequentialCompositeWizard = async function(modal, slot, item, onComplete, close) {
+    const entities = slot.entities.map(e => CompositeEntityHelper.normaliseEntry(e));
+    let currentStep = Math.max(0, CompositeEntityHelper.nextSequentialStep(item, slot));
+    if (currentStep === -1) currentStep = entities.length - 1; // all done, show last step for review
+
+    const render = async () => {
+      modal.innerHTML = '';
+
+      // Close button
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'composite-close-btn';
+      closeBtn.textContent = '×';
+      closeBtn.onclick = close;
+      modal.appendChild(closeBtn);
+
+      // Title
+      const h2 = document.createElement('h2');
+      h2.textContent = `Step ${currentStep + 1} of ${entities.length}`;
+      modal.appendChild(h2);
+
+      const sub = document.createElement('div');
+      sub.className = 'composite-subtitle';
+      sub.textContent = `Complete each step in order. ${CompositeEntityHelper.getCompletionState(item, slot) === 'partial' ? 'You can resume where you left off.' : ''}`;
+      modal.appendChild(sub);
+
+      // Step pills
+      const pillBar = document.createElement('div');
+      pillBar.className = 'composite-steps';
+      entities.forEach((entry, i) => {
+        const pill = document.createElement('span');
+        pill.className = 'composite-step-pill';
+        const stepData = item._composite?.[entry.name];
+        const isDone = entry.multiple ? (Array.isArray(stepData) && stepData.length > 0) : (stepData && Object.keys(stepData).length > 0);
+        if (i === currentStep) pill.classList.add('active');
+        else if (isDone) pill.classList.add('done');
+        pill.textContent = (isDone && i !== currentStep ? '✓ ' : '') + (entry.name.charAt(0).toUpperCase() + entry.name.slice(1));
+        pillBar.appendChild(pill);
+      });
+      modal.appendChild(pillBar);
+
+      // Current step form
+      const entry = entities[currentStep];
+      const existing = item._composite?.[entry.name];
+      const wrapper = await this._buildCompositeSubForm(entry.name, entry.multiple ? null : existing);
+
+      if (entry.multiple) {
+        const listEntries = Array.isArray(existing) ? [...existing] : [];
+        wrapper._entries = listEntries;
+        this._wrapMultipleSection(wrapper, entry.name, listEntries);
+      }
+
+      modal.appendChild(wrapper);
+
+      // Actions
+      const actions = document.createElement('div');
+      actions.className = 'composite-actions';
+
+      if (currentStep > 0) {
+        const backBtn = document.createElement('button');
+        backBtn.className = 'composite-btn secondary';
+        backBtn.textContent = '← Back';
+        backBtn.onclick = async () => {
+          // Save current step's data before going back (non-destructive)
+          await saveCurrentStep(wrapper, entry, false);
+          currentStep--;
+          await render();
+        };
+        actions.appendChild(backBtn);
+      } else {
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'composite-btn secondary';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.onclick = close;
+        actions.appendChild(cancelBtn);
+      }
+
+      const isLast = currentStep === entities.length - 1;
+      const nextBtn = document.createElement('button');
+      nextBtn.className = 'composite-btn ' + (isLast ? 'success' : 'primary');
+      nextBtn.textContent = isLast ? '💾 Finish' : 'Next →';
+      nextBtn.onclick = async () => {
+        const missing = entry.multiple ? [] : this._validateCompositeSubForm(wrapper);
+        if (missing.length > 0) {
+          this.showNotification?.(`Please fill required fields: ${missing.join(', ')}`, 'error');
+          return;
+        }
+        await saveCurrentStep(wrapper, entry, true);
+
+        if (isLast) {
+          // Persist and complete
+          try {
+            await this.db.saveAppData(this.currentApp.id, this.data);
+            close();
+            const state = CompositeEntityHelper.getCompletionState(item, slot);
+            if (state === 'complete') {
+              this.confirmDot(item.ID);
+              this.showNotification?.('✅ All steps complete!', 'success');
+            } else {
+              this.markDotAsPartial(item.ID);
+            }
+            onComplete?.(item);
+          } catch (err) {
+            this.showNotification?.('❌ Failed to save: ' + err.message, 'error');
+          }
+        } else {
+          currentStep++;
+          await render();
+        }
+      };
+      actions.appendChild(nextBtn);
+      modal.appendChild(actions);
+    };
+
+    const saveCurrentStep = async (wrapper, entry, persist) => {
+      if (!item._composite) item._composite = {};
+      if (entry.multiple) {
+        item._composite[entry.name] = wrapper._entries || [];
+      } else {
+        item._composite[entry.name] = this._collectCompositeSubFormData(wrapper);
+      }
+      // Update partial badge without full confirm
+      const state = CompositeEntityHelper.getCompletionState(item, slot);
+      if (state === 'partial') this.markDotAsPartial(item.ID);
+      if (persist && state !== 'complete') {
+        try { await this.db.saveAppData(this.currentApp.id, this.data); } catch(e) {}
+      }
+    };
+
+    await render();
+  };
+
+  /* ----------------------------------------------------------
+     Helper: wrap a sub-form section with "+ Add" / list controls
+     for multiple-entry entities.
+     ---------------------------------------------------------- */
+  SchemaOrchestrator.prototype._wrapMultipleSection = function(wrapper, entityName, entries) {
+    // List of added entries
+    const listEl = document.createElement('div');
+    listEl.className = 'composite-list-items';
+
+    const refreshList = () => {
+      listEl.innerHTML = '';
+      entries.forEach((entry, i) => {
+        const row = document.createElement('div');
+        row.className = 'composite-list-item';
+        row.innerHTML = `<span>${entry.name || entry.dotLabel || JSON.stringify(entry).substring(0, 40)}</span>`;
+        const removeBtn = document.createElement('button');
+        removeBtn.textContent = '×';
+        removeBtn.onclick = () => { entries.splice(i, 1); refreshList(); };
+        row.appendChild(removeBtn);
+        listEl.appendChild(row);
+      });
+    };
+    refreshList();
+    wrapper.appendChild(listEl);
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'composite-btn primary';
+    addBtn.style.fontSize = '13px';
+    addBtn.style.padding = '6px 14px';
+    addBtn.textContent = '+ Add entry';
+    addBtn.onclick = () => {
+      // Collect current input values as a new entry
+      const data = this._collectCompositeSubFormData(wrapper);
+      if (Object.values(data).some(v => v && v !== false)) {
+        entries.push(data);
+        // Clear inputs for next entry
+        wrapper.querySelectorAll('input:not([type=checkbox]), textarea, select').forEach(el => el.value = '');
+        wrapper.querySelectorAll('input[type=checkbox]').forEach(el => el.checked = false);
+        refreshList();
+      }
+    };
+    wrapper.appendChild(addBtn);
+  };
+
+ 
+  /* ----------------------------------------------------------
+     Patch: render — add composite state badges to newly rendered dots
+     ---------------------------------------------------------- */
+  const _origRender = SchemaOrchestrator.prototype.render;
+  SchemaOrchestrator.prototype.render = function() {
+    const result = _origRender.call(this);
+    // After render, stamp composite badges on dots
+    setTimeout(() => this._stampCompositeBadges(), 120);
+    return result;
+  };
+
+  SchemaOrchestrator.prototype._stampCompositeBadges = function() {
+    if (!this.currentApp) return;
+    const level = this.currentPath.length;
+    const slot = this.currentApp.hierarchy?.[level];
+    if (!slot || !CompositeEntityHelper.isComposite(slot)) return;
+
+    injectCompositeCSS();
+
+    document.querySelectorAll('.dot').forEach(dotEl => {
+      const item = dotEl.itemData;
+      if (!item) return;
+
+      // Remove old badges
+      dotEl.querySelectorAll('.dot-composite-badge').forEach(b => b.remove());
+
+      const state = CompositeEntityHelper.getCompletionState(item, slot);
+
+      const badge = document.createElement('span');
+      badge.className = 'dot-composite-badge ' + slot.type;
+      badge.title = `${slot.type} composite — ${state}`;
+      badge.textContent = slot.type === 'sequential' ? '⋯' : '⊕';
+
+      if (state === 'partial') {
+        badge.classList.add('partial');
+        dotEl.classList.add('dot-partial');
+        dotEl.classList.remove('dot-pending');
+        badge.textContent = '!';
+      } else if (state === 'empty') {
+        dotEl.classList.add('dot-pending');
+        dotEl.classList.remove('dot-partial');
+      } else {
+        dotEl.classList.remove('dot-pending', 'dot-partial');
+      }
+
+      dotEl.style.position = 'relative';
+      dotEl.appendChild(badge);
+    });
+  };
+
+  /* ----------------------------------------------------------
+     Expose helpers on window for external use / schema building
+     ---------------------------------------------------------- */
+  window.CompositeEntityHelper = CompositeEntityHelper;
+
+  console.log('[CompositeEntityExtension] loaded — sequential & parallel composite entities enabled');
+  
+  /**
+    * Create the center add button.
+    * Call this once in your render method and position at canvas center.
+    */
+   SchemaOrchestrator.prototype._createAddButton = function(onClickCallback) {
+
+       // Inject CSS once
+       if (!document.getElementById('add-btn-styles')) {
+           var style = document.createElement('style');
+           style.id = 'add-btn-styles';
+           style.textContent = [
+               '.orb-add-btn {',
+               '    position: absolute;',
+               '    width: 56px;',
+               '    height: 56px;',
+               '    border-radius: 50%;',
+               '    cursor: pointer;',
+               '    display: flex;',
+               '    align-items: center;',
+               '    justify-content: center;',
+               '    transform: translate(-50%, -50%);',
+               '    background: rgba(255,255,255,0.75);',
+               '    backdrop-filter: blur(8px);',
+               '    -webkit-backdrop-filter: blur(8px);',
+               '    border: 1.5px solid rgba(108,92,231,0.25);',
+               '    box-shadow:',
+               '        0 4px 16px rgba(108,92,231,0.12),',
+               '        0 1px 4px rgba(0,0,0,0.06),',
+               '        inset 0 1px 0 rgba(255,255,255,0.9);',
+               '    transition:',
+               '        box-shadow 0.25s ease,',
+               '        border-color 0.25s ease,',
+               '        background 0.25s ease,',
+               '        transform 0.25s ease;',
+               '    z-index: 10;',
+               '}',
+               '.orb-add-btn:hover {',
+               '    background: rgba(255,255,255,0.92);',
+               '    border-color: rgba(108,92,231,0.55);',
+               '    box-shadow:',
+               '        0 6px 24px rgba(108,92,231,0.22),',
+               '        0 2px 8px rgba(0,0,0,0.08),',
+               '        inset 0 1px 0 rgba(255,255,255,1.0);',
+               '    transform: translate(-50%, -50%) scale(1.08);',
+               '}',
+               '.orb-add-btn:active {',
+               '    transform: translate(-50%, -50%) scale(0.96);',
+               '    box-shadow:',
+               '        0 2px 8px rgba(108,92,231,0.15),',
+               '        inset 0 1px 0 rgba(255,255,255,0.9);',
+               '}',
+               '.orb-add-icon {',
+               '    width: 16px;',
+               '    height: 16px;',
+               '    position: relative;',
+               '    transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);',
+               '}',
+               '.orb-add-btn:hover .orb-add-icon {',
+               '    transform: rotate(90deg);',
+               '}',
+               '.orb-add-icon::before,',
+               '.orb-add-icon::after {',
+               '    content: "";',
+               '    position: absolute;',
+               '    background: #6c5ce7;',
+               '    border-radius: 2px;',
+               '    transition: background 0.2s ease;',
+               '}',
+               '.orb-add-icon::before {',
+               '    width: 2px;',
+               '    height: 16px;',
+               '    left: 7px;',
+               '    top: 0;',
+               '}',
+               '.orb-add-icon::after {',
+               '    width: 16px;',
+               '    height: 2px;',
+               '    left: 0;',
+               '    top: 7px;',
+               '}',
+               // Pulse ring animation
+               '.orb-add-ring {',
+               '    position: absolute;',
+               '    width: 56px;',
+               '    height: 56px;',
+               '    border-radius: 50%;',
+               '    border: 1.5px solid rgba(108,92,231,0.35);',
+               '    transform: translate(-50%, -50%) scale(1);',
+               '    opacity: 0;',
+               '    pointer-events: none;',
+               '    z-index: 9;',
+               '    transition: none;',
+               '}',
+               '.orb-add-btn:hover ~ .orb-add-ring {',
+               '    animation: orb-ring-pulse 1.2s ease-out infinite;',
+               '}',
+               '@keyframes orb-ring-pulse {',
+               '    0%   { transform: translate(-50%,-50%) scale(1);   opacity: 0.7; }',
+               '    100% { transform: translate(-50%,-50%) scale(2.2); opacity: 0;   }',
+               '}'
+           ].join('\n');
+           document.head.appendChild(style);
+       }
+
+       // Wrapper so ring can be a sibling of the button
+       var wrapper = document.createElement('div');
+       wrapper.style.cssText = 'position:absolute; width:0; height:0;';
+
+       var btn = document.createElement('div');
+       btn.className = 'orb-add-btn';
+       btn.setAttribute('title', 'Add item');
+
+       var icon = document.createElement('div');
+       icon.className = 'orb-add-icon';
+       btn.appendChild(icon);
+
+       var ring = document.createElement('div');
+       ring.className = 'orb-add-ring';
+
+       wrapper.appendChild(btn);
+       wrapper.appendChild(ring);
+
+       btn.addEventListener('click', function(e) {
+           e.stopPropagation();
+           if (typeof onClickCallback === 'function') onClickCallback(e);
+       });
+
+       return wrapper;
+   };
+   
+   // ─────────────────────────────────────────────
+    // DATA MAP — add these methods to SchemaOrchestrator
+    // Generic — works for any app, no inventory-specific code
+    // ─────────────────────────────────────────────
+
+    SchemaOrchestrator.prototype._showDataMap = function(anchorEl) {
+        var self = this;
+        var isMobile = window.innerWidth < 768;
+
+        // Toggle off if already open
+        var existing = document.getElementById('data-map-popup');
+        if (existing) { existing.remove(); return; }
+
+        var tree = self._buildMapTree();
+        if (!tree || !tree.length) return;
+
+        var popup = document.createElement('div');
+        popup.id = 'data-map-popup';
+
+        if (isMobile) {
+            popup.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:20000; display:flex; align-items:center; justify-content:center;';
+            popup.addEventListener('click', function(e) {
+                if (e.target === popup) popup.remove();
+            });
+        } else {
+            var anchorRect = anchorEl.getBoundingClientRect();
+            popup.style.cssText = 'position:fixed; left:' + anchorRect.left + 'px; top:' + (anchorRect.bottom + 8) + 'px;' +
+                'background:white; border-radius:12px; padding:16px 12px 12px 12px;' +
+                'box-shadow:0 8px 32px rgba(0,0,0,0.18); z-index:20000;' +
+                'border:1px solid #eee; max-width:90vw; overflow:hidden;';
+
+            setTimeout(function() {
+                document.addEventListener('click', function outsideHandler(e) {
+                    if (!popup.contains(e.target) && e.target !== anchorEl) {
+                        popup.remove();
+                        document.removeEventListener('click', outsideHandler);
+                    }
+                });
+            }, 100);
+        }
+
+        var card = isMobile ? document.createElement('div') : popup;
+        if (isMobile) {
+            card.style.cssText = 'background:white; border-radius:16px; padding:16px 12px 12px 12px; width:94vw; max-height:88vh; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,0.3);';
+            popup.appendChild(card);
+        }
+
+        var header = document.createElement('div');
+        header.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;';
+        header.innerHTML = '<span style="font-size:11px; font-weight:700; color:#b2bec3; letter-spacing:1px;">DATA MAP</span>';
+        if (isMobile) {
+            var closeBtn = document.createElement('button');
+            closeBtn.textContent = '✕';
+            closeBtn.style.cssText = 'background:none; border:none; font-size:16px; cursor:pointer; color:#636e72;';
+            closeBtn.onclick = function() { popup.remove(); };
+            header.appendChild(closeBtn);
+        }
+        card.appendChild(header);
+
+        var scrollWrap = document.createElement('div');
+        scrollWrap.style.cssText = 'overflow-x:auto; overflow-y:auto; max-height:' + (isMobile ? '78vh' : '420px') + ';';
+        card.appendChild(scrollWrap);
+
+        self._renderMapCanvas(scrollWrap, tree, isMobile, popup);
+
+        document.body.appendChild(popup);
+    };
+
+    SchemaOrchestrator.prototype._renderMapCanvas = function(container, tree, isMobile, popup) {
+        var self = this;
+
+        var NODE_R = 5;
+        var COL_W = 90;
+        var ROW_H = 28;
+        var PAD_X = 16;
+        var PAD_Y = 16;
+        var LABEL_H = 14;
+        var TOOLTIP_DELAY = 300;
+
+        var pathIds = {};
+        for (var pi = 0; pi < self.currentPath.length; pi++) {
+            pathIds[self.currentPath[pi].id] = true;
+            if (self.currentPath[pi].displayID) pathIds[self.currentPath[pi].displayID] = true;
+        }
+        var currentId = self.currentPath.length > 0
+            ? self.currentPath[self.currentPath.length - 1].id
+            : null;
+
+        var allNodes = [];
+        var rowCounter = { val: 0 };
+
+        var assignPositions = function(node, depth, parentNode) {
+            node.col = depth;
+            node.parentNode = parentNode || null;
+
+            if (!node.children || !node.children.length || !node._expanded) {
+                node.row = rowCounter.val;
+                rowCounter.val++;
+                allNodes.push(node);
+                return;
+            }
+
+            var firstRow = rowCounter.val;
+            allNodes.push(node);
+
+            for (var i = 0; i < node.children.length; i++) {
+                assignPositions(node.children[i], depth + 1, node);
+            }
+
+            var lastRow = rowCounter.val - 1;
+            node.row = (firstRow + lastRow) / 2;
+        };
+
+        var markExpanded = function(nodes, depth) {
+            for (var i = 0; i < nodes.length; i++) {
+                var node = nodes[i];
+                node._expanded = (depth === 0) || !!(pathIds[node.id] || pathIds[node.displayID]);
+                if (node.children && node.children.length) {
+                    markExpanded(node.children, depth + 1);
+                }
+            }
+        };
+
+        markExpanded(tree, 0);
+
+        var layoutTree = function() {
+            allNodes = [];
+            rowCounter.val = 0;
+            for (var i = 0; i < tree.length; i++) {
+                assignPositions(tree[i], 0, null);
+            }
+        };
+
+        layoutTree();
+
+        var maxCol = 0;
+        var maxRow = 0;
+        for (var ni = 0; ni < allNodes.length; ni++) {
+            if (allNodes[ni].col > maxCol) maxCol = allNodes[ni].col;
+            if (allNodes[ni].row > maxRow) maxRow = allNodes[ni].row;
+        }
+
+        var canvasW = PAD_X * 2 + (maxCol + 1) * COL_W;
+        var canvasH = PAD_Y * 2 + (maxRow + 1) * ROW_H + LABEL_H;
+
+        var canvas = document.createElement('canvas');
+        var dpr = window.devicePixelRatio || 1;
+        canvas.width = canvasW * dpr;
+        canvas.height = canvasH * dpr;
+        canvas.style.width = canvasW + 'px';
+        canvas.style.height = canvasH + 'px';
+        canvas.style.display = 'block';
+        container.appendChild(canvas);
+
+        var ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+
+        var nodeX = function(node) { return PAD_X + node.col * COL_W + NODE_R * 2; };
+        var nodeY = function(node) { return PAD_Y + node.row * ROW_H; };
+
+        var isInPath = function(node) {
+            return !!(pathIds[node.id] || pathIds[node.displayID]);
+        };
+
+        var isCurrentNode = function(node) {
+            return node.id === currentId || node.displayID === currentId;
+        };
+
+        var redraw = function() {
+            ctx.clearRect(0, 0, canvasW, canvasH);
+
+            // Pass 1: lines
+            for (var i = 0; i < allNodes.length; i++) {
+                var node = allNodes[i];
+                if (!node._expanded || !node.children || !node.children.length) continue;
+
+                var px = nodeX(node);
+                var py = nodeY(node);
+
+                for (var ci = 0; ci < node.children.length; ci++) {
+                    var child = node.children[ci];
+                    if (allNodes.indexOf(child) === -1) continue;
+
+                    var cx = nodeX(child);
+                    var cy = nodeY(child);
+                    var onPath = isInPath(node) && isInPath(child);
+
+                    ctx.beginPath();
+                    ctx.strokeStyle = onPath ? '#6c5ce7' : '#e0e0e0';
+                    ctx.lineWidth = onPath ? 2 : 1;
+                    var midX = (px + cx) / 2;
+                    ctx.moveTo(px + NODE_R, py);
+                    ctx.bezierCurveTo(midX, py, midX, cy, cx - NODE_R, cy);
+                    ctx.stroke();
+                }
+            }
+
+            // Pass 2: nodes
+            for (var j = 0; j < allNodes.length; j++) {
+                var n = allNodes[j];
+                var nx = nodeX(n);
+                var ny = nodeY(n);
+                var inPath = isInPath(n);
+                var isCurrent = isCurrentNode(n);
+
+                // Highlight box for current node
+                if (isCurrent) {
+                    ctx.beginPath();
+                    var boxPad = 4;
+                    var labelWidth = ctx.measureText(n.dotLabel || n.name.substring(0, 6)).width + 8;
+                    var boxW = Math.max(labelWidth, NODE_R * 2 + boxPad * 2);
+                    var boxH = NODE_R * 2 + LABEL_H + boxPad * 2;
+                    var boxX = nx - NODE_R - boxPad;
+                    var boxY = ny - NODE_R - boxPad;
+                    var br = 6;
+                    ctx.moveTo(boxX + br, boxY);
+                    ctx.lineTo(boxX + boxW - br, boxY);
+                    ctx.quadraticCurveTo(boxX + boxW, boxY, boxX + boxW, boxY + br);
+                    ctx.lineTo(boxX + boxW, boxY + boxH - br);
+                    ctx.quadraticCurveTo(boxX + boxW, boxY + boxH, boxX + boxW - br, boxY + boxH);
+                    ctx.lineTo(boxX + br, boxY + boxH);
+                    ctx.quadraticCurveTo(boxX, boxY + boxH, boxX, boxY + boxH - br);
+                    ctx.lineTo(boxX, boxY + br);
+                    ctx.quadraticCurveTo(boxX, boxY, boxX + br, boxY);
+                    ctx.closePath();
+                    ctx.fillStyle = 'rgba(108, 92, 231, 0.08)';
+                    ctx.fill();
+                    ctx.strokeStyle = '#6c5ce7';
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+                }
+
+                // Node circle
+                ctx.beginPath();
+                ctx.arc(nx, ny, NODE_R, 0, Math.PI * 2);
+                ctx.fillStyle = isCurrent ? '#6c5ce7' : (inPath ? n.urgencyColor : _mapDimColor(n.urgencyColor));
+                ctx.fill();
+
+                // +/- expand indicator
+                if (n.children && n.children.length > 0) {
+                    ctx.beginPath();
+                    ctx.arc(nx + NODE_R + 3, ny - NODE_R - 1, 4, 0, Math.PI * 2);
+                    ctx.fillStyle = '#f0f0f0';
+                    ctx.fill();
+                    ctx.strokeStyle = '#b2bec3';
+                    ctx.lineWidth = 0.5;
+                    ctx.stroke();
+                    ctx.fillStyle = '#636e72';
+                    ctx.font = '8px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(n._expanded ? '−' : '+', nx + NODE_R + 3, ny - NODE_R - 1);
+                }
+
+                // Label
+                ctx.font = isCurrent ? 'bold 9px sans-serif' : '9px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                ctx.fillStyle = isCurrent ? '#6c5ce7' : (inPath ? '#2d3436' : '#b2bec3');
+                var label = n.dotLabel || (n.name ? n.name.substring(0, 5) : '?');
+                ctx.fillText(label, nx, ny + NODE_R + 3);
+            }
+        };
+
+        redraw();
+
+        // ── Scroll to current node ──
+        var currentNode = null;
+        for (var si = 0; si < allNodes.length; si++) {
+            if (isCurrentNode(allNodes[si])) {
+                currentNode = allNodes[si];
+                break;
+            }
+        }
+        if (currentNode) {
+            var targetY = nodeY(currentNode);
+            var containerHeight = container.clientHeight || 420;
+            setTimeout(function() {
+                container.scrollTop = targetY - containerHeight / 2;
+            }, 50);
+        }
+
+        // ── Resize and redraw on expand/collapse ──
+        var resizeAndRedraw = function() {
+            allNodes = [];
+            rowCounter.val = 0;
+            layoutTree();
+
+            var newMaxCol = 0;
+            var newMaxRow = 0;
+            for (var i = 0; i < allNodes.length; i++) {
+                if (allNodes[i].col > newMaxCol) newMaxCol = allNodes[i].col;
+                if (allNodes[i].row > newMaxRow) newMaxRow = allNodes[i].row;
+            }
+
+            canvasW = PAD_X * 2 + (newMaxCol + 1) * COL_W;
+            canvasH = PAD_Y * 2 + (newMaxRow + 1) * ROW_H + LABEL_H;
+            canvas.width = canvasW * dpr;
+            canvas.height = canvasH * dpr;
+            canvas.style.width = canvasW + 'px';
+            canvas.style.height = canvasH + 'px';
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.scale(dpr, dpr);
+            redraw();
+        };
+
+        // ── Click handler ──
+        canvas.addEventListener('click', function(e) {
+            var rect = canvas.getBoundingClientRect();
+            var mx = e.clientX - rect.left;
+            var my = e.clientY - rect.top;
+
+            for (var i = 0; i < allNodes.length; i++) {
+                var n = allNodes[i];
+                var nx = nodeX(n);
+                var ny = nodeY(n);
+
+                // +/- toggle
+                if (n.children && n.children.length > 0) {
+                    var bx = nx + NODE_R + 3;
+                    var by = ny - NODE_R - 1;
+                    if (Math.abs(mx - bx) < 6 && Math.abs(my - by) < 6) {
+                        n._expanded = !n._expanded;
+                        resizeAndRedraw();
+                        return;
+                    }
+                }
+
+                // Node click — navigate
+                var dist = Math.sqrt(Math.pow(mx - nx, 2) + Math.pow(my - ny, 2));
+                if (dist <= NODE_R + 4) {
+                    popup.remove();
+                    self._navigateToMapNode(n);
+                    return;
+                }
+            }
+        });
+
+        // ── Tooltip ──
+        var tooltipEl = document.createElement('div');
+        tooltipEl.style.cssText = 'position:fixed; background:#2d3436; color:white; font-size:11px; padding:4px 8px; border-radius:6px; pointer-events:none; opacity:0; transition:opacity 0.15s; z-index:20001; white-space:nowrap;';
+        document.body.appendChild(tooltipEl);
+
+        var tooltipTimer;
+        canvas.addEventListener('mousemove', function(e) {
+            var rect = canvas.getBoundingClientRect();
+            var mx = e.clientX - rect.left;
+            var my = e.clientY - rect.top;
+            clearTimeout(tooltipTimer);
+            var found = false;
+
+            for (var i = 0; i < allNodes.length; i++) {
+                var n = allNodes[i];
+                var nx = nodeX(n);
+                var ny = nodeY(n);
+                var dist = Math.sqrt(Math.pow(mx - nx, 2) + Math.pow(my - ny, 2));
+
+                if (dist <= NODE_R + 6) {
+                    found = true;
+                    canvas.style.cursor = 'pointer';
+                    tooltipTimer = setTimeout(function(name, ex, ey) {
+                        tooltipEl.textContent = name;
+                        tooltipEl.style.left = (ex + 12) + 'px';
+                        tooltipEl.style.top = (ey - 20) + 'px';
+                        tooltipEl.style.opacity = '1';
+                    }.bind(null, n.name, e.clientX, e.clientY), TOOLTIP_DELAY);
+                    break;
+                }
+
+                if (n.children && n.children.length > 0) {
+                    var bx = nx + NODE_R + 3;
+                    var by = ny - NODE_R - 1;
+                    if (Math.abs(mx - bx) < 8 && Math.abs(my - by) < 8) {
+                        found = true;
+                        canvas.style.cursor = 'pointer';
+                        break;
+                    }
+                }
+            }
+
+            if (!found) {
+                canvas.style.cursor = 'default';
+                tooltipEl.style.opacity = '0';
+            }
+        });
+
+        canvas.addEventListener('mouseleave', function() {
+            clearTimeout(tooltipTimer);
+            tooltipEl.style.opacity = '0';
+            canvas.style.cursor = 'default';
+        });
+
+        // Clean up tooltip on popup close
+        var observer = new MutationObserver(function() {
+            if (!document.getElementById('data-map-popup')) {
+                tooltipEl.remove();
+                observer.disconnect();
+            }
+        });
+        observer.observe(document.body, { childList: true });
+    };
+
+    // Private helper — dim a hex color by mixing with white at 70%
+    // Named _mapDimColor to avoid conflicts with other utilities
+    function _mapDimColor(hex) {
+        if (!hex || hex[0] !== '#') return '#e0e0e0';
+        var r = parseInt(hex.slice(1, 3), 16);
+        var g = parseInt(hex.slice(3, 5), 16);
+        var b = parseInt(hex.slice(5, 7), 16);
+        r = Math.round(r * 0.3 + 255 * 0.7);
+        g = Math.round(g * 0.3 + 255 * 0.7);
+        b = Math.round(b * 0.3 + 255 * 0.7);
+        return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }
+
+    SchemaOrchestrator.prototype._buildMapTree = function() {
+        var self = this;
+        if (!self.data || !self.data.items) return null;
+
+        var hierarchy = self.currentApp.hierarchy;
+        var entityConfigs = self.currentApp.entityConfigs;
+
+        var pathIds = {};
+        for (var pi = 0; pi < self.currentPath.length; pi++) {
+            pathIds[self.currentPath[pi].id] = true;
+            if (self.currentPath[pi].displayID) pathIds[self.currentPath[pi].displayID] = true;
+        }
+
+        var buildNode = function(item, entityType, depth) {
+            if (depth > 5) return null;
+
+            var config = entityConfigs[entityType];
+            var childrenField = config && config.childrenField;
+            var childEntityType = config && config.childEntity;
+            var children = [];
+
+            if (childrenField && childEntityType && item[childrenField]) {
+                var childItems = item[childrenField];
+                for (var i = 0; i < childItems.length; i++) {
+                    var childNode = buildNode(childItems[i], childEntityType, depth + 1);
+                    if (childNode) children.push(childNode);
+                }
+            }
+
+            return {
+                id: item.ID,
+                displayID: item.displayID,
+                name: item.name || item.dotLabel || item.ID,
+                dotLabel: item.dotLabel || (item.name ? item.name.substring(0, 5) : '?'),
+                entityType: entityType,
+                depth: depth,
+                urgencyColor: self._getMapNodeColor(item, entityType),
+                children: children,
+                _expanded: false,
+                rawItem: item
+            };
+        };
+
+        var roots = [];
+        for (var i = 0; i < self.data.items.length; i++) {
+            var node = buildNode(self.data.items[i], hierarchy[0], 0);
+            if (node) roots.push(node);
+        }
+
+        return roots;
+    };
+
+    SchemaOrchestrator.prototype._getMapNodeColor = function(item, entityType) {
+        var self = this;
+        var entityConfig = self.currentApp && self.currentApp.entityConfigs[entityType];
+        var sortConfig = entityConfig && entityConfig.sortConfig;
+
+        if (!sortConfig || !sortConfig.urgencyMode) return '#a29bfe';
+
+        var scoreField = sortConfig.type === 'field'
+            ? sortConfig.scoreField
+            : sortConfig.aggregateField;
+
+        if (!scoreField) return '#a29bfe';
+
+        var value = null;
+        if (sortConfig.type === 'field') {
+            value = parseFloat(item[scoreField]);
+        } else {
+            var childrenField = entityConfig.childrenField;
+            var children = childrenField && item[childrenField];
+            if (children && children.length > 0) {
+                var values = [];
+                for (var i = 0; i < children.length; i++) {
+                    values.push(parseFloat(children[i][scoreField]) || 0);
+                }
+                if (sortConfig.aggregateFunction === 'min') {
+                    value = Math.min.apply(null, values);
+                } else if (sortConfig.aggregateFunction === 'max') {
+                    value = Math.max.apply(null, values);
+                } else {
+                    value = values.reduce(function(a, b) { return a + b; }, 0);
+                }
+            }
+        }
+
+        if (value === null || isNaN(value)) return '#b2bec3';
+
+        var threshold = parseFloat(item[sortConfig.alertThresholdField]) || 0;
+        if (value === 0) return '#e53935';
+        if (threshold && value <= threshold) return '#ffa726';
+        return '#43a047';
+    };
+
+	SchemaOrchestrator.prototype._navigateToMapNode = function(node) {
+	    var self = this;
+	    var targetPath = self._findPathToNode(node.id, node.displayID);
+	    if (!targetPath || !targetPath.length) return;
+
+	    // ✅ Set currentPath to full path INCLUDING target node
+	    self.currentPath = targetPath;
+	    self.render();
+	};	
+
+    SchemaOrchestrator.prototype._findPathToNode = function(targetId, targetDisplayId) {
+        var self = this;
+        var hierarchy = self.currentApp.hierarchy;
+        var entityConfigs = self.currentApp.entityConfigs;
+        var result = [];
+
+        var search = function(items, entityType, pathSoFar) {
+            for (var i = 0; i < items.length; i++) {
+                var item = items[i];
+                var newPath = pathSoFar.concat([{
+                    id: item.ID,
+                    displayID: item.displayID,
+                    name: item.name || item.dotLabel
+                }]);
+
+                if (item.ID === targetId || item.displayID === targetDisplayId) {
+                    result = newPath;
+                    return true;
+                }
+
+                var config = entityConfigs[entityType];
+                var childrenField = config && config.childrenField;
+                var childEntityType = config && config.childEntity;
+
+                if (childrenField && childEntityType && item[childrenField]) {
+                    if (search(item[childrenField], childEntityType, newPath)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        if (self.data && self.data.items) {
+            search(self.data.items, hierarchy[0], []);
+        }
+
+        return result;
+    };
+    
+
+})();

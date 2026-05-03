@@ -32,6 +32,9 @@ let maxPage;
 let minPage = 0; // First available page
 let scrollTimer;
 
+let SSEerrorCount = 0; 
+const SSEmaxErrors = 5;
+
 var addpostfunction = function(evt) {
 	return posttoflakemodal(event);
 };
@@ -164,7 +167,8 @@ function cleanString(str) {
 			.replace(/[?]/g, '') // Remove question marks
 			.replace(/\\+/g, '\\') // Replace multiple backslashes with a single backslash
 			.replace(/\.+/g, '.') // Replace multiple periods with a single period
-			.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$|(?<=\s)[^a-zA-Z0-9]+(?=\s)/g, ''); // Clear text without letters or numbers
+			.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "") // Trim boundaries
+			.replace(/\s[^a-zA-Z0-9]+\s/g, " ");           // Clean middle (no lookbehind)
 }
 
 function topicdocumentclick(e) {
@@ -198,7 +202,8 @@ function topicdocumentclick(e) {
 				elemstoremove[0].classList.remove('expand-open');
 
 				setTimeout(function() {
-					removediv(elemstoremove[0]);
+					//console.log('removing popup ' + elemstoremove[0].id + ' counter ' + counter);
+					//removediv(elemstoremove[0]);
 				}, 400);
 
 				counter--;
@@ -275,7 +280,25 @@ function displayemptypostsmessage() {
 
 function displaypostsasdots(inposts, justadded, filter, startingdot) { // 
 	//console.log(inposts);
+	console.log('[displaypostsasdots] called at', new Date().toISOString(), 'with', inposts.length, 'posts');
+	
+	// Add this helper above the filter block
+	function matchesTimeFilter(dotValue, filterValue) {
+	    if (!dotValue || !filterValue) return false;
+	    // "5/4 AMC" matches filter "5/4"
+	    return dotValue.split(' ')[0].trim() === filterValue.split(' ')[0].trim();
+	}
 
+	function dotMatchesFilter(dot, filterValue, field) {
+	    // ✅ Use getAttribute — preserves original case
+	    var dotValue = dot.getAttribute('data-' + field) || 
+	                   dot.getAttribute('data-' + field.toLowerCase()) || '';
+	    
+	    if (field.toLowerCase() === 'time') {
+	        return dotValue.split(' ')[0].trim() === filterValue.split(' ')[0].trim();
+	    }
+	    return dotValue === filterValue;
+	}
 	//var colloc = new getcolorandlocationbasedondata("x");
 
 	dotsizemap = new Map();
@@ -293,13 +316,19 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 						if (filter.split(":::")[2] == 'ALL') {
 							existingdots[d].style.backgroundColor = existingdots[d].dataset["savedBgClr"];
 							scaledotsize(existingdots[d], 2);
-						} else if (existingdots[d].dataset[sortfield.toLowerCase()] != filter.split(":::")[2]) {
+						} else if (!dotMatchesFilter(existingdots[d], filter.split(":::")[2], sortfield)) {
 
 							existingdots[d].style.backgroundColor = '#f2f2f2';
 							scaledotsize(existingdots[d], 1);
 						}
 					}
 				} else { /// Click
+					
+					// Add right before the filter comparison in the Click branch:
+					console.log('dot dataset time:', existingdots[d].dataset['time'], 
+					            'filter value:', filter.split(":::")[1],
+					            'sortfield:', sortfield);
+								
 					if (filter.split(":::")[1] == 'ALL') {
 						existingdots[d].style.display = 'flex';
 						existingdots[d].style.justifyContent = 'center';
@@ -310,7 +339,7 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 							document.getElementById('dot-sidepanel-' + d).style.display = 'block';
 						}
 					} else if (filter.indexOf(sortfield + '::') >= 0 && typeof existingdots[d].dataset[sortfield.toLowerCase()] != 'undefined') {
-						if (existingdots[d].dataset[sortfield.toLowerCase()] != filter.split(":::")[1]) {
+						if (!dotMatchesFilter(existingdots[d], filter.split(":::")[1], sortfield)) {
 							existingdots[d].style.display = 'none';
 							if (document.getElementById('dot-sidepanel-' + d) != null) {
 								document.getElementById('dot-sidepanel-' + d).style.display = 'none';
@@ -342,6 +371,7 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 		}
 	}
 	console.log(inposts.length + ' justadded: ' + justadded + ' startingdot: ' + startingdot);
+	console.log('inposts 0:' + JSON.stringify(inposts[0]));
 	if (typeof justadded == 'undefined' || justadded == false)
 		postlocationmap = [];
 	else {
@@ -370,25 +400,33 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 
 	var areaperdot = ((window.innerWidth * window.innerHeight) - (Math.pow(minRadius * 2, 2))) / inposts.length;
 	maxdotsize = parseInt(Math.sqrt(areaperdot) / 4);
-	console.log('max dot size [theoretical] ' + maxdotsize + ' postlen ' + inposts.length);
+	//console.log('max dot size [theoretical] ' + maxdotsize + ' postlen ' + inposts.length);
 	//screenWidth = window.innerWidth || document.documentElement.clientWidth || document.body.clientWidth;
 	//screenHeight = window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight;
 
-	console.log('screenWidth screenHeight' + screenWidth + ' ' + screenHeight);
+	//console.log('screenWidth screenHeight' + screenWidth + ' ' + screenHeight);
 
 
 	if (maxdotsize > centerdotsize / 3) maxdotsize = centerdotsize / 3;
 
 
 	//	alert(window.screen.availHeight + ' ' + window.screen.availWidth + ' ' + startsize + ' ' + maxdotsize);
-	var cntnr = document.getElementById('topic-app');
+	var cntnr = document.getElementById('topic-page-id');
 	if (cntnr == null) {
 		cntnr = document.getElementById('app-flk');
 	}
 	var filtermatches = 0;
 	if (inposts != null) {
 
-		var colorandpositions = displayRadialText(inposts, false);
+		// 1. Compute positions once
+		var colorandpositions = displayRadialText(inposts, cntnr, {
+				    pageSize:          60,
+				    centerClearRadius: 80,
+				    bgDotSize:         5,
+					showPageIndicator: true 
+				});
+		
+		//console.log('displayRadialText OUTPUT:' + JSON.stringify(colorandpositions));
 
 		if (colorandpositions != null && colorandpositions.length > 0)
 			maxdotsize = colorandpositions[0].dotmaxsize;
@@ -465,6 +503,27 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 					dot.setAttribute('id', 'dot-' + i);
 				else
 					dot.setAttribute('id', 'sub-' + startingdot + '-' + i);
+				
+				if (typeof colorandpositions[i].dotLabel != 'undefined') {
+					
+					//  insert centered span as first child
+					var span = document.createElement('span');
+					span.style.position = 'absolute';
+					span.style.top = '0';
+					span.style.left = '0';
+					span.style.width = '100%';
+					span.style.height = '100%';
+					span.style.display = 'flex';
+					span.style.alignItems = 'center';
+					span.style.justifyContent = 'center';
+					span.style.zIndex = '8';
+					span.style.fontSize = '10px';
+					span.style.fontWeight = 'bold';
+					span.style.color = 'white';
+					span.style.pointerEvents = 'none';
+					span.textContent = colorandpositions[i].dotLabel;
+					dot.insertBefore(span, dot.firstChild);
+				}
 				//dot.setAttribute('draggable', true);
 				//dot.classList.add('dot');
 				dot.classList.add('circle-to-rect');
@@ -539,8 +598,23 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 
 				dot.setAttribute('data-long-press-delay', 500);
 
-				if (sortfield != null && sortvalues.length > 1 && typeof inposts[i].data[sortfield] != 'undefined') {
-					dot.setAttribute('data-' + sortfield, inposts[i].data[sortfield]);
+				var postData = inposts[i].data;
+				if (typeof postData === 'string') {
+				    try {
+				        postData = JSON.parse(postData);
+				    } catch(e) {
+				        postData = {};
+				    }
+				}
+				if (sortfield != null && sortvalues.length > 1 && 
+				    typeof postData !== 'undefined' && 
+				    typeof postData[sortfield] !== 'undefined') {
+
+				    var fieldValue = postData[sortfield];
+				    if (sortfield === 'Time') {
+				        fieldValue = fieldValue.split(' ')[0].trim(); // "5/4 AMC" → "5/4"
+				    }
+				    dot.setAttribute('data-' + sortfield, fieldValue);
 				}
 
 				let dotexpandtimer; // used to prevent jitters
@@ -781,8 +855,14 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 							circleToRect = document.getElementById('dot-' + idx);
 							//var rect = circleToRect.getBoundingClientRect();
 							console.log('came in  mouseout event on dot ' + idx + ' left ' + circleToRect.left + ' top ' + circleToRect.top + ' doexpand ' + doexpand);
-							if (doexpand) shrinkdot(circleToRect);
-							else {
+							if (doexpand) {
+								if (circleToRect.dataset.dotState === 'signaled' || 
+								    circleToRect.dataset.dotState === 'hovering' ||
+								    String(PriceMoves.getPinnedId()) === String(idx)) {
+								    return;
+								}
+								shrinkdot(circleToRect);
+							} else {
 								showpostdescription(e, idx, true);
 								removeDotConnections('dot-' + idx);	// remove any connections if exist
 							}
@@ -1074,6 +1154,20 @@ function displaypostsasdots(inposts, justadded, filter, startingdot) { //
 
 			}
 		}
+		
+		var scores = inposts.map(function(post) {
+		    return parseInt(post.hit || 0);
+		});
+
+		/*window.radialScroll = makeRadialScrollHandler(colorandpositions, cntnr, 60, {
+			minFgDotSize:      10,
+			bgDotSize:         4, 
+			showPageIndicator: true 
+			//,
+		   // scores:     scores
+		});*/
+
+
 
 		if (typeof filter != 'undefined' && filter.length > 0) {
 			if (filtermatches == 0) displaybuttonbehavior(null, 'No match found');
@@ -1636,6 +1730,8 @@ function increasesizesoftopdots() {
 		}
 
 	} else {
+		
+		if (posts.length > 30) return;
 
 		for (var x = 0; x < posts.length * 0.2; x++) {
 			//let index = rnd(0, maxdots-1);;	 
@@ -1850,6 +1946,8 @@ function expandDot(circleToRect, rect, autoplay) {
 		circleToRect.querySelector(".dot-popup").style.zIndex = '7';
 		copyicon.style.display = 'flex';
 	}
+	
+	circleToRect.dataset.expanded = 'true';
 
 }
 
@@ -1975,14 +2073,17 @@ function displayNoMoreDataMessage() {
 // END SCROLL HANDLING
 
 function shrinkdot(circletorect) {
+	console.log('shrinkdot called:', circletorect.id, 
+	               new Error().stack.split('\n').slice(1,4).join(' | '));
 
-	var rect;
+	var alreadyRestored = circletorect.dataset.dotState === 'normal';
 
-	if (typeof circletorect.savedRect != 'undefined')
-		rect = circletorect.savedRect;
-	else {
-		rect = circletorect.getBoundingClientRect();
-	}
+   var rect;
+   if (typeof circletorect.savedRect != 'undefined')
+       rect = circletorect.savedRect;
+   else
+       rect = circletorect.getBoundingClientRect();
+
 	const textContainer = circletorect.querySelector('.text-container');
 	var embimg = null;
 
@@ -2002,10 +2103,14 @@ function shrinkdot(circletorect) {
 	}
 
 	const evtreceiver = circletorect.querySelector('.concentric-square')
+	
+	if (!alreadyRestored) {
+        circletorect.style.top  = `${rect.top}px`;
+        circletorect.style.left = `${rect.left}px`;
+    }
 
 	circletorect.style.transition = 'all 0.5s cubic-bezier(.42,.97,.52,1.29)';
-	circletorect.style.top = `${rect.top}px`;
-	circletorect.style.left = `${rect.left}px`;
+	
 	//console.log('new left after mouseout : ' + circleToRect.style.left);
 	circletorect.style.bottom = '';
 	circletorect.style.right = '';
@@ -2013,12 +2118,14 @@ function shrinkdot(circletorect) {
 	circletorect.style.opacity = '';
 	circletorect.style.height = maxdotsize + 'px';
 
-	evtreceiver.style.width = maxdotsize + 'px';
-	evtreceiver.style.height = maxdotsize + 'px';
-	evtreceiver.style.top = '50%';
-	evtreceiver.style.left = '50%';
-	evtreceiver.style.transform = 'translate(-50%, -50%)';
-	evtreceiver.style.zIndex = 6;
+	if (evtreceiver != null) {
+		evtreceiver.style.width = maxdotsize + 'px';
+		evtreceiver.style.height = maxdotsize + 'px';
+		evtreceiver.style.top = '50%';
+		evtreceiver.style.left = '50%';
+		evtreceiver.style.transform = 'translate(-50%, -50%)';
+		evtreceiver.style.zIndex = 6;
+	}
 
 	circletorect.style.backgroundColor = circletorect.savedpastel;
 	circletorect.style.borderRadius = '50%';
@@ -2082,6 +2189,8 @@ function shrinkdot(circletorect) {
 		circletorect.querySelector(".dot-popup").style.zIndex = '4';
 		copyicon.style.display = 'none';
 	}
+	
+	circletorect.dataset.expanded = 'false';
 	
 }
 
@@ -2450,13 +2559,17 @@ function retrievepostsummaryandshowinpopup(info, idx, e, toggle, lft, tp, showal
 			info.crtime = info.crTime;
 	}
 
-	var url = '/newauth/api/getpostsummarybytopicandtime/' + btoa(info.topic) + '/' + info.crtime;
-	console.log('calling uriencoded url ' + url);
-	xhr.open('GET', url, false);
-	xhr.withCredentials = true;
-	xhr.setRequestHeader('Content-Type', 'application/json');
-
-	xhr.send(null);
+	if (info.crtime) {
+		var url = '/newauth/api/getpostsummarybytopicandtime/' + btoa(info.topic) + '/' + info.crtime;
+		console.log('calling uriencoded url ' + url);
+		xhr.open('GET', url, false);
+		xhr.withCredentials = true;
+		xhr.setRequestHeader('Content-Type', 'application/json');
+	
+		xhr.send(null);
+	} else {
+		console.warn('Post without crtime. Can not load summary '  + JSON.stringify(info));
+	}
 
 }
 
@@ -2761,7 +2874,7 @@ function createpopupdiv(info, idx, evt, toggle, lft, tp, showall) {
 				
 				displaysidepanel({
 							id: idx,
-							text: cleanString(dat.text),
+							data: dat,
 							sent: crtimediff,
 							views: info.hit,
 							comments: info.comments
@@ -3017,8 +3130,8 @@ function addcopylinktopopup(popupelem) {
   			  img.className = "img-icon";
   			  img.src = "/static/icons/copy-96.png";
   			  
-  			  img.style.width = "18px";
-  			  img.style.height = "18px";
+  			  img.style.width = "30px";
+  			  img.style.height = "30px";
   			  img.style.objectFit = "contain";
   			  img.style.display = "block";
   	
@@ -3033,8 +3146,8 @@ function addcopylinktopopup(popupelem) {
 	    color: "rgb(221, 221, 221)",
 	    cursor: "pointer",
 	    position: "absolute",
-	    width: "18px",
-	    height: "18px",
+	    width: "30px",
+	    height: "30px",
 	    fontSize: "18px",
 	    zIndex: "7",
 	    display: "none",
@@ -3048,15 +3161,38 @@ function addcopylinktopopup(popupelem) {
      // Match the open-icon's top position and offset the copy icon slightly to its left
      const openRight = parseInt(popupelem.querySelector(".open-icon").style.right || "10", 10);
 	 console.log('right value of open icon ' + openRight);
-     copyIcon.style.right = `${openRight + 24}px`; // space between icons
+     copyIcon.style.right = `${openRight + 24}px`; // space between icons 
    } else {
      // Fallback position if no open-icon found
      copyIcon.style.right = "10px";
    }
 
   // Add click handler for copying link text
-  copyIcon.addEventListener("click", () => {
-    alert('handle copy of dot.. ');
+  copyIcon.addEventListener("click", (e) => {
+    	e.stopPropagation();
+		let popupid = popupelem.id.split('-').pop();
+		let thispost = posts[parseInt(popupid)];
+		console.log('Copyig post ' + JSON.stringify(thispost));
+		console.log('text ' + thispost.data.text);
+		let isfolder = isdotafolder(thispost.tags);
+		
+		if (isfolder) {
+			document.getElementById('post-to-topic-select').style.display = 'none';
+			document.getElementById('post-topic-label').innerText = "Copy existing folder"
+		} else {
+			document.getElementById('create-sub-topic-select').style.display = 'none';
+			document.getElementById('post-topic-label').innerText = "Copy existing post"
+			document.getElementById('post-text-input').value = thispost.data.text;
+			
+			document.getElementById('post-text-input').addEventListener('input', () => {
+				document.getElementById('contentpostbtn').disabled = false;
+			});
+			
+			document.getElementById('contentpostbtn').disabled = true;
+		}
+		
+		posttotopicmodal(e,true, popupid);
+		
 	});
 
     popupelem.appendChild(copyIcon);
@@ -3240,292 +3376,645 @@ function extractVideoId(url) {
 	return match ? match[1] : null;
 }
 
+// Reusable debounce function
+function debounce(func, wait, options) {
+    options = options || {};
+    var timeout;
+    return function() {
+        var context = this;
+        var args = arguments;
+        var later = function() {
+            timeout = null;
+            if (!options.leading) {
+                func.apply(context, args);
+            }
+        };
+        var callNow = options.leading && !timeout;
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+        if (callNow) {
+            func.apply(context, args);
+        }
+    };
+}
+
+/**
+ * Filter divs by data attribute value
+ * @param {string|Element} container - CSS selector or DOM element containing the divs
+ * @param {string} dataAttr - The data attribute name (without 'data-' prefix)
+ * @param {string|number|function} filterValue - Value to match, or function for custom logic
+ * @param {string} matchType - 'exact' | 'contains' | 'startsWith' | 'endsWith' | 'regex' | 'function'
+ * @param {boolean} showMatching - If true, show matching + hide others; if false, hide matching + show others
+ */
+function filterDivsByDataAttribute(container, dataAttr, filterValue, matchType, showMatching) {
+    matchType = matchType || 'exact';
+    showMatching = showMatching !== false; // default: show matches
+    
+    // Resolve container
+    var root = typeof container === 'string' 
+        ? document.querySelector(container) 
+        : container;
+    
+    if (!root) {
+        console.warn('filterDivsByDataAttribute: container not found', container);
+        return;
+    }
+    
+    // Find all divs with the data attribute
+    var selector = 'div[data-' + dataAttr + ']';
+    var divs = root.querySelectorAll(selector);
+    
+    for (var i = 0; i < divs.length; i++) {
+        var div = divs[i];
+        var attrValue = div.getAttribute('data-' + dataAttr);
+        var shouldShow = false;
+        
+        // ── Matching Logic ──
+        if (matchType === 'function' && typeof filterValue === 'function') {
+            // Custom function: pass (attrValue, div) → return boolean
+            shouldShow = !!filterValue(attrValue, div);
+            
+        } else if (matchType === 'regex' && filterValue instanceof RegExp) {
+            shouldShow = filterValue.test(attrValue);
+            
+        } else if (matchType === 'contains') {
+            shouldShow = attrValue && attrValue.indexOf(String(filterValue)) !== -1;
+            
+        } else if (matchType === 'startsWith') {
+            shouldShow = attrValue && attrValue.indexOf(String(filterValue)) === 0;
+            
+        } else if (matchType === 'endsWith') {
+            shouldShow = attrValue && attrValue.slice(-String(filterValue).length) === String(filterValue);
+            
+        } else {
+            // Default: exact match (case-insensitive)
+            shouldShow = attrValue != null && String(attrValue).toLowerCase() === String(filterValue).toLowerCase();
+        }
+        
+        // ── Apply Visibility ──
+        if (showMatching) {
+            div.style.display = shouldShow ? '' : 'none';
+            // Optional: add fade transition
+            if (!shouldShow) {
+                div.style.opacity = '0';
+                div.style.pointerEvents = 'none';
+            } else {
+                div.style.opacity = '1';
+                div.style.pointerEvents = 'auto';
+            }
+        } else {
+            // Inverse: hide matches, show others
+            div.style.display = shouldShow ? 'none' : '';
+            if (shouldShow) {
+                div.style.opacity = '0';
+                div.style.pointerEvents = 'none';
+            } else {
+                div.style.opacity = '1';
+                div.style.pointerEvents = 'auto';
+            }
+        }
+    }
+}
+
+
+// ── Module level — outside displaysidepanel ──────────────
+var hoverTimers = {};
+
+function debounce(func, wait, options) {
+    options = options || {};
+    var timeout;
+    return function() {
+        var context = this;
+        var args = arguments;
+        var later = function() {
+            timeout = null;
+            if (!options.leading) func.apply(context, args);
+        };
+        var callNow = options.leading && !timeout;
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+        if (callNow) func.apply(context, args);
+    };
+}
+
+function createMouseOverHandler(div, obj) {
+    return function() {
+        var _dot = document.getElementById('dot-' + obj.id);
+        console.log('mouseover fired for', obj.id, 'dotState:', _dot ? _dot.dataset.dotState : 'element not found');
+
+        if (hoverTimers[obj.id]) clearTimeout(hoverTimers[obj.id]);
+        if (hoverTimers[obj.id + '_out']) {
+            clearTimeout(hoverTimers[obj.id + '_out']);
+            delete hoverTimers[obj.id + '_out'];
+        }
+
+        if (PriceMoves.getPinnedId() !== null &&
+            String(PriceMoves.getPinnedId()) === String(obj.id)) {
+            console.log('BLOCKED: pinned', PriceMoves.getPinnedId(), obj.id);
+            return;
+        }
+
+        // Show hint immediately
+        var hint = div.querySelector('.signal-hint');
+        if (hint) hint.style.display = 'block';
+
+        hoverTimers[obj.id] = setTimeout(function() {
+            var dotElement = document.getElementById('dot-' + obj.id);
+            if (!dotElement) return;
+
+            var state = dotElement.dataset.dotState;
+            if (state === 'hovering' || state === 'signaled') return;
+
+            PriceMoves.saveDotState(dotElement, dotElement.id);
+            dotElement.dataset.dotState = 'hovering';
+
+            PriceMoves.smartExpand(dotElement, function() {
+                dotElement.classList.add('dot-expanding');
+                setTimeout(function() { dotElement.classList.remove('dot-expanding'); }, 300);
+
+                if (dotElement.dataset.signalCached === 'true') {
+                    dotElement.style.background = '#ffffff';
+                    dotElement.innerHTML = dotElement.dataset.signalHTML;
+                    PriceMoves.addCloseButton(dotElement);
+                } else {
+                    PriceMoves.showBasicPopup(dotElement);
+                }
+            });
+
+        }, 500);
+    };
+}
+
+function createMouseOutHandler(div, obj) {
+    return function() {
+        var dotElement = document.getElementById('dot-' + obj.id);
+        if (!dotElement) return;
+
+        if (hoverTimers[obj.id]) {
+            clearTimeout(hoverTimers[obj.id]);
+            delete hoverTimers[obj.id];
+        }
+        if (hoverTimers[obj.id + '_out']) {
+            clearTimeout(hoverTimers[obj.id + '_out']);
+            delete hoverTimers[obj.id + '_out'];
+        }
+
+        // Hide hint
+        var hint = div.querySelector('.signal-hint');
+        if (hint) hint.style.display = 'none';
+
+        if (PriceMoves.getPinnedId() !== null &&
+            String(PriceMoves.getPinnedId()) === String(obj.id)) return;
+
+        if (dotElement.dataset.dotState === 'hovering') {
+			logDotCSS(dotElement, 'MOUSEOUT - before restore');
+            dotElement.dataset.dotState = 'normal';
+            PriceMoves.restoreDotState(dotElement, dotElement.id);
+            PriceMoves.clearStateRegistry(dotElement.id);
+			logDotCSS(dotElement, 'MOUSEOUT - after restore');
+        }
+    };
+}
+
+function shrinkCanvasForPanel(show) {
+    var canvas = document.getElementById('topic-page-id');
+    if (!canvas) return;
+
+    var panelWidth = 280;
+    var dots = canvas.querySelectorAll('.dot');
+
+    if (show) {
+        var canvasWidth = canvas.offsetWidth;
+        var newWidth    = canvasWidth - panelWidth;
+        var scale       = newWidth / canvasWidth;
+
+        canvas.style.position  = 'absolute';
+        canvas.style.left      = '0';
+        canvas.style.right     = panelWidth + 'px';
+        canvas.style.width     = 'auto';
+        canvas.style.transition = 'right 0.3s ease';
+
+        dots.forEach(function(dot) {
+            // ✅ Always scale from original, not current
+            var baseLeft = dot.dataset.originalLeft 
+                ? parseFloat(dot.dataset.originalLeft) 
+                : parseFloat(dot.style.left);
+            
+            if (!isNaN(baseLeft)) {
+                dot.dataset.originalLeft = baseLeft + 'px'; // save original
+                dot.style.left = (baseLeft * scale) + 'px';
+            }
+        });
+
+    } else {
+        canvas.style.right = '0';
+        canvas.style.left  = '0';
+        canvas.style.width = 'auto';
+
+        dots.forEach(function(dot) {
+            if (dot.dataset.originalLeft) {
+                dot.style.left = dot.dataset.originalLeft;
+                delete dot.dataset.originalLeft;
+            }
+        });
+    }
+}
+
+function createClickHandler(div, obj) {
+    return function(e) {
+        if (e) { e.stopPropagation(); e.preventDefault(); }
+
+        console.log('CLICK: obj.id:', obj.id,
+                    'getPinnedId:', PriceMoves.getPinnedId(),
+                    'match:', String(PriceMoves.getPinnedId()) === String(obj.id));
+
+        var dotElement = document.getElementById('dot-' + obj.id);
+        if (!dotElement) return;
+
+        if (hoverTimers[obj.id]) {
+            clearTimeout(hoverTimers[obj.id]);
+            delete hoverTimers[obj.id];
+        }
+
+        if (String(PriceMoves.getPinnedId()) === String(obj.id)) {
+            PriceMoves.closePinnedDot();
+            return;
+        }
+
+        if (PriceMoves.getPinnedId() !== null) PriceMoves.closePinnedDot();
+
+        if (dotElement.dataset.dotState !== 'hovering') {
+            PriceMoves.saveDotState(dotElement, dotElement.id);
+        }
+
+        dotElement.dataset.dotState = 'signaled';
+        PriceMoves.setPinnedId(obj.id);
+
+        // ✅ showSignal only in callback — not twice
+		if (dotElement.dataset.dotState === 'hovering') {
+		    // Already positioned by hover — just show signal
+		    PriceMoves.showSignal(dotElement, obj);
+		} else {
+		    PriceMoves.smartExpand(dotElement, function() {
+		        PriceMoves.showSignal(dotElement, obj);
+		    });
+		}
+    };
+}
+
+var pinnedDotId = null;
+
+function updateSidepanelCount() {
+    var header = document.getElementById('sp-header');
+    if (!header) return;
+
+    // Count visible sidepanel items
+    var listContainer = document.getElementById('sp-list');
+    if (!listContainer) return;
+
+    var allCards = listContainer.querySelectorAll('[id^="dot-sidepanel-"]');
+    var visibleCount = 0;
+    for (var i = 0; i < allCards.length; i++) {
+        if (allCards[i].style.display !== 'none') visibleCount++;
+    }
+
+    header.innerHTML = [
+        '<div style="display:flex;justify-content:space-between;font-size:13px;font-weight:bold;">',
+            '<span>Records: ' + visibleCount + '</span>',
+        '</div>',
+        '<div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-top:2px;">',
+            '<span>Views: '    + toApproximateWords(totalViews)    + '</span>',
+            '<span>Comments: ' + toApproximateWords(totalComments) + '</span>',
+        '</div>'
+    ].join('');
+}
+
+function logDotCSS(dotElement, label) {
+    var s = dotElement.style;
+    var c = window.getComputedStyle(dotElement);
+    console.log('[' + label + ']',
+        'pos:' + (s.position||c.position),
+        'top:' + (s.top||c.top),
+        'left:' + (s.left||c.left),
+        'w:' + (s.width||c.width),
+        'h:' + (s.height||c.height),
+        'r:' + (s.borderRadius||c.borderRadius),
+        'op:' + (s.opacity||c.opacity),
+        'tr:' + (s.transform||c.transform),
+        'trans:' + (s.transition||c.transition).substring(0,30),
+        'zi:' + (s.zIndex||c.zIndex)
+    );
+}
 
 function displaysidepanel(input) {
-	// Convert single object to array if necessary
-	//console.log('in displaysidepanel ');
-	const objectList = Array.isArray(input) ? input : [input];
+    var objectList = Array.isArray(input) ? input : [input];
 
-	if (!sidecontainer) {
-		// Create a sidecontainer for the list if it doesn't exist
-		sidecontainer = document.createElement('div');
-		sidecontainer.id = 'object-list-sidecontainer';
-		sidecontainer.style.cssText = `
-            position: fixed;
-            right: 20px;
-            top: 50px;
-            bottom: 20px;
-            width: 250px;
-			opacity: 0.9;
-            overflow-y: auto;
-            background-color: #f0f0f0;
-            border-radius: 10px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            padding: 15px;
-            font-family: Arial, sans-serif;
-			z-index: 12;
-        `;
-		document.body.appendChild(sidecontainer);
+    // ── Create sidecontainer once ──────────────────────────────
+    if (!sidecontainer) {
+		totalRecords  = 0;
+	    totalViews    = 0;
+	    totalComments = 0;
+        sidecontainer = document.createElement('div');
+        sidecontainer.id = 'object-list-sidecontainer';
+        sidecontainer.style.cssText = [
+            'position:fixed',
+            'right:20px',
+            'top:50px',
+            'bottom:20px',
+            'width:250px',
+            'overflow-y:auto',
+            'background-color:#f0f0f0',
+            'border-radius:10px',
+            'box-shadow:0 0 10px rgba(0,0,0,0.1)',
+            'font-family:Arial,sans-serif',
+            'z-index:12',
+            'display:flex',
+            'flex-direction:column'
+        ].join(';');
+        document.body.appendChild(sidecontainer);
+        
+    }
 
-		// Add custom scrollbar styles
-		const style = document.createElement('style');
-		style.textContent = `
-            #object-list-sidecontainer::-webkit-scrollbar {
-                width: 10px;
-            }
-            #object-list-sidecontainer::-webkit-scrollbar-track {
-                background: #f1f1f1;
-                border-radius: 10px;
-            }
-            #object-list-sidecontainer::-webkit-scrollbar-thumb {
-                background: #888;
-                border-radius: 10px;
-            }
-            #object-list-sidecontainer::-webkit-scrollbar-thumb:hover {
-                background: #555;
-            }
-        `;
-		document.head.appendChild(style);
+    // ── Create sticky header once ──────────────────────────────
+    var header = document.getElementById('sp-header');
+    if (!header) {
+        header = document.createElement('div');
+        header.id = 'sp-header';
+        header.style.cssText = [
+            'position:sticky',
+            'top:0',
+            'z-index:10',
+            'background:#e0e0e0',
+            'padding:8px 10px',
+            'border-radius:8px 8px 0 0',
+            'flex-shrink:0'
+        ].join(';');
+        sidecontainer.appendChild(header);
+    }
+
+    // ── Update header counts ───────────────────────────────────
+ 
+    objectList.forEach(function(obj) {
+        totalViews    += obj.views    || 0;
+        totalComments += obj.comments || 0;
+        totalRecords  += 1;
+    });
+	
+    header.innerHTML = [
+        '<div style="display:flex;justify-content:space-between;font-size:13px;font-weight:bold;">',
+            '<span>Records: ' + toApproximateWords(totalRecords) + '</span>',
+        '</div>',
+        '<div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-top:2px;">',
+            '<span>Views: ' + toApproximateWords(totalViews) + '</span>',
+            '<span>Comments: ' + toApproximateWords(totalComments) + '</span>',
+        '</div>'
+    ].join('');
+	
+	// Add after header.innerHTML = [...]:
+	if (!document.getElementById('sp-refresh-btn')) {
+	    var refreshBtn = document.createElement('button');
+	    refreshBtn.id = 'sp-refresh-btn';
+	    refreshBtn.textContent = '↻ Refresh';
+	    refreshBtn.style.cssText = [
+	        'margin-top:6px',
+	        'width:100%',
+	        'padding:4px 8px',
+	        'background:#3b82f6',
+	        'color:white',
+	        'border:none',
+	        'border-radius:6px',
+	        'font-size:11px',
+	        'font-weight:600',
+	        'cursor:pointer'
+	    ].join(';');
+
+	    refreshBtn.addEventListener('click', function() {
+	        refreshBtn.textContent = '↻ Refreshing...';
+	        refreshBtn.style.background = '#6b7280';
+	        refreshBtn.disabled = true;
+
+	        fetch('/newauth/api/refresh-earnings', { method: 'GET' })
+	            .then(function(res) { return res.text(); })
+				.then(function(msg) {
+				    refreshBtn.textContent = '✓ Done — reloading...';
+				    refreshBtn.style.background = '#16a34a';
+				    setTimeout(function() {
+				        window.location.reload();
+				    }, 1500);
+				})
+	            .catch(function(err) {
+	                refreshBtn.textContent = '✗ Failed';
+	                refreshBtn.style.background = '#dc2626';
+	                refreshBtn.disabled = false;
+	                console.error('Refresh failed:', err);
+	            });
+	    });
+
+	    header.appendChild(refreshBtn);
 	}
 
-	let summaryPanel = document.getElementById('summary-panel');
-	if (!summaryPanel) {
-		summaryPanel = document.createElement('div');
-		summaryPanel.id = 'summary-panel';
-		summaryPanel.style.cssText = `
-				background-color: #e0e0e0;
-	            padding: 10px;
-	            margin-bottom: 15px;
-	            border-radius: 5px;
-	            font-weight: bold;
-	            position: fixed;
-	            top: 0px;
-				width: 220px;
-	            z-index: 4;
-	        `;
-		sidecontainer.prepend(summaryPanel);
-	}
+    // ── Create pills row once ──────────────────────────────────
+    var pillsRow = document.getElementById('sp-pills');
+    if (!pillsRow && sortvalues && sortvalues.length > 1) {
+        pillsRow = document.createElement('div');
+        pillsRow.id = 'sp-pills';
+        pillsRow.style.cssText = [
+            'position:sticky',
+            'top:52px',
+            'z-index:9',
+            'background:#f0f0f0',
+            'padding:6px 8px',
+            'display:flex',
+            'flex-wrap:wrap',
+            'gap:6px',
+            'flex-shrink:0',
+            'border-bottom:1px solid #ddd'
+        ].join(';');
 
-	// Update summary panel
+        sortvalues.forEach(function(text) {
+            var pill = document.createElement('span');
+            pill.textContent = text;
+            pill.style.cssText = [
+                'display:inline-block',
+                'padding:3px 10px',
+                'background:#fff',
+                'border:1px solid #ccc',
+                'border-radius:12px',
+                'font-size:12px',
+                'font-weight:600',
+                'color:#333',
+                'cursor:pointer'
+            ].join(';');
 
-	objectList.forEach(obj => {
-		totalViews += obj.views || 0;
-		totalComments += obj.comments || 0;
-		totalRecords += 1;
-	});
+			pill.addEventListener('click', function(e) {
+			    e.stopPropagation();
+			    var isActive = pill.dataset.active === 'true';
+			    pillsRow.querySelectorAll('span').forEach(function(p) {
+			        p.dataset.active = 'false';
+			        p.style.background = '#fff';
+			        p.style.color = '#333';
+			    });
+			    if (isActive) {
+			        displaypostsasdots(posts, false, sortfield + ':::ALL');
+			        filterDivsByDataAttribute('#object-list-sidecontainer', sortfield, 'ALL', 'startsWith', true);
+			    } else {
+			        pill.dataset.active = 'true';
+			        pill.style.background = '#ffdcdc';
+			        pill.style.color = '#8b0000';
+			        displaypostsasdots(posts, false, sortfield + ':::' + text);
+			        filterDivsByDataAttribute('#object-list-sidecontainer', sortfield, text, 'startsWith', true);
+			    }
 
-	// Your existing data transformation
-	let disptotalRecords = toApproximateWords(totalRecords);
-	let disptotalViews = toApproximateWords(totalViews);
-	let disptotalComments = toApproximateWords(totalComments);
-
-	// Create summary panel HTML
-	summaryPanel.innerHTML = `
-		  <div id="record-header" style="display: flex; justify-content: space-between; cursor: pointer;">
-		    <span>Records: ${disptotalRecords}</span>
-		  </div>
-		  <div style="display: flex; justify-content: space-between;">
-		    <span>Views: ${disptotalViews}</span>
-		    <span>Comments: ${disptotalComments}</span>
-		  </div>
-		`;
-
-
-	let linkArray = sortvalues;
-
-	// Create hidden panel
-	let slidingPanel = document.createElement('div');
-	slidingPanel.id = 'sliding-panel';
-	slidingPanel.style.cssText = `
-		  display: none;
-		  margin-top: 10px;
-		  padding: 10px;
-		  border-top: 1px solid #ccc;
-		  animation: slideDown 0.3s ease-out;
-		  display: grid;
-		  grid-template-columns: repeat(4, 1fr);
-		  gap: 8px;
-		`;
-
-	if (linkArray != null && linkArray.length > 0) {
-		// Populate with links
-		linkArray.forEach(text => {
-			const linkItem = document.createElement('a');
-			linkItem.textContent = text;
-			linkItem.classList.add("link-item");
-
-			//linkItem.href = "#";
-
-			linkItem.addEventListener("click", (event) => {
-				
-				event.stopPropagation(); 
-				console.log("filtering " + sortfield + ":::" + text);
-				const isActive = linkItem.classList.contains("active-filter");
-				if (isActive) {
-					linkItem.classList.remove("active-filter");
-					displaypostsasdots(posts, false, sortfield + ":::ALL");
-				} else {
-					// Remove active class from all other items
-					document.querySelectorAll(".link-item").forEach(item =>
-						item.classList.remove("active-filter")
-					);
-
-					linkItem.classList.add("active-filter");
-					displaypostsasdots(posts, false, sortfield + ":::" + text);
-				}
+			    // ✅ Update count after filter
+			    setTimeout(function() { updateSidepanelCount(); }, 50);
 			});
 
-			linkItem.addEventListener("mouseenter", (event) => {
-				event.stopPropagation(); 
-				console.log("filtering " + "PREVIEW:::" + sortfield + ":::" + text);
-				displaypostsasdots(posts, false, "PREVIEW:::" + sortfield + ":::" + text);
+            pill.addEventListener('mouseenter', function(e) {
+                e.stopPropagation();
+                displaypostsasdots(posts, false, 'PREVIEW:::' + sortfield + ':::' + text);
+            });
 
-			});
-			linkItem.addEventListener("mouseleave", (event) => {
-				event.stopPropagation(); 
-				console.log("removing filter " + "PREVIEW:::" + sortfield + ":::" + text);
-				displaypostsasdots(posts, false, "PREVIEW:::" + sortfield + ":::ALL");
-			});
+            pill.addEventListener('mouseleave', function(e) {
+                e.stopPropagation();
+                displaypostsasdots(posts, false, 'PREVIEW:::' + sortfield + ':::ALL');
+            });
 
-			slidingPanel.appendChild(linkItem);
-		});
-	}
+            pillsRow.appendChild(pill);
+        });
 
-	const style = document.createElement('style');
-	style.textContent = `
-		  .link-item {
-		    display: block;
-		    padding: 4px;
-		    background: #f0f0f0;
-		    text-align: center;
-		    text-decoration: none;
-		    border-radius: 4px;
-		    color: #333;
-		    transition: background 0.2s ease, color 0.2s ease;
-		  }
+        sidecontainer.appendChild(pillsRow);
+    }
 
-		  .link-item:hover {
-		    background: #e0e0ff;
-		    color: #00008b;
-		  }
+    // ── Scrollable list container ──────────────────────────────
+    var listContainer = document.getElementById('sp-list');
+    if (!listContainer) {
+        listContainer = document.createElement('div');
+        listContainer.id = 'sp-list';
+        listContainer.style.cssText = [
+            'flex:1',
+            'overflow-y:auto',
+            'padding:8px'
+        ].join(';');
+        sidecontainer.appendChild(listContainer);
+    }
 
-		  .link-item:active {
-		    background: #c0c0ff;
-		    color: #000066;
-		  }
-		  .link-item.active-filter {
-		    background: #ffdcdc;
-		    color: #8b0000;
-		    font-weight: bold;
-		  }
-		`;
-	document.head.appendChild(style);
+    // ── Add company cards ──────────────────────────────────────
+    objectList.forEach(function(obj, index) {
+        var existing = document.getElementById('dot-sidepanel-' + obj.id);
+        if (existing) return; // don't duplicate
 
-	// Add the panel after the summary
-	summaryPanel.appendChild(slidingPanel);
+        var div = document.createElement('div');
+        div.id = 'dot-sidepanel-' + obj.id;
+        div.style.cssText = [
+            'background:#fff',
+            'margin-bottom:10px',
+            'padding:10px',
+            'border-radius:5px',
+            'box-shadow:0 2px 5px rgba(0,0,0,0.05)',
+            'cursor:pointer',
+            'position:relative',
+            'opacity:0',
+            'transform:translateY(-20px)',
+            'transition:transform 0.2s ease, opacity 0.5s ease'
+        ].join(';');
 
-	// Handle click
-	document.getElementById("record-header").addEventListener("click", () => {
-		slidingPanel.style.display = slidingPanel.style.display === "none" ? "grid" : "none";
-	});
+        // Set sort field data attribute
+        if (sortfield && sortfield.length > 0) {
+            var postData = obj.data;
+            if (typeof postData === 'string') {
+                try { postData = JSON.parse(postData); } catch(e) { postData = {}; }
+            }
+            if (postData && typeof postData[sortfield] !== 'undefined') {
+                var fieldVal = postData[sortfield];
+                if (sortfield === 'Time') fieldVal = fieldVal.split(' ')[0].trim();
+                div.setAttribute('data-' + sortfield, fieldVal);
+            }
+        }
 
+        // Text content
+        var textSpan = document.createElement('span');
+        textSpan.style.cssText = 'display:block;font-size:13px;margin-bottom:18px;';
+        var postData2 = obj.data;
+        if (typeof postData2 === 'string') {
+            try { postData2 = JSON.parse(postData2); } catch(e) { postData2 = {}; }
+        }
+        textSpan.textContent = (postData2 && postData2.text) ? postData2.text : '';
+        div.appendChild(textSpan);
 
-	// Slide existing divs down
-	const existingDivs = sidecontainer.children;
-	for (let i = 0; i < existingDivs.length; i++) {
-		const div = existingDivs[i];
-		div.style.transition = 'transform 0.5s ease';
-		div.style.transform = `translateY(${objectList.length * 60}px)`;
-	}
-
-	// Create and prepend new object divs with animation
-	objectList.forEach((obj, index) => {
-		const div = document.createElement('div');
-		div.id = `dot-sidepanel-${obj.id}`;
-		div.style.cssText = `
-            background-color: #ffffff;
-            margin-bottom: 10px;
-            padding: 10px;
-            border-radius: 5px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-            transition: transform 0.2s ease, opacity 0.5s ease;
-            opacity: 0;
-			z-index: 3;
-            transform: translateY(-20px);
-            position: relative;
-        `;
-
-		const textSpan = document.createElement('span');
-		textSpan.textContent = obj.text;
-		div.appendChild(textSpan);
-
-		const sentSpan = document.createElement('span');
-		sentSpan.textContent = obj.sent;
-		sentSpan.style.cssText = `
-            position: absolute;
-            bottom: 5px;
-            right: 5px;
-            font-size: 0.8em;
-            color: #888;
-        `;
-		div.appendChild(sentSpan);
-
-		const createMouseOverHandler = (div, obj) => {
-			return () => {
-				div.style.transform = 'scale(1.02) translateY(0)';
-				div.style.backgroundColor = '#ffffcc';
-
-				const dotElement = document.getElementById('dot-' + obj.id);
-				// console.log('about to expand dot-' + obj.id + ' ' + dotElement);
-
-				if (dotElement) {
-					expandDot(dotElement, dotElement.getBoundingClientRect());
-				}
-			};
-		};
-
-		const createMouseOutHandler = (div, obj) => {
-			return () => {
-				div.style.transform = 'scale(1) translateY(0)';
-				div.style.backgroundColor = '#ffffff';
-
-				const dotElement = document.getElementById('dot-' + obj.id);
-				// console.log('about to shrink dot-' + obj.id + ' ' + dotElement);
-
-				if (dotElement) {
-					shrinkdot(dotElement);
-				}
-			};
-		};
-
-		div.addEventListener('mouseover', createMouseOverHandler(div, obj));
-		div.addEventListener('mouseout', createMouseOutHandler(div, obj));
-
-		sidecontainer.append(div);
-
-		// Trigger animation after a short delay
-		setTimeout(() => {
-			div.style.opacity = 0.9;
-			div.style.transform = 'translateY(0)';
-		}, 100 * (index + 1));
-	});
-
-	// Reset the transform of existing divs after animation
-	setTimeout(() => {
-		for (let i = objectList.length; i < existingDivs.length; i++) {
-			existingDivs[i].style.transition = 'none';
-			existingDivs[i].style.transform = 'none';
+        // Signal hint
+        var hint = document.createElement('div');
+        hint.className = 'signal-hint';
+        hint.style.cssText = 'display:none;font-size:10px;color:#3b82f6;font-weight:600;margin-top:4px;';
+        hint.textContent = '⚡ Click for signal';
+        div.appendChild(hint);
+		
+		// After textSpan, before sentSpan:
+		var postData2 = obj.data;
+		if (typeof postData2 === 'string') {
+		    try { postData2 = JSON.parse(postData2); } catch(e) { postData2 = {}; }
 		}
-	}, 500);
 
-	const firstDotPanel = sidecontainer.querySelector('[id^="dot-sidepanel-"]');
-	if (firstDotPanel && summaryPanel) {
-		const summaryHeight = summaryPanel.offsetHeight;
-		firstDotPanel.style.marginTop = `${summaryHeight + 15}px`; // 15px for additional spacing
-	}
-	// add the collapse/expand control
-	addSidePanelToggle();
-	updateToggleButtonStyle();
+		var signal = postData2.Signal || postData2.signal || '';
+		if (signal) {
+		    var indicator = document.createElement('span');
+		    var color = signal === 'BUY'   ? '#16a34a' :  // green
+		                signal === 'SELL'  ? '#dc2626' :  // red
+		                signal === 'WATCH' ? '#d97706' :  // amber
+		                                     '#6b7280';   // gray for AVOID/unknown
+		    indicator.style.cssText = [
+		        'display:inline-block',
+		        'width:8px',
+		        'height:8px',
+		        'border-radius:50%',
+		        'background:' + color,
+		        'margin-right:6px',
+		        'vertical-align:middle',
+		        'flex-shrink:0'
+		    ].join(';');
+		    indicator.title = signal;  // tooltip on hover
+
+		    // Prepend to textSpan so it appears before company name
+		    textSpan.insertBefore(indicator, textSpan.firstChild);
+		}
+
+        // Sent timestamp
+        var sentSpan = document.createElement('span');
+        sentSpan.textContent = obj.sent || '';
+        sentSpan.style.cssText = 'position:absolute;bottom:5px;right:5px;font-size:0.8em;color:#888;';
+        div.appendChild(sentSpan);
+
+        // Event handlers
+        var overHandler  = createMouseOverHandler(div, obj);
+        var outHandler   = createMouseOutHandler(div, obj);
+        var clickHandler = createClickHandler(div, obj);
+
+        div.addEventListener('mouseenter', overHandler);
+        div.addEventListener('mouseleave', outHandler);
+        div.addEventListener('click',      clickHandler);
+
+        listContainer.appendChild(div);
+
+        // Animate in
+        setTimeout(function() {
+            div.style.opacity   = '0.9';
+            div.style.transform = 'translateY(0)';
+        }, 100 * (index + 1));
+    });
+
+    // ── Scrollbar styles once ──────────────────────────────────
+    if (!document.getElementById('sp-scrollbar-style')) {
+        var style = document.createElement('style');
+        style.id  = 'sp-scrollbar-style';
+        style.textContent = [
+            '#object-list-sidecontainer::-webkit-scrollbar { width:6px; }',
+            '#object-list-sidecontainer::-webkit-scrollbar-track { background:#f1f1f1; border-radius:10px; }',
+            '#object-list-sidecontainer::-webkit-scrollbar-thumb { background:#888; border-radius:10px; }',
+            '#sp-list::-webkit-scrollbar { width:6px; }',
+            '#sp-list::-webkit-scrollbar-thumb { background:#888; border-radius:10px; }',
+            '.link-item.active-filter { background:#ffdcdc !important; color:#8b0000 !important; font-weight:bold; }'
+        ].join('');
+        document.head.appendChild(style);
+    }
 }
 
 function toggleSidePanel() {
@@ -4574,8 +5063,9 @@ function dragElement(elmnt) {
 	}
 }
 
-function posttotopicmodal(event) {
-	event.stopPropagation();
+function posttotopicmodal(event, reposition, dotid) {
+	if (typeof event != undefined && event != null)
+		event.stopPropagation();
 
 	//alert(topicmaxdepth +  ' ' + topiccurrentdepth);
 
@@ -4600,7 +5090,81 @@ function posttotopicmodal(event) {
 			document.getElementById('create-sub-topic-select').style.visibility = 'visible';
 		}
 	}
-	$('#topic-post-modal').modal('show');
+	
+	if (typeof reposition !== 'undefined' && reposition === true) {
+	    const $modal = $('#topic-post-modal');
+	    const $dialog = $modal.find('.modal-dialog');
+
+	    // Temporarily show off-screen to measure accurately
+	    $modal.css({
+	        position: 'fixed',
+	        top: '-10000px',
+	        left: '-10000px',
+	        display: 'block',
+	        visibility: 'hidden'
+	    });
+
+	    const mw = $dialog.outerWidth();
+	    const mh = $dialog.outerHeight();
+
+	    // Hide it again
+	    $modal.css({
+	        position: '',
+	        top: '',
+	        left: '',
+	        display: '',
+	        visibility: ''
+	    });
+
+	    const ww = $(window).width();
+	    const wh = $(window).height();
+
+	    // Use clientX/Y (viewport-relative)
+	    let x = event.clientX;
+	    let y = event.clientY;
+		
+		if (typeof dotid != 'undefined' && dotid != null) {
+			let dotelem = document.getElementById('dot-' + dotid);
+			let shiftleft = parseInt(window.getComputedStyle(dotelem).width, 10) || 0;
+			//console.log('shifting dialog left by ' + shiftleft);
+			x = x - shiftleft;
+		}
+
+	    // Keep dialog fully inside viewport (with 10px padding)
+	    x = Math.max(10, Math.min(x, ww - mw - 10));
+	    y = Math.max(10, Math.min(y, wh - mh - 10));
+
+	    // Apply styles directly to override Bootstrap 3's default centering
+	    $dialog.css({
+	        position: 'fixed',
+	        top: y + 'px',
+	        left: x + 'px',
+	        margin: 0,      // Critical: overrides Bootstrap's "margin: 30px auto"
+	        right: 'auto',
+	        bottom: 'auto'
+	    });
+
+	    // Show modal
+	    $modal.modal({
+	        keyboard: true
+	    });
+
+	} else {
+	    // Restore Bootstrap 3 default behavior
+	    $('#topic-post-modal')
+	        .find('.modal-dialog')
+	        .css({
+	            position: '',
+	            top: '',
+	            left: '',
+	            margin: '',
+	            right: '',
+	            bottom: ''
+	        })
+	        .end()
+	        .modal('show');
+	}
+
 	return false;
 }
 
@@ -5436,7 +6000,7 @@ function removepostfromtopic(topicname, crtime) {
 
 	xhr.send(reqpacket);
 
-	alert('removing this post ' + reqpacket);
+	console.log('removing this post ' + reqpacket);
 	if (topicstorage != null && topicstorage.indexOf('client') >= 0) { // remove locally also		
 		removecontentlocally(topicname, crtime);
 	}
@@ -6029,22 +6593,87 @@ function openSSEConnection() {
 		topiceventsource = new EventSource("/newauth/api/monitorTopic/" + topicname);
 		topiceventsource.addEventListener('message', function(event) {
 			//console.log('new data arrived ' + event.data);
-			var recdpost = JSON.parse('[' + event.data + ']');
-			var currentposttime = new Date(posts[0].crtime);
-			var recdposttime = new Date(recdpost[0].crTime)
-			//console.log('post received created at time ' + recdpost[0].crTime + ' ' + posts[0].crtime)
-			//console.log('post received created at time ' + recdposttime + ' ' + currentposttime)
+			try {
+			    // Validate event.data
+			    if (!event || typeof event.data !== "string") {
+			        console.error("Invalid event.data", event);
+			        return;
+			    }
 
-			if (parseInt(recdpost[0].comments) > 0 && recdpost[0].summary == null) {// this is a new comment on a post
-				showpostcomment(recdpost[0], true);
-			} else {
-				if (typeof posts[0].crtime == 'undefined' || recdposttime > currentposttime) {
-					recdpost[0].crtime = recdpost[0].crTime; // naming mismatch			
-					displaypostsasdots(recdpost, true);   // justadded true
-				}
+			    // Safely parse JSON
+			    let recdpost;
+			    try {
+			        recdpost = JSON.parse("[" + event.data + "]");
+			    } catch (e) {
+			        console.error("Failed to parse event.data:", e, event.data);
+			        return;
+			    }
+
+			    // Validate parsed structure
+			    if (!Array.isArray(recdpost) || !recdpost[0]) {
+			        console.error("Parsed recdpost is invalid:", recdpost);
+			        return;
+			    }
+
+			    const rp = recdpost[0];
+
+			    // Validate posts array
+			    if (!Array.isArray(posts) || !posts[0]) {
+			        console.error("posts array is invalid:", posts);
+			        return;
+			    }
+
+			    const cp = posts[0];
+
+			    // Extract times safely
+			    const currentposttime = cp.crtime ? new Date(cp.crtime) : null;
+			    const recdposttime = rp.crTime ? new Date(rp.crTime) : null;
+
+			    console.log(
+			        "post received created at time",
+			        rp.crTime,
+			        cp.crtime
+			    );
+				SSEerrorCount = 0;
+			    // If either date is invalid, skip comparison
+			    const timesAreValid =
+			        currentposttime instanceof Date &&
+			        !isNaN(currentposttime) &&
+			        recdposttime instanceof Date &&
+			        !isNaN(recdposttime);
+
+			    // Handle new comment
+			    if (
+			        rp.comments &&
+			        !isNaN(parseInt(rp.comments)) &&
+			        parseInt(rp.comments) > 0 &&
+			        rp.summary == null
+			    ) {
+			        showpostcomment(rp, true);
+			        return;
+			    }
+
+			    // Handle new post or updated post
+			    if (!timesAreValid || recdposttime > currentposttime) {
+			        rp.crtime = rp.crTime || rp.crtime; // fix naming mismatch safely
+			        displaypostsasdots(recdpost, true);
+			    }
+
+			} catch (err) {
+				SSEerrorCount++;
+			    console.error("Unexpected error in post handler:", err);
 			}
 
 		});
+		
+		topiceventsource.onerror = (err) => { 
+			SSEerrorCount++; 
+			console.warn("EventSource error", err, "count:", SSEerrorCount); 
+			if (SSEerrorCount >= SSEmaxErrors) { 
+				console.error("Max errors reached. Closing EventSource."); 
+				//topiceventsource.close(); 
+				closeSSEConnection();
+			} };
 
 
 	} else {
@@ -6923,6 +7552,19 @@ function createVaultPopup(creds, idx) {
 	document.addEventListener('click', function(e) {
 		//e.preventDefault();
 		e.stopPropagation();
+		if (e.target.closest('[id^="dot-sidepanel-"]')) {
+	        return;
+	    }
+	    
+	    // ✅ Don't close if clicking on the expanded dot itself
+	    if (e.target.closest('[id^="dot-"]')) {
+	        return;
+	    }
+	    
+	    // Only close if clicking truly outside
+	    if (pinnedDotId !== null) {
+	        PriceMoves.closePinnedDot();
+	    }
 		var pops = document.getElementsByClassName('dot-popup-vault');
 
 		for (var p = 0; p < pops.length; p++) {
@@ -7675,590 +8317,447 @@ function addnametotopicmembers(ev) {
 
 }
 
-
-function displayRadialText(textList, draw) {
-	// Get the center point of the screen
-	var centerX = window.innerWidth / 2;
-	var centerY = window.innerHeight / 2;
-
-	var outputobj = [];
-	var safelocationsmap = [];
-
-
-	var highestz = textList.length * 2;
-	// Keep track of the positionsdeg of the text elements
-	var positionsdeg = new Set();
-	var positionsrad = new Map();
-	var centerdotsize = 180;
-
-	centerdotsize = parseInt(Math.min(window.innerHeight, window.innerWidth) * (1.2 / 3.6));  // big center
-
-	// Minimum radius
-	var minRadius = (centerdotsize / 2) + centerdotsize * 0.06;
-
-	console.log('Computed centerdot size ' + centerdotsize + ' minradiius ' + minRadius);
-
-	var dotsperrad = {};
-	var beginsafeloc = 0;
-
-	var usedidx = new Set();
-
-	var totalcountofdots = 0;
-
-	if (textList.length < 20)
-		totalcountofdots = 20;
-
-	if (textList.length >= 20 && textList.length < 50)
-		totalcountofdots = 50;
-
-	if (textList.length >= 50)
-		totalcountofdots = parseInt(textList.length + 50);
-
-	var areaperdot = ((window.innerWidth * window.innerHeight) - (Math.pow(minRadius * 2, 2))) / totalcountofdots;
-	var dotmaxsize = parseInt(Math.sqrt(areaperdot) / 3.2);
-	console.log('max dot size [theoretical] ' + dotmaxsize);
-
-	if (dotmaxsize > centerdotsize / 8) dotmaxsize = parseInt(centerdotsize / 8);
-
-	console.log('max dot size [practical] ' + dotmaxsize);
-
-	var maxdiagdeg = parseInt(Math.atan((centerY - (dotmaxsize * 2)) / (centerX - (dotmaxsize * 2))) * 180 / Math.PI);
-	console.log('max diagonal at degree ' + maxdiagdeg);
-
-	var maxDiagonal = parseInt((centerX - (dotmaxsize * 2)) / Math.cos(Math.atan((centerY - (dotmaxsize * 2)) / (centerX - (dotmaxsize * 2)))));
-
-	console.log('max diagonal ' + maxDiagonal);
-
-	var cendiv = document.createElement("div");
-	cendiv.innerHTML = 'center';
-	cendiv.style.color = 'white';
-	cendiv.style.fontSize = '9px';
-
-	cendiv.style.position = "absolute";
-	cendiv.style.left = centerX - centerdotsize / 2 + "px";
-	cendiv.style.top = centerY - centerdotsize / 2 + "px";
-
-	cendiv.style.maxWidth = centerdotsize + "px";
-	cendiv.style.width = centerdotsize + "px";
-
-	cendiv.id = '100000';
-	cendiv.style.backgroundColor = '#565656';
-	cendiv.style.zIndex = highestz - i;
-	cendiv.classList.add('dot');
-	cendiv.classList.add('centerdot');
-
-	if (draw) document.body.appendChild(cendiv);
-	// Iterate through the list of text
-
-	for (var i = 0; i < textList.length; i++) {
-		// Get the first 3 letters of the text
-
-		let datatohash;
-
-		if (typeof textList[i].data != 'undefined' && textList[i].data != null && textList[i].data.length > 0) {
-			try {
-				//console.log('info.data: ' + textList[i].data);
-				var dat = JSON.parse(textList[i].data);
-
-				textList[i].data = dat;
-
-
-			} catch (e) {
-				console.error(' Exception caught while parsing JSON:', info.data);
-				console.error(' Error details:', e);
-			}
-		}
-
-		if (textList[i].category != null) {
-			//console.log('info.category: ' + textList[i].category);
-			datatohash = textList[i].category;
-		} else if (textList[i].data != null) {
-
-			if (textList[i].data.category != null)
-				datatohash = textList[i].data.category;
-			else
-				datatohash = JSON.stringify(textList[i].data);
-		} else if (textList[i].summary != null) {
-			datatohash = textList[i].summary;
-		} else if (textList[i].text != null) {
-			datatohash = textList[i].text;
-		}
-		//console.log('input to get data for hash ' + JSON.stringify(textList[i]));
-		//console.log('datatohash ' + datatohash);
-		var text = datatohash;
-
-		// Create a div element to hold the text
-		var div = document.createElement("div");
-		//  div.innerHTML = text;
-		div.style.color = 'white';
-		div.style.fontSize = '9px';
-		//  div.style.width = "20px";
-		//  div.style.height = "20px";
-
-		// Use the hash value of the text to determine the placement of the text
-		//  console.log('processing item ' + i + ' prehash ' + textList[i].datahash + ' datatohash ' + text + ' ticker ' + textList[i].data.Ticker);
-		var hashobj;
-
-		if (typeof textList[i].datahash != 'undefined' && textList[i].datahash != null && textList[i].datahash.length > 0) {
-			//console.log('hascode from existing hash ' + textList[i].datahash);
-			hashobj = hashCodeSHA(textList[i].datahash, true);
-		} else if (typeof text != 'undefined') {
-				//console.log('hashcode from ' + text);
-				hashobj = hashCodeSHA(text);
-		} else {
-			hashobj = hashCodeSHA(Math.floor(Math.random() * 1e16).toString());
-		}
-		
-		var hashval= hashobj.num;
-		
-		var angledeg = hashval % 360;
-		var angle = angledeg * (Math.PI / 180);
-
-		var halfdotmaxsize = dotmaxsize / 2;
-		var maxRadius = Math.sqrt(Math.pow(centerX - halfdotmaxsize, 2) + Math.pow(centerY - halfdotmaxsize, 2));
-
-		var locations = [];
-		maxRadius = getMaxRadiusByAngle(angledeg);
-
-		//if (i == 2) {
-
-		if (Object.keys(safelocationsmap).length == 0) {
-			populatesafelocationsmap(0);
-			//console.log('safelocations  ' + JSON.stringify(safelocationsmap));
-			console.log('safelocations size ' + Object.keys(safelocationsmap).length + ' dots per radius ' + JSON.stringify(dotsperrad));
-		}
-
-		beginsafeloc = parseInt(Object.keys(safelocationsmap).length / 2);
-		//	alert(beginsafeloc);
-		if (beginsafeloc % 2 > 0) beginsafeloc++;
-
-
-		//var maxRadius = Math.min(Math.abs(centerX - window.innerWidth), Math.abs(centerY - window.innerHeight));
-		var locidx = hashval % parseInt(Object.keys(safelocationsmap).length / 3);
-		var loopcount = 0;
-		var inconflict = false;
-
-		// var dotstofling = textList.length*0.4; //dotsperrad[Object.keys(dotsperrad)[0]] + dotsperrad[Object.keys(dotsperrad)[1]];
-		// if (i < dotstofling && i%2 > 0) locidx += parseInt(beginsafeloc/2);
-
-		if (hashval % 10 > 6) locidx += parseInt(beginsafeloc / 2);   // 30% dots fling
-
-		if (locidx >= Object.keys(safelocationsmap).length)
-			locidx = Object.keys(safelocationsmap).length - 2;
-
-		//	 console.log('locifdx for ' + i + ' ' + locidx + ' safelocations remaining ' + Object.keys(safelocationsmap).length + ' hash ' + hashval);
-
-		while (usedidx.has(locidx)) {
-			inconflict = true;
-			console.log(i + ' conflict with locidx ');
-			if (loopcount > 5) break;
-			locidx = safelocationsmap.length - loopcount;
-
-			loopcount++;
-		}
-		// if (i < textList.length /2) locidx = hashval % (textList.length);
-
-		if (locidx < 0) locidx = safelocationsmap.length - 1;
-
-		if (typeof safelocationsmap[locidx] != 'undefined') {
-			//console.log(' a location ' + locidx + ' ' + safelocationsmap[locidx]);
-			var angledegs = safelocationsmap[locidx].split('::')[0];
-			var rads = safelocationsmap[locidx].split('::')[1];
-
-			var endang = parseInt(angledegs.split(':')[1]);
-			if (parseInt(angledegs.split(':')[1]) < parseInt(angledegs.split(':')[0])) {
-				endang += 360;
-			}
-			angledeg = (parseInt(angledegs.split(':')[0]) + endang) / 2;
-
-			if (angledeg > 360) angledeg -= 360;
-
-			var raddiff = parseInt(rads.split(':')[1]) - parseInt(rads.split(':')[0]);
-
-			radius = (parseInt(rads.split(':')[1]) + parseInt(rads.split(':')[0])) / 2;
-
-			var jitter = Math.pow(10, locidx / safelocationsmap.length);
-
-			// console.log(' location ' + locidx + ' jitter ' + jitter);
-
-			if (locidx < dotsperrad[Object.keys(dotsperrad)[0]]) {
-				angledeg -= jitter;
-				radius -= jitter;
-			}
-			else {
-				if (radius + jitter < getMaxRadiusByAngle(angledeg + jitter)) {
-					angledeg += jitter;
-					radius += jitter;
-				} else if (radius + (jitter / 2) < getMaxRadiusByAngle(angledeg + (jitter))) {
-					angledeg += jitter / 2;
-					radius += jitter / 2;
-				}
-			}
-
-
-
-		} else {
-			console.log('locidx ' + locidx + ' is  undefined .. safelocations size ' + Object.keys(safelocationsmap).length);
-			var randangledeg = (hashval % 360);
-
-			if (randangledeg > 0 && randangledeg <= 90) angledeg = maxdiagdeg;
-
-			if (randangledeg > 90 && randangledeg <= 180) angledeg = 180 - maxdiagdeg;
-
-			if (randangledeg > 180 && randangledeg <= 270) angledeg = 180 + maxdiagdeg;
-
-			if (randangledeg > 270 && randangledeg <= 360) angledeg = 360 - maxdiagdeg;
-
-			maxRadius = getMaxRadiusByAngle(angledeg);
-
-			radius = parseInt(Math.max(minRadius, (hashval) % maxRadius));
-
-			if (radius < (minRadius * 1.3)) {
-				if ((radius + (hashval) % (dotmaxsize * 3)) < maxRadius)
-					radius += (hashval) % (dotmaxsize * 3);
-				else if ((radius + (hashval) % (dotmaxsize * 2)) < maxRadius)
-					radius += (hashval) % (dotmaxsize * 2);
-				else if ((radius + (hashval) % (dotmaxsize)) < maxRadius)
-					radius += (hashval) % (dotmaxsize);
-			}
-			console.log(i + ' hardcoded location angle ' + angledeg + ' rad ' + radius);
-
-			inconflict = true;
-		}
-
-		angle = angledeg * (Math.PI / 180);
-
-		const halfBeforeTheUnwantedElement = safelocationsmap.slice(0, locidx);
-
-		const halfAfterTheUnwantedElement = safelocationsmap.slice(locidx + 1);
-
-		safelocationsmap = halfBeforeTheUnwantedElement.concat(halfAfterTheUnwantedElement);
-
-		//console.log(i + ' removed ' + locidx + ' remaining safe positions ' + safelocationsmap.length);
-
-		var x = parseInt(centerX + (radius * Math.cos(angle)));
-		var y = parseInt(centerY - (radius * Math.sin(angle)));
-
-		//console.log(i + ' hash ' + hashval + ' angle ' + angledeg + ' maxradius ' + maxRadius + ' radius ' + radius + ' x:y ' + x + ':' + y);
-
-		//	usedidx.add(locidx);
-		//	if (locidx < safelocationsmap.length -1) usedidx.add(locidx+1);
-
-		// Set the position of the div element
-		div.style.position = "absolute";
-
-		div.style.left = parseInt(x - (dotmaxsize / 2)) + "px";
-		div.style.top = parseInt(y - (dotmaxsize / 2)) + "px";
-
-		//	console.log( ' x:y ' + parseInt(x) + ':' + parseInt(y));
-
-		div.id = i;
-		//div.style.maxWidth = parseInt(Math.sqrt(areaperdot)/4) + 'px';
-		div.style.maxWidth = dotmaxsize + 'px';
-
-		div.style.backgroundColor = '#565656';
-		div.style.zIndex = highestz - i;
-		div.classList.add('dot');
-		locations.push('locidx angle radius -- ' + locidx + ' ::' + parseInt(angledeg) + ':' + parseInt(radius));
-
-		div.title = div.id + JSON.stringify(locations);
-
-
-		var pastel = getpastelcolor('#' + hashobj.hex.substring(0, 6));
-
-		//console.log('index ' + i + ' text ' + text + ' pastel ' + pastel);
-		// Add the div element to the body of the document
-		if (typeof draw != 'undefined' && draw) {
-			document.body.appendChild(div);
-
-			document.getElementById('elemcount').innerHTML = textList.length;
-
-			if (i == textList.length - 1) {
-				document.addEventListener("click", function() {
-
-					var dots = document.getElementsByClassName('dot');
-					//alert('hello');
-					for (var x = 0; x < dots.length; x++) {
-						if (!dots[x].classList.contains('centerdot')) {
-							dots[x].classList.add('shake');
-
-							removeshake(x);
-						}
-					}
-				});
-			}
-
-			setpastelcolor(i, pastel);
-		}
-
-		//	if (inconflict) setpastelcolor(i, '#565656');
-
+function generateTestPosts(count) {
+    const categories = ['Tech', 'Finance', 'Health', 'Sports', 'Politics', 'Entertainment', 'Science', 'Travel'];
+    const summaries = [
+        'Market update shows strong growth',
+        'New policy announced today',
+        'Research breakthrough reported',
+        'Team wins championship',
+        'Product launch exceeds expectations',
+        'Weather alert issued for region',
+        'Conference highlights key trends',
+        'Study reveals surprising findings'
+    ];
+
+    const posts = [];
+    for (let i = 0; i < count; i++) {
+        const type = i % 4; // cycle through different object shapes
+
+        if (type === 0) {
+            // Has datahash — highest priority seed
+            posts.push({
+                datahash: `hash_${Math.random().toString(36).substring(2, 10)}`,
+                category: categories[i % categories.length],
+                text: `Post text number ${i}`,
+                summary: summaries[i % summaries.length],
+                title: `Title ${i}`,
+                score: Math.floor(Math.random() * 100),
+                timestamp: Date.now() - (i * 3600000),
+                data: { ticker: `TK${i}`, value: Math.random() * 500 }
+            });
+        } else if (type === 1) {
+            // Has category but no datahash
+            posts.push({
+                category: categories[i % categories.length],
+                text: `Another post ${i}`,
+                summary: summaries[i % summaries.length],
+                score: Math.floor(Math.random() * 100),
+                timestamp: Date.now() - (i * 7200000),
+                data: { region: `Region${i}`, active: true }
+            });
+        } else if (type === 2) {
+            // Has text + summary, no category or datahash
+            posts.push({
+                text: `Breaking news item ${i} with some longer content here`,
+                summary: summaries[i % summaries.length],
+                score: Math.floor(Math.random() * 100),
+                timestamp: Date.now() - (i * 1800000),
+                data: { source: `Source${i}`, verified: i % 2 === 0 }
+            });
+        } else {
+            // Minimal — falls back to item_i seed
+            posts.push({
+                summary: summaries[i % summaries.length],
+                score: Math.floor(Math.random() * 100),
+                timestamp: Date.now() - (i * 900000)
+            });
+        }
+    }
+    return posts;
+}
+
+function displayRadialText(textList, canvasEl, options) {
+    if (!textList || !textList.length || !canvasEl) return [];
+
+    options = options || {};
+
+    var label = 'displayRadialText[' + textList.length + ']';
+    console.time(label);
+
+    var rect   = canvasEl.getBoundingClientRect();
+	var W    = rect.width  || canvasEl.offsetWidth ;
+	var H    = rect.height || canvasEl.offsetHeight ;
+	var margin    = Math.min(70, Math.floor(W * 0.06));
+	var headerEl = document.querySelector('.fixed-row');
+	var headerH  = headerEl ? Math.ceil(headerEl.getBoundingClientRect().height) : 50;
+
+	var bounds = {
+	    minX: margin,
+	    maxX: W - margin,
+	    minY: headerH + margin,  // accounts for fixed header
+	    maxY: H - margin
+	};
+
+    var centerX             = W / 2;
+    var centerY             = H / 2;
+    var CENTER_CLEAR_RADIUS = options.centerClearRadius || 120;
+    var PAGE_SIZE           = options.pageSize || textList.length;
+    var BG_DOT_SIZE         = options.bgDotSize || 5;
+
+    function fnv32(str, seed) {
+        if (typeof seed === 'undefined') seed = 0x811c9dc5;
+        var h = seed;
+        for (var i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = (h * 0x01000193) >>> 0;
+        }
+        return h;
+    }
+
+    function getColorFromSeed(str) {
+        var h          = fnv32(str, 0x811c9dc5);
+        var hue        = h % 360;
+        var saturation = 55 + (h >> 8)  % 20;
+        var lightness  = 50 + (h >> 16) % 15;
+        return 'hsl(' + hue + ',' + saturation + '%,' + lightness + '%)';
+    }
+	
+	function getDisplayText(post) {
+	    try {
+	        var data = typeof post.data === 'string' ? JSON.parse(post.data) : post.data;
+
+	        if (data && data.abbr && data.abbr.trim()) {
+	            return data.abbr.trim().substring(0, 4).toUpperCase();
+	        }
+
+	        if (data && data.text && data.text.trim()) {
+	            return data.text.trim().substring(0, 4).toUpperCase();
+	        }
+
+	        if (post.data && post.data.text && post.data.text.trim()) {
+	            return post.data.text.trim().substring(0, 4).toUpperCase();
+	        }
+
+	    } catch (e) {
+	        console.warn('getDisplayText parse error:', e);
+	    }
+	    return '????';
+	}
+
+    var totalcountofdots;
+    if (PAGE_SIZE < 20)      totalcountofdots = 20;
+    else if (PAGE_SIZE < 50) totalcountofdots = 50;
+    else                     totalcountofdots = PAGE_SIZE + 50;
+
+    var areaperdot    = (W * H) / totalcountofdots;
+    var dotmaxsize    = parseInt(Math.sqrt(areaperdot) / 3.2);
+	dotmaxsize = Math.min(dotmaxsize, 60);
+	dotmaxsize = Math.max(dotmaxsize, 5); // ← just enough to be clickable
+
+    console.time(label + ' positions');
+    var positions = [];
+    var i, item, seed, indexStr, hx, hy;
+    for (i = 0; i < textList.length; i++) {
+        item     = textList[i];
+        seed     = item.datahash || item.category || item.text || item.summary || ('item_' + i);
+        indexStr = 'idx_' + i + '_' + seed;
+        hx       = fnv32(indexStr, 0x811c9dc5);
+        hy       = fnv32(indexStr, 0x33333333);
+        positions.push({
+            x: bounds.minX + (hx / 0xFFFFFFFF) * (bounds.maxX - bounds.minX),
+            y: bounds.minY + (hy / 0xFFFFFFFF) * (bounds.maxY - bounds.minY)
+        });
+    }
+    console.timeEnd(label + ' positions');
+
+    var js, jx, jy;
+    for (i = 0; i < positions.length; i++) {
+        js = fnv32('jitter_' + i, 0xDEADBEEF);
+        jx = ((js & 0xFF) / 255 - 0.5) * dotmaxsize * 2;
+        jy = (((js >> 8) & 0xFF) / 255 - 0.5) * dotmaxsize * 2;
+        positions[i].x = Math.max(bounds.minX, Math.min(bounds.maxX, positions[i].x + jx));
+        positions[i].y = Math.max(bounds.minY, Math.min(bounds.maxY, positions[i].y + jy));
+    }
+
+    var ITERS    = 40;
+    var cellSize = dotmaxsize * 2 + 20;
+    var pass, cx, cy, key, grid, neighbors, n, j;
+    var minDist, dx, dy, dist, push, nx, ny;
+    var r, jitterSeed;
+
+    console.time(label + ' repulsion');
+    for (pass = 0; pass < ITERS; pass++) {
+
+        grid = {};
+        for (i = 0; i < positions.length; i++) {
+            cx  = Math.floor(positions[i].x / cellSize);
+            cy  = Math.floor(positions[i].y / cellSize);
+            key = cx + ',' + cy;
+            if (!grid[key]) grid[key] = [];
+            grid[key].push(i);
+        }
+
+        var dcx, dcy;
+        for (i = 0; i < positions.length; i++) {
+            cx = Math.floor(positions[i].x / cellSize);
+            cy = Math.floor(positions[i].y / cellSize);
+
+            for (dcx = -1; dcx <= 1; dcx++) {
+                for (dcy = -1; dcy <= 1; dcy++) {
+                    neighbors = grid[(cx + dcx) + ',' + (cy + dcy)];
+                    if (!neighbors) continue;
+                    for (n = 0; n < neighbors.length; n++) {
+                        j = neighbors[n];
+                        if (j <= i) continue;
+                        minDist = dotmaxsize + 16;
+                        dx      = positions[j].x - positions[i].x;
+                        dy      = positions[j].y - positions[i].y;
+                        dist    = Math.sqrt(dx*dx + dy*dy) || 0.01;
+                        if (dist < minDist) {
+                            push = (minDist - dist) * 0.8;
+                            nx   = dx / dist;
+                            ny   = dy / dist;
+                            positions[i].x -= nx * push;
+                            positions[i].y -= ny * push;
+                            positions[j].x += nx * push;
+                            positions[j].y += ny * push;
+                        }
+                    }
+                }
+            }
+
+            r          = dotmaxsize / 2;
+            jitterSeed = fnv32('clamp_' + i + '_' + pass, 0xBEEFCAFE);
+			jx = ((jitterSeed & 0xFF) / 255) * dotmaxsize * 1.5;  // ← was r * 0.4
+			jy = (((jitterSeed >> 8) & 0xFF) / 255) * dotmaxsize * 1.5;
+
+            if (positions[i].x < bounds.minX + r)
+                positions[i].x = bounds.minX + r + jx;
+            else if (positions[i].x > bounds.maxX - r)
+                positions[i].x = bounds.maxX - r - jx;
+
+            if (positions[i].y < bounds.minY + r)
+                positions[i].y = bounds.minY + r + jy;
+            else if (positions[i].y > bounds.maxY - r)
+                positions[i].y = bounds.maxY - r - jy;
+        }
+
+        for (i = 0; i < positions.length; i++) {
+            dx      = positions[i].x - centerX;
+            dy      = positions[i].y - centerY;
+            dist    = Math.sqrt(dx*dx + dy*dy) || 0.01;
+            minDist = CENTER_CLEAR_RADIUS + dotmaxsize / 2;
+            if (dist < minDist) {
+                push       = (minDist - dist) * 0.8;
+                nx         = dx / dist;
+                ny         = dy / dist;
+                positions[i].x += nx * push;
+                positions[i].y += ny * push;
+                r          = dotmaxsize / 2;
+                jitterSeed = fnv32('center_' + i, 0xCAFEBABE);
+                jx         = ((jitterSeed & 0xFF) / 255) * dotmaxsize * 0.8;
+                jy         = (((jitterSeed >> 8) & 0xFF) / 255) * dotmaxsize * 0.8;
+                if (positions[i].x < bounds.minX + r)
+                    positions[i].x = bounds.minX + r + jx;
+                else if (positions[i].x > bounds.maxX - r)
+                    positions[i].x = bounds.maxX - r - jx;
+                if (positions[i].y < bounds.minY + r)
+                    positions[i].y = bounds.minY + r + jy;
+                else if (positions[i].y > bounds.maxY - r)
+                    positions[i].y = bounds.maxY - r - jy;
+            }
+        }
+    }
+    console.timeEnd(label + ' repulsion');
+
+    var outputobj = [];
+    var colorSeed;
+    for (i = 0; i < textList.length; i++) {
+        item      = textList[i];
+        colorSeed = item.datahash || item.category || item.text || item.summary || ('item_' + i);
 		outputobj.push({
-			left: parseInt(x - (dotmaxsize / 2)) + "px",
-			top: parseInt(y - (dotmaxsize / 2)) + "px",
-			width: dotmaxsize + 'px',
-			dotmaxsize: dotmaxsize,
-			pcolor: pastel,
-			color: '#' + hashobj.hex.substring(0, 6)
-
+		    left:       Math.round(positions[i].x - dotmaxsize / 2) + 'px',
+		    top:        Math.round(positions[i].y - dotmaxsize / 2) + 'px',
+		    width:      dotmaxsize + 'px',
+		    dotmaxsize: dotmaxsize,
+		    bgDotSize:  BG_DOT_SIZE,
+		    color:      getColorFromSeed(colorSeed),
+		    pcolor:     getColorFromSeed(colorSeed),
+		    index:      i,
+			dotLabel:   getDisplayText(item)
 		});
+    }
 
+    console.timeEnd(label);
+    return outputobj;
+}
 
-	}
+function renderRadialPage(outputobj, canvasEl, page, pageSize, options) {
+    if (!outputobj || !outputobj.length) return;
 
-	//console.log('remaining safe positions ' + safelocationsmap.length);
-	safelocationsmap = [];
+    options  = options  || {};
+    page     = page     || 0;
+    pageSize = pageSize || outputobj.length;
 
-	console.log('safe positions map cleared. new size ' + safelocationsmap.length);
-	return outputobj;
+    var pageStart = page * pageSize;
+    var pageEnd   = Math.min(pageStart + pageSize, outputobj.length);
+    var MIN_FG_SIZE = options.minFgDotSize || 10;
 
-	function cleardots() {
-		document.querySelectorAll(".dot").forEach(el => el.remove());
-	}
+    var i, r, pct, dmax, size, opacity, score;
+    var pageItems = [];
+    for (i = pageStart; i < pageEnd; i++) {
+        score = (options.scores && options.scores[i] !== undefined)
+            ? options.scores[i]
+            : (pageEnd - i);
+        pageItems.push({ index: i, score: score });
+    }
 
-	function getMaxRadiusByAngle(deg) {
+    pageItems.sort(function(a, b) { return b.score - a.score; });
 
-		if (deg > 360)
-			deg = deg - 360;
+    console.log('[renderRadialPage] pageItems after sort (first 5):', 
+                JSON.stringify(pageItems.slice(0,5)));
 
-		var maxRadius;
-		var angle = deg * (Math.PI / 180);
-		if (deg <= maxdiagdeg) {
-			maxRadius = (centerX - (dotmaxsize)) / Math.cos(angle);
-		}
+    var sizeMap    = {};
+    var opacityMap = {};
+    var len        = pageItems.length;
 
-		if (deg > maxdiagdeg && deg <= (180 - maxdiagdeg)) {
-			//console.log('degree ' + angledeg + ' ' + (centerY - 50 )/Math.sin(angle) + ' ' + centerX + ' ' + Math.cos(angle) );
-			maxRadius = Math.abs((centerY - 65) / Math.sin(angle));
-		}
-
-		if (deg > (180 - maxdiagdeg) && deg <= (180 + maxdiagdeg)) {
-			maxRadius = Math.abs((centerX - (dotmaxsize)) / Math.cos(angle));
-		}
-
-		if (deg > (180 + maxdiagdeg) && deg <= (360 - maxdiagdeg)) {
-			maxRadius = Math.abs((centerY - (dotmaxsize)) / Math.sin(angle));
-		}
-
-		if (deg > (360 - maxdiagdeg) && deg <= 360) {
-			maxRadius = Math.abs((centerX - (dotmaxsize)) / Math.cos(angle));
-		}
-
-		return maxRadius;
-	}
-
-	function populatesafelocationsmap(deg) {
-		var dotelems = document.getElementsByClassName('dot');
-		var realdotsize = dotmaxsize;
-
-		//	if (dotelems != null && dotelems.length > 1) realdotsize = dotelems[1].clientWidth;
-
-		//if (realdotsize > 30) realdotsize = 30;
-
-		console.log('realdotsz ' + realdotsize);
-		var cellcount = 0;
-		var skpd = 0;
-		for (var rad = minRadius; rad <= maxDiagonal; rad += (realdotsize * 1.618)) { // going outwards
-			var loggedmsg = [];
-			loggedmsg.push('processing radius ' + rad);
-			var safedistang = Math.atan((realdotsize * 1.8 / rad));
-			var degdiff = Math.ceil(safedistang * (180 / Math.PI)) + 1;
-
-			for (var startdeg = deg; startdeg < deg + 360; startdeg += degdiff * 1.1) {
-				var enddeg = startdeg + (degdiff * 1.1);
-
-				var endrad = rad + (realdotsize * 1.8);
-
-				var stdeg = startdeg;
-				var endeg = enddeg;
-
-				if (stdeg > 360) stdeg -= 360;
-
-				if (endeg > 360) break; //endeg -= 360;
-
-				//console.log('processing startdeg enddeg ' + startdeg + ' ' + enddeg + ' converted ' + stdeg + ' ' + endeg);
-				var maxradforrange = Math.min(getMaxRadiusByAngle(stdeg), getMaxRadiusByAngle(endeg));
-				//	maxradforrange = Math.min(maxradforrange, maxDiagonal);
-
-				maxradforrange = getMaxRadiusByAngle((stdeg + endeg) / 2);
-
-				if ((rad + endrad) / 2 < maxradforrange) {
-
-					safelocationsmap.push(parseInt(stdeg) + ':' + parseInt(endeg) + '::' + parseInt(rad) + ':' + parseInt(endrad));
-					//	console.log('ADDED startdeg ' + startdeg + ' ENDDEG ' + enddeg + ' maxradforrange ' +  maxradforrange + ' endrad ' + endrad );
-					//		drawindicator(stdeg,endeg,rad,endrad);
-					addradiusentry(parseInt(rad));
-					cellcount++;
-				} else {
-					skpd++;
-					//	drawindicator(stdeg,endeg,rad,endrad, true);
-					//	if (startdeg == 189 ) console.log('radii ' + getMaxRadiusByAngle(stdeg) + ' ' + getMaxRadiusByAngle(endeg) + ' --- ' + stdeg + ' ' + endeg);
-					//	console.log('SKIPPED startdeg ' + startdeg + ' ENDDEG ' + enddeg + ' maxradforrange ' +  maxradforrange + ' endrad ' + endrad );
-				}
-			}
-
-			loggedmsg.push('processed ');
-			//console.log(...loggedmsg);
-		}
-		console.log('no of cells ' + cellcount + ' skipped ' + skpd);
-	}
-
-	function addradiusentry(radius) {
-
-		if (typeof dotsperrad[radius] != 'undefined') {
-			dotsperrad[radius] += 1;
+    for (r = 0; r < len; r++) {
+        pct  = r / len;
+        dmax = outputobj[pageItems[r].index].dotmaxsize;
+		if (pct < 0.20) {
+		    size    = dmax;
+		    opacity = 1.0;
+		} else if (pct < 0.50) {
+		    size    = Math.max(MIN_FG_SIZE, dmax * 0.60);
+		    opacity = 0.75;
 		} else {
-			dotsperrad[radius] = 1;
+		    size    = Math.max(MIN_FG_SIZE, dmax * 0.35);
+		    opacity = 0.50;
 		}
+        sizeMap[pageItems[r].index]    = size;
+        opacityMap[pageItems[r].index] = opacity;
 
+    
+    }
+
+    var dot, pos, isForeground, bg, pe, rankFade, halfDiff;
+
+    for (i = 0; i < outputobj.length; i++) {
+        dot = document.getElementById('dot-' + i);
+        if (!dot) {
+            if (i < 3) console.warn('[renderRadialPage] dot-' + i + ' not found in DOM');
+            continue;
+        }
+
+        pos          = outputobj[i];
+        isForeground = (i >= pageStart && i < pageEnd);
+
+        if (isForeground) {
+            size    = sizeMap[i]    || pos.dotmaxsize;
+            opacity = opacityMap[i] || 1.0;
+            bg      = pos.color;
+            pe      = 'auto';
+        } else {
+            size     = pos.bgDotSize;
+            rankFade = i / outputobj.length;
+            opacity  = options.hideBgDots ? 0 : Math.max(0.15, 0.55 - rankFade * 0.40);
+            bg       = '#b0b0b0';
+            pe       = options.hideBgDots ? 'none' : 'auto';
+        }
+
+        halfDiff         = (pos.dotmaxsize - size) / 2;
+        dot.style.width  = size + 'px';
+        dot.style.height = size + 'px';
+        dot.style.left   = (parseInt(pos.left) + halfDiff) + 'px';
+        dot.style.top    = (parseInt(pos.top)  + halfDiff) + 'px';
+        dot.style.backgroundColor = bg;
+        dot.style.opacity         = opacity.toFixed(2);
+        dot.style.pointerEvents   = pe;
+        dot.style.cursor          = isForeground ? 'pointer' : 'default';
+        dot.style.borderRadius    = '50%';
+        dot.style.position        = 'absolute';
+        dot.style.zIndex          = isForeground
+            ? String(100 + len - (i - pageStart))
+            : '1';
+
+    
+    }
+	
+	// ── Page indicator ────────────────────────────────────────────
+	if (options.showPageIndicator) {
+	    var existing = canvasEl.querySelector('.radial-page-indicator');
+	    if (existing) existing.parentNode.removeChild(existing);
+
+	    var totalPages = Math.ceil(outputobj.length / pageSize);
+	    if (totalPages > 1) {
+	        var indicator = document.createElement('div');
+	        indicator.className = 'radial-page-indicator';
+	        indicator.style.cssText = [
+	            'position:absolute',
+	            'bottom:14px',
+	            'left:50%',
+	            'transform:translateX(-50%)',
+	            'font-size:12px',
+	            'color:#888',
+	            'background:rgba(255,255,255,0.85)',
+	            'border:0.5px solid #ddd',
+	            'border-radius:20px',
+	            'padding:4px 12px',
+	            'pointer-events:none',
+	            'z-index:300',
+	            'white-space:nowrap'
+	        ].join(';');
+	        var showing = pageEnd - pageStart;
+	        indicator.textContent = (page + 1) + ' of ' + totalPages + '  \u00b7  ' + showing + ' shown';
+	        canvasEl.appendChild(indicator);
+	    }
 	}
+}
 
-	function getsafeangleforradius(rad) {
-		var dotelems = document.getElementsByClassName('dot');
-		var realdotsize = dotmaxsize;
+function makeRadialScrollHandler(outputobj, canvasEl, pageSize, options) {
+    options  = options  || {};
+    pageSize = pageSize || 30;
 
-		if (dotelems != null && dotelems.length > 1) realdotsize = dotelems[1].clientWidth;
+    var state = {
+        page:       0,
+        pageSize:   pageSize,
+        totalPages: Math.ceil(outputobj.length / pageSize)
+    };
 
-		var safedistang = Math.atan((realdotsize * 2 / rad));
+    renderRadialPage(outputobj, canvasEl, state.page, state.pageSize, options);
 
-		return Math.ceil(safedistang * (180 / Math.PI))
+    function goToPage(newPage) {
+        if (newPage < 0 || newPage >= state.totalPages) return;
+        if (newPage === state.page) return;
+        state.page = newPage;
+        renderRadialPage(outputobj, canvasEl, state.page, state.pageSize, options);
+    }
 
-	}
+    var touchStartY = 0;
 
-	function drawindicator(stdeg, endeg, rad, endrad, skipped) {
+    canvasEl.addEventListener('touchstart', function(e) {
+        touchStartY = e.touches[0].clientY;
+    }, { passive: true });
 
-		if (stdeg > endeg) endeg += 360;
-		var radius = (parseInt(rad) + parseInt(endrad)) / 2;
-		var angledeg = (parseInt(stdeg) + parseInt(endeg)) / 2;
+    canvasEl.addEventListener('touchend', function(e) {
+        var deltaY = touchStartY - e.changedTouches[0].clientY;
+        if (Math.abs(deltaY) < 40) return;
+        goToPage(deltaY > 0 ? state.page + 1 : state.page - 1);
+    }, { passive: true });
 
-		if (angledeg > 360) angledeg -= 360;
+   /* canvasEl.addEventListener('wheel', function(e) {
+        if (state.totalPages <= 1) return;
+        e.preventDefault();
+        goToPage(e.deltaY > 0 ? state.page + 1 : state.page - 1);
+    }, { passive: false });*/
 
-		var angle = angledeg * (Math.PI / 180);
-		var x = parseInt(centerX + (radius * Math.cos(angle)));
-		var y = parseInt(centerY - (radius * Math.sin(angle)));
-
-		//console.log(i + ' hash ' + hashval + ' angle ' + angledeg + ' maxradius ' + maxRadius + ' radius ' + radius + ' x:y ' + x + ':' + y);
-		var div = document.createElement('div');
-		// Set the position of the div element
-		div.style.position = "absolute";
-		div.innerHTML = '+';
-		div.style.left = parseInt(x) + "px";
-		div.style.top = parseInt(y) + "px";
-
-		//	console.log( ' x:y ' + parseInt(x) + ':' + parseInt(y));
-		div.title = stdeg + '-' + endeg + ':' + radius + ' ::' + div.style.left + ' ' + div.style.top;
-		//div.id = text.trim();
-		div.style.maxWidth = '4px';
-
-		if (typeof skipped != 'undefined' && skipped) {
-			div.style.color = '#cbcbcb';
-		} else {
-			div.style.color = '#232323';
-		}
-
-		div.style.zIndex = highestz - i;
-		//div.classList.add('dot');
-
-		// Add the div element to the body of the document
-		document.body.appendChild(div);
-	}
-
-	function setpastelcolor(x, pastel) {
-		var dots = document.getElementsByClassName('dot');
-		setTimeout(function() {
-			if (!dots[x].classList.contains('centerdot')) {
-				dots[x].style.backgroundColor = pastel;
-				//dots[x].style.backgroundImage = 'linear-gradient(60deg, ' + pastel + ' 20%,' + pastel + ' 60%,' + pastel + ' 70%, #fafafa 100%)'; /* Add gradient */
-				//dots[x].style.boxShadow ="0 2px 6px rgba(0, 0, 0, 0.1)";  /* Add box shadow for depth */
-			}
-		}, 500);
-	}
-
-	function removeshake(x) {
-		var dots = document.getElementsByClassName('dot');
-		setTimeout(function() { if (!dots[x].classList.contains('centerdot')) dots[x].classList.remove('shake'); }, 1000);
-	}
-
-	function addangletoradius(rad, ang) {
-		if (positionsrad.has(rad)) {
-			var angles = positionsrad.get(rad);
-			angles.add(ang);
-			positionsrad.set(rad, angles);
-		} else {
-			var angles = new Set();
-			angles.add(ang);
-			positionsrad.set(rad, angles);
-		}
-	}
-
-	function getanglereservecount(angledeg) {
-		var count = 10;
-		if (angledeg <= maxdiagdeg / 2) {
-			count = 15;
-		}
-
-
-
-		if (angledeg > (180 - (maxdiagdeg / 2)) && angledeg <= (180 + (maxdiagdeg / 2))) {
-			count = 15;
-		}
-
-
-		if (angledeg > (360 - (maxdiagdeg / 2)) && angledeg <= 360) {
-			count = 15;
-		}
-		return count;
-	}
-
-	function rotateinspace(deg, safeangle, pos) {
-		//console.log('in rotateinspace deg ' + deg + ' safe ' + safeangle + ' pos ' + pos);
-		var stretch = false;
-		var shrink = false;
-
-		if (deg <= maxdiagdeg / 2) {
-			deg += safeangle * 2;
-		}
-
-		if (deg > maxdiagdeg / 2 && deg <= (180 - (maxdiagdeg / 2))) {
-			if (pos <= 0.5)
-				stretch = true;
-			else {
-				shrink = true;
-			}
-
-			if (deg < 90)
-				deg += safeangle;
-			else
-				deg -= safeangle;
-		}
-
-		if (deg > (180 - (maxdiagdeg / 2)) && deg <= (180 + (maxdiagdeg / 2))) {
-			deg += safeangle * 2;
-		}
-
-		if (deg > (180 + maxdiagdeg / 2) && deg <= (360 - (maxdiagdeg / 2))) {
-			if (pos <= 0.5)
-				stretch = true;
-			else {
-				shrink = true;
-			}
-
-			deg += safeangle;
-		}
-
-		if (deg > (360 - (maxdiagdeg / 2)) && deg <= 360) {
-			deg += safeangle * 2;
-			if (pos <= 0.5)
-				stretch = true;
-			else {
-				shrink = true;
-			}
-		}
-
-		return { "newangledeg": deg, "stretch": stretch };
-	}
-
-} // displayRadialText end
+    return {
+        goToPage:   goToPage,
+        getPage:    function() { return state.page; },
+        totalPages: state.totalPages
+    };
+}
 
 // Hash function
 function hashCode(str) {
@@ -8339,30 +8838,29 @@ function creatergbmapofpastels() {
 }
 
 function findclosestrgbfrommap(col) {
-	//document.getElementById('b64').style.backgroundColor = col; /// Remove this LINE
-	col = col.replace('#', '');
-	var rgbobjforcol = hexToRgb1(col);
+    col = col.replace('#', '');
+    var rgbobjforcol = hexToRgb1(col);
 
-	//console.log('Looking for the closest color for ' + col + ' ' + JSON.stringify(rgbobjforcol));
+    // ← Guard: if hex is invalid, return a default pastel
+    if (rgbobjforcol == null) {
+        return '#B6D8F2';
+    }
 
-	var distance = -1;
-	var closestcolor;
-	const rgbkeys = Object.keys(rgbmap);
-	rgbkeys.forEach((key, index) => {
-		//console.log(`${key}: ${rgbmap[key]}`);
-		var thisdist = calculatedistance(rgbobjforcol, rgbmap[key]);
-		if (distance < 0 || thisdist < distance) {
+    var distance = -1;
+    var closestcolor = '#B6D8F2'; // ← default instead of undefined
+    var rgbkeys = Object.keys(rgbmap);
 
-			if (distance > 0) {
-				//document.getElementById('json').style.backgroundColor = '#'+key; /// Remove this LINE
-				closestcolor = '#' + key;
-				//console.log('Idx ' + index + 'Closest  ' + closestcolor + ' distance ' + thisdist);
-			}
-			distance = thisdist;
-		}
-	});
+    rgbkeys.forEach(function(key) {
+        var mapColor = rgbmap[key];
+        if (mapColor == null) return; // ← guard against bad map entries
+        var thisdist = calculatedistance(rgbobjforcol, mapColor);
+        if (distance < 0 || thisdist < distance) {
+            closestcolor = '#' + key; // ← moved outside the inner if
+            distance = thisdist;
+        }
+    });
 
-	return closestcolor;
+    return closestcolor;
 }
 
 function calculatedistance(obj1, obj2) {
