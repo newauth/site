@@ -443,31 +443,9 @@
 	var pinnedDotId      = null;
 	var hoverTimers      = {};
 
-	function showBasicPopup(dotElement) {
-	    // ✅ Extract data BEFORE replacing innerHTML
-	    var ticker = '', price = '', time = '', exchange = '';
-	    
-	    // Try from dot-popup li items first
-	    var popup = dotElement.querySelector('.dot-popup');
-	    if (popup) {
-	        var items = popup.querySelectorAll('li');
-	        for (var i = 0; i < items.length; i++) {
-	            var text = items[i].textContent;
-	            if (text.indexOf('Ticker:')   > -1) ticker   = text.split(':')[1].trim().toUpperCase();
-	            if (text.indexOf('Price:')    > -1) price    = text.split(':')[1].trim();
-	            if (text.indexOf('Time:')     > -1) time     = text.split(':')[1].trim();
-	            if (text.indexOf('Exchange:') > -1) exchange = text.split(':')[1].trim();
-	        }
-	    }
-
-	    // Fallback — ticker from span
-	    if (!ticker) {
-	        var tickerSpan = dotElement.querySelector('span[style*="pointer-events: none"]');
-	        if (tickerSpan) ticker = tickerSpan.textContent.trim();
-	    }
-
-	    var bg = dotElement.dataset.savedBgClr || dotElement.style.backgroundColor || '#3b82f6';
-	    dotElement.savedpastel         = bg;
+	function showBasicPopup(dotElement, ticker, price, time, exchange, bg) {
+	    bg = bg || dotElement.dataset.savedBgClr || dotElement.style.backgroundColor || '#3b82f6';
+	    dotElement.savedpastel = bg;
 	    dotElement.style.background    = 'transparent';
 	    dotElement.style.position      = 'fixed';
 	    dotElement.style.overflow      = 'hidden';
@@ -488,7 +466,6 @@
 	            'display:flex;',
 	            'flex-direction:column;',
 	            'gap:12px;',
-	            'overflow:auto;',
 	            'font-family:Inter,Arial,sans-serif;',
 	        '">',
 	            '<div style="font-size:11px;letter-spacing:.1em;opacity:0.8;">EARNINGS</div>',
