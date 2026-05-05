@@ -485,6 +485,7 @@
 	    ].join('');
 	}
 
+	
 	function smartExpand(dotElement, callback) {
 		logDotCSS(dotElement, 'BEFORE smartExpand');
 	    // ✅ Capture rect FIRST before any style changes
