@@ -3919,21 +3919,21 @@ function displaysidepanel(input) {
         var existing = document.getElementById('dot-sidepanel-' + obj.id);
         if (existing) return; // don't duplicate
 
-        var div = document.createElement('div');
+        var div = document.createElement('div');	
+		
         div.id = 'dot-sidepanel-' + obj.id;
-        div.style.cssText = [
-            'background:#fff',
-            'margin-bottom:10px',
-            'padding:10px',
-            'border-radius:5px',
-            'box-shadow:0 2px 5px rgba(0,0,0,0.05)',
-            'cursor:pointer',
-            'position:relative',
-            'opacity:0',
-            'transform:translateY(-20px)',
-            'transition:transform 0.2s ease, opacity 0.5s ease'
-        ].join(';');
-
+		div.style.cssText = [
+		    'margin-bottom:10px',
+		    'padding:10px',
+		    'border-radius:5px',
+		    'box-shadow:0 2px 5px rgba(0,0,0,0.05)',
+		    'cursor:pointer',
+		    'position:relative',
+		    'opacity:0',
+		    'transform:translateY(-20px)',
+		    'transition:transform 0.2s ease, opacity 0.5s ease'
+		].join(';');
+		
         // Set sort field data attribute
         if (sortfield && sortfield.length > 0) {
             var postData = obj.data;
@@ -3946,14 +3946,25 @@ function displaysidepanel(input) {
                 div.setAttribute('data-' + sortfield, fieldVal);
             }
         }
-
-        // Text content
-        var textSpan = document.createElement('span');
-        textSpan.style.cssText = 'display:block;font-size:13px;margin-bottom:18px;';
-        var postData2 = obj.data;
+		
+		var postData2 = obj.data;
         if (typeof postData2 === 'string') {
             try { postData2 = JSON.parse(postData2); } catch(e) { postData2 = {}; }
         }
+
+        // Text content
+        var textSpan = document.createElement('span');
+		var reportTime = postData2.ReportTime || '';
+		var isBMO = reportTime.indexOf('BMO') > -1;       
+		
+		if (isBMO) {
+		    div.style.background = 'linear-gradient(to bottom, #0f172a 0%, #1e3a5f 20%, #4a7fa5 40%, #b0c8d8 60%, #e8f0f5 80%, #ffffff 100%)';
+		    textSpan.style.cssText = 'display:block;font-size:13px;margin-bottom:18px;color:white;';
+		    sentSpan.style.color = 'rgba(255,255,255,0.6)';
+		} else {
+		    div.style.background = '#ffffff';
+		    textSpan.style.cssText = 'display:block;font-size:13px;margin-bottom:18px;';
+		}
         textSpan.textContent = (postData2 && postData2.text) ? postData2.text : '';
         div.appendChild(textSpan);
 
@@ -3994,10 +4005,11 @@ function displaysidepanel(input) {
 		}
 
         // Sent timestamp
-        var sentSpan = document.createElement('span');
-        sentSpan.textContent = obj.sent || '';
-        sentSpan.style.cssText = 'position:absolute;bottom:5px;right:5px;font-size:0.8em;color:#888;';
-        div.appendChild(sentSpan);
+		var sentSpan = document.createElement('span');
+		sentSpan.textContent = obj.sent || '';
+		sentSpan.style.cssText = 'position:absolute;bottom:5px;right:5px;font-size:0.8em;color:' + 
+		    (isBMO ? 'rgba(255,255,255,0.6)' : '#888') + ';';
+		div.appendChild(sentSpan);
 
         // Event handlers
         var overHandler  = createMouseOverHandler(div, obj);
