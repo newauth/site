@@ -3719,11 +3719,10 @@ class SchemaOrchestrator {
 	        seg.asuuid ? seg.id : (seg.displayID || this.db.hashUUID(seg.id))
 	    );
 
-	    if (useShortUrl) {
-	        // /.agnts or /.agnts/tenantId/...
-	        const base = `${baseUrl}/.${this.currentApp.id}`;
-	        return pathIds.length ? `${base}/${pathIds.join('/')}` : base;
-	    }
+		if (useShortUrl) {
+		    const base = `${baseUrl}/.apps/${this.currentApp.id}`;
+		    return pathIds.length ? `${base}/${pathIds.join('/')}` : base;
+		}
 
 	    // default long format
 	    const base = `${baseUrl}/t/apps/${this.currentApp.id}`;

@@ -13268,8 +13268,8 @@
 		requestAnimationFrame(() => {
 		  const form = document.querySelector('#add-form');
 		  if (!form) return;
-		  
-		  // Lock access to private for agntmaster
+
+		  // Lock access to private for agntmaster — UNCHANGED
 		  const pillContainer = form.querySelector('[data-access-value]')?.parentElement;
 		  if (pillContainer) {
 		    pillContainer.innerHTML = `
@@ -13290,19 +13290,50 @@
 		        </div>
 		      </div>
 		    `;
-		    // Update hidden inputs
 		    const readInput  = form.querySelector('input[name="readAccess"]');
 		    const writeInput = form.querySelector('input[name="writeAccess"]');
 		    if (readInput)  readInput.value  = 'owner';
 		    if (writeInput) writeInput.value = 'owner';
 		  }
 
-		  // Hook form submit for overlay
+		  // Hook form submit — check invite then show overlay
 		  if (!form._agntsOverlayHooked) {
 		    form._agntsOverlayHooked = true;
-		    form.addEventListener('submit', () => {
-		      _showAgentMasterCreatingOverlay();
-		    }, { once: true });
+		    
+		    // Store reference to orchestrator's native onsubmit before we override
+		    const _nativeSubmit = form.onsubmit;
+			form.onsubmit = null;
+
+			const submitHandler = async (e) => {
+			  e.preventDefault();
+			  e.stopPropagation();
+			  e.stopImmediatePropagation();
+
+			  const email = form.querySelector('input[name="contactemail"]')?.value?.trim();
+			  if (email) {
+			    try {
+			      const res = await fetch(`/newauth/api/checkagntsinvite?email=${encodeURIComponent(email)}`);
+			      if (!res.ok) {
+			        const data = await res.json();
+			        window.app?.showNotification?.(
+			          data.error || 'This email is not on the invite list.',
+			          'error',
+			          5000
+			        );
+			        return; // stay — listener remains active for retry
+			      }
+			    } catch (err) {
+			      console.warn('[agnts] Invite check failed:', err.message);
+			    }
+			  }
+
+			  // Check passed — remove listener, show overlay, fire native handler
+			  form.removeEventListener('submit', submitHandler, { capture: true });
+			  _showAgentMasterCreatingOverlay();
+			  if (_nativeSubmit) _nativeSubmit.call(form, e);
+			};
+
+			form.addEventListener('submit', submitHandler, { capture: true });
 		  }
 		});
 	    return result;

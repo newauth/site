@@ -626,7 +626,56 @@
 
 	        addCloseButton(dotElement);
 	        fetchAndRenderSignal(dotElement, obj);
+			// In showSignal, after innerHTML is set:
+			overlaySignalOutcomes(dotElement, obj.data.Ticker || obj.data.ticker);
 	    }
+	}
+	
+	// After rendering timeline dots in showSignal:
+	function overlaySignalOutcomes(dotElement, ticker) {
+	    fetch('/newauth/api/earnings/' + ticker + '/outcomes')
+	        .then(function(res) { return res.json(); })
+	        .then(function(outcomes) {
+	            if (!outcomes || !outcomes.length) return;
+
+	            // Find timeline dots in the signal card
+	            var timelineDots = dotElement.querySelectorAll('.earnings-dot');
+	            
+	            outcomes.forEach(function(outcome, idx) {
+	                if (idx >= timelineDots.length) return;
+	                if (!outcome.outcomeFlag) return;
+
+	                var dot = timelineDots[idx];
+	                var icon = document.createElement('span');
+	                icon.style.cssText = [
+	                    'position:absolute',
+	                    'top:-14px',
+	                    'left:50%',
+	                    'transform:translateX(-50%)',
+	                    'font-size:10px',
+	                    'font-weight:700',
+	                    'pointer-events:none'
+	                ].join(';');
+
+	                if (outcome.outcomeFlag === 'CORRECT') {
+	                    icon.textContent = outcome.signal === 'BUY' ? '✓' : '✓';
+	                    icon.style.color = outcome.signal === 'BUY' ? '#16a34a' : '#dc2626';
+	                } else if (outcome.outcomeFlag === 'WRONG') {
+	                    icon.textContent = '✗';
+	                    icon.style.color = '#6b7280';
+	                } else if (outcome.outcomeFlag === 'MISSED_BIG') {
+	                    icon.textContent = '⚠';
+	                    icon.style.color = '#f59e0b';
+	                }
+	                // AVOIDED_NOISE — no icon, keep clean
+
+	                dot.style.position = 'relative';
+	                dot.appendChild(icon);
+	            });
+	        })
+	        .catch(function(err) {
+	            console.warn('Could not load signal outcomes:', err);
+	        });
 	}
 
 	// ─────────────────────────────────────────────

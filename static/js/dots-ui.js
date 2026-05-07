@@ -3680,7 +3680,6 @@ function updateSidepanelCount() {
     var header = document.getElementById('sp-header');
     if (!header) return;
 
-    // Count visible sidepanel items
     var listContainer = document.getElementById('sp-list');
     if (!listContainer) return;
 
@@ -3690,15 +3689,27 @@ function updateSidepanelCount() {
         if (allCards[i].style.display !== 'none') visibleCount++;
     }
 
-    header.innerHTML = [
-        '<div style="display:flex;justify-content:space-between;font-size:13px;font-weight:bold;">',
-            '<span>Records: ' + visibleCount + '</span>',
-        '</div>',
-        '<div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-top:2px;">',
-            '<span>Views: '    + toApproximateWords(totalViews)    + '</span>',
-            '<span>Comments: ' + toApproximateWords(totalComments) + '</span>',
-        '</div>'
-    ].join('');
+    // Fetch accuracy stats
+    fetch('/newauth/api/earnings/accuracy')
+        .then(function(res) { return res.json(); })
+        .then(function(stats) {
+            var buyPct  = stats.BUY  ? Math.round(100 * stats.BUY.correct  / stats.BUY.total)  : '--';
+            var sellPct = stats.SELL ? Math.round(100 * stats.SELL.correct / stats.SELL.total) : '--';
+
+            header.innerHTML = [
+                '<div style="display:flex;justify-content:space-between;font-size:13px;font-weight:bold;">',
+                    '<span>Records: ' + visibleCount + '</span>',
+                '</div>',
+                '<div style="display:flex;gap:8px;margin-top:6px;font-size:11px;">',
+                    '<span style="color:#16a34a;font-weight:700;">BUY ' + buyPct + '%</span>',
+                    '<span style="color:#dc2626;font-weight:700;">SELL ' + sellPct + '%</span>',
+                '</div>'
+            ].join('');
+        })
+        .catch(function() {
+            // fallback — just show count
+            header.querySelector('span').textContent = 'Records: ' + visibleCount;
+        });
 }
 
 function logDotCSS(dotElement, label) {
@@ -4030,6 +4041,8 @@ function displaysidepanel(input) {
             div.style.transform = 'translateY(0)';
         }, 100 * (index + 1));
     });
+	
+	setTimeout(function() { updateSidepanelCount(); }, 50);
 
     // ── Scrollbar styles once ──────────────────────────────────
     if (!document.getElementById('sp-scrollbar-style')) {
