@@ -64,10 +64,10 @@ SchemaOrchestrator.prototype.initEtsyAuth = async function() {
         
         var etsySellerId = seller.ID;
         
-        var response = await fetch('/api/etsy/auth/init?etsySellerId=' + encodeURIComponent(etsySellerId), {
-            method: 'GET',
-            credentials: 'include'
-        });
+        var response = await 		fetch('/newauth/api/connect/etsy/init?context=' + encodeURIComponent(JSON.stringify({
+		    sellerId: etsySellerId,
+		    sellerName: seller.name || seller.dotLabel
+		})), { method: 'GET', credentials: 'include' });
         
         if (!response.ok) {
             throw new Error('Auth init failed: ' + response.status);
@@ -79,7 +79,7 @@ SchemaOrchestrator.prototype.initEtsyAuth = async function() {
         sessionStorage.setItem('etsy_seller_id', etsySellerId);
         sessionStorage.setItem('etsy_seller_name', seller.name || seller.dotLabel);
         
-        window.location.href = data.authUrl;
+        var popup = newauthOAuth.centeredPopup(data.authUrl, 'etsy_oauth', 560, 680);
         
     } catch (err) {
         console.error('[InventoryExtension] Etsy auth init failed:', err);
@@ -87,80 +87,6 @@ SchemaOrchestrator.prototype.initEtsyAuth = async function() {
     }
 };
 
-// ─────────────────────────────────────────────
-// Handle OAuth Callback (tokens in response body)
-// ─────────────────────────────────────────────
-SchemaOrchestrator.prototype.handleEtsyCallback = async function() {
-    var urlParams = new URLSearchParams(window.location.search);
-    var code = urlParams.get('code');
-    var state = urlParams.get('state');
-    var shopId = urlParams.get('shop_id');
-    
-    if (!code || !state) return;
-    
-    var storedState = sessionStorage.getItem('etsy_auth_state');
-    var etsySellerId = sessionStorage.getItem('etsy_seller_id');
-    var sellerName = sessionStorage.getItem('etsy_seller_name');
-    
-    if (state !== storedState) {
-        this.showNotification('⚠️ Auth state mismatch — possible CSRF', 'error');
-        return;
-    }
-    
-    sessionStorage.removeItem('etsy_auth_state');
-    sessionStorage.removeItem('etsy_seller_id');
-    sessionStorage.removeItem('etsy_seller_name');
-    
-    // Clean URL (remove OAuth params)
-    window.history.replaceState({}, document.title, window.location.pathname);
-    
-    try {
-        // Exchange code for tokens (tokens returned in response body, NOT URL)
-        var response = await fetch('/api/etsy/auth/callback?code=' + encodeURIComponent(code) + 
-                                   '&state=' + encodeURIComponent(state) + 
-                                   '&shop_id=' + encodeURIComponent(shopId) + 
-                                   '&etsySellerId=' + encodeURIComponent(etsySellerId), {
-            method: 'GET',
-            credentials: 'include'
-        });
-        
-        if (!response.ok) {
-            throw new Error('Token exchange failed');
-        }
-        
-        var tokenData = await response.json();
-        
-        // Save tokens via your existing save flow (tokens in body, encrypted on save)
-        var seller = this._getCurrentSeller();
-        if (seller) {
-            var etsyConfig = {
-                connected: true,
-                shopId: tokenData.shopId,
-                accessToken: tokenData.accessToken,
-                refreshToken: tokenData.refreshToken,
-                tokenExpiresAt: Date.now() + (parseInt(tokenData.expiresIn) * 1000),
-                lastSync: Date.now()
-            };
-            
-            this._setIntegrationConfig(seller, 'etsy', etsyConfig);
-            
-            await this.db.savePartialAppData(
-                this.currentApp.id,
-                { items: [seller] },
-                { operation: 'update', entityType: 'seller', appId: this.currentApp.id, isPartial: true }
-            );
-            
-            this.showNotification('✅ Etsy connected for ' + (sellerName || 'seller') + '!', 'success');
-            
-            // Trigger initial sync
-            await this._syncEtsyOrders(seller);
-        }
-        
-    } catch (err) {
-        console.error('[InventoryExtension] Etsy callback failed:', err);
-        this.showNotification('❌ Etsy connection failed: ' + err.message, 'error');
-    }
-};
 
 // ─────────────────────────────────────────────
 // ETSY SYNC (auto on page load)
@@ -168,8 +94,8 @@ SchemaOrchestrator.prototype.handleEtsyCallback = async function() {
 SchemaOrchestrator.prototype.maybeEtsySync = async function() {
     if (!this.currentApp || this.currentApp.id !== 'inventory') return;
     
-    // Check for OAuth callback first
-    await this.handleEtsyCallback();
+    // Check for OAuth callback first-- 
+    //await this.handleEtsyCallback();
     
     var seller = this._getCurrentSeller();
     var etsyConfig = this._getIntegrationConfig(seller, 'etsy');
@@ -207,7 +133,7 @@ SchemaOrchestrator.prototype._syncEtsyOrders = async function(seller) {
     var etsySellerId = seller.ID;
     var lastSync = etsyConfig.lastSync || 0;
 
-    var response = await fetch('/api/etsy/data?etsySellerId=' + encodeURIComponent(etsySellerId) + 
+    var response = await fetch('/newauth/api/connect/etsy/data?etsySellerId=' + encodeURIComponent(etsySellerId) + 
                                '&tenantId=' + encodeURIComponent(this.currentUserId || 'default') +
                                '&lastSyncTimestamp=' + lastSync +
                                '&accessToken=' + encodeURIComponent(etsyConfig.accessToken) +

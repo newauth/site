@@ -633,45 +633,103 @@
 	
 	// After rendering timeline dots in showSignal:
 	function overlaySignalOutcomes(dotElement, ticker) {
+	    function applyOutcomes(outcomes) {
+	        if (!outcomes || !outcomes.length) return;
+
+	        // Build map by "Mon 'YY" format matching timeline-date text
+	        var outcomeByLabel = {};
+	        outcomes.forEach(function(o) {
+	            if (!o.earningsDate || !o.outcomeFlag) return;
+	            // "2026-02-10" → "Feb '26"
+	            var parts = o.earningsDate.split('-');
+	            var year  = parts[0].substring(2); // "26"
+	            var month = parseInt(parts[1], 10);
+	            var monthNames = ['Jan','Feb','Mar','Apr','May','Jun',
+	                              'Jul','Aug','Sep','Oct','Nov','Dec'];
+	            var label = monthNames[month - 1] + " '" + year; // "Feb '26"
+	            outcomeByLabel[label] = o;
+	        });
+
+	        // Find all timeline items
+	        var timelineItems = dotElement.querySelectorAll('.timeline-item');
+	        if (!timelineItems.length) {
+	            console.warn('No .timeline-item elements found for', ticker);
+	            return;
+	        }
+
+	        timelineItems.forEach(function(item) {
+	            var dateEl = item.querySelector('.timeline-date');
+	            if (!dateEl) return;
+
+	            var label   = dateEl.textContent.trim(); // "Feb '26"
+	            var outcome = outcomeByLabel[label];
+	            if (!outcome) return;
+
+	            var dotContainer = item.querySelector('.timeline-dot-container');
+	            if (!dotContainer) return;
+
+	            // Remove existing icon
+	            var existing = dotContainer.querySelector('.outcome-icon');
+	            if (existing) existing.remove();
+
+	            var icon = document.createElement('span');
+	            icon.className = 'outcome-icon';
+	            icon.style.cssText = [
+	                'position:absolute',
+	                'top:4px',
+	                'left:50%',
+	                'transform:translateX(-50%)',
+	                'font-size:11px',
+	                'font-weight:700',
+	                'pointer-events:none',
+	                'white-space:nowrap',
+	                'z-index:20'
+	            ].join(';');
+
+	            var signal = outcome.signal;
+	            var flag   = outcome.outcomeFlag;
+
+	            if (flag === 'CORRECT') {
+	                if (signal === 'BUY') {
+	                    icon.textContent = '✓';
+	                    icon.style.color = '#16a34a';
+	                    icon.title = 'Correct BUY — rose';
+	                } else if (signal === 'SELL') {
+	                    icon.textContent = '✓';
+	                    icon.style.color = '#dc2626';
+	                    icon.title = 'Correct SELL — fell';
+	                } else {
+	                    icon.textContent = '○';
+	                    icon.style.color = '#6b7280';
+	                    icon.title = signal + ' — correctly avoided noise';
+	                }
+	            } else if (flag === 'WRONG') {
+	                icon.textContent = '✗';
+	                icon.style.color = '#9ca3af';
+	                icon.title = 'Wrong ' + signal + ' call';
+	            } else if (flag === 'MISSED_BIG') {
+	                icon.textContent = '⚠';
+	                icon.style.color = '#f59e0b';
+	                icon.title = signal + ' — missed big move!';
+	            } else {
+	                return;
+	            }
+
+	            dotContainer.appendChild(icon);
+	        });
+	    }
+
+	    // Cache
+	    if (outcomesCache[ticker]) {
+	        applyOutcomes(outcomesCache[ticker]);
+	        return;
+	    }
+
 	    fetch('/newauth/api/earnings/' + ticker + '/outcomes')
 	        .then(function(res) { return res.json(); })
 	        .then(function(outcomes) {
-	            if (!outcomes || !outcomes.length) return;
-
-	            // Find timeline dots in the signal card
-	            var timelineDots = dotElement.querySelectorAll('.earnings-dot');
-	            
-	            outcomes.forEach(function(outcome, idx) {
-	                if (idx >= timelineDots.length) return;
-	                if (!outcome.outcomeFlag) return;
-
-	                var dot = timelineDots[idx];
-	                var icon = document.createElement('span');
-	                icon.style.cssText = [
-	                    'position:absolute',
-	                    'top:-14px',
-	                    'left:50%',
-	                    'transform:translateX(-50%)',
-	                    'font-size:10px',
-	                    'font-weight:700',
-	                    'pointer-events:none'
-	                ].join(';');
-
-	                if (outcome.outcomeFlag === 'CORRECT') {
-	                    icon.textContent = outcome.signal === 'BUY' ? '✓' : '✓';
-	                    icon.style.color = outcome.signal === 'BUY' ? '#16a34a' : '#dc2626';
-	                } else if (outcome.outcomeFlag === 'WRONG') {
-	                    icon.textContent = '✗';
-	                    icon.style.color = '#6b7280';
-	                } else if (outcome.outcomeFlag === 'MISSED_BIG') {
-	                    icon.textContent = '⚠';
-	                    icon.style.color = '#f59e0b';
-	                }
-	                // AVOIDED_NOISE — no icon, keep clean
-
-	                dot.style.position = 'relative';
-	                dot.appendChild(icon);
-	            });
+	            outcomesCache[ticker] = outcomes;
+	            applyOutcomes(outcomes);
 	        })
 	        .catch(function(err) {
 	            console.warn('Could not load signal outcomes:', err);

@@ -1198,6 +1198,8 @@ class SchemaOrchestrator {
 		            this.setupEventListeners();
 		            this.setupPopstateHandler();
 		            this.setupSearch();
+					
+					_installOAuthListener(this);
 
 		            if (!userloggedin) {
 		                this._createGuestModeBanner();

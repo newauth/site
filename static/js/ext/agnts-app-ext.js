@@ -889,9 +889,10 @@
 	}
 	
 	const SnippetHistory = (() => {
-	  const DB_NAME   = 'agnts_snippets';
-	  const STORE     = 'snippets';
-	  const MAX       = 200; // keep last 200 relevant snippets
+		const DB_NAME   = 'agnts_snippets';
+		const STORE     = 'snippets';
+		const MAX_PER_AGENT = 30;        // ← was global 200
+		const TTL_DAYS      = 14;       
 
 	  async function openDB() {
 	    return new Promise((res, rej) => {
@@ -910,9 +911,10 @@
 	  }
 
 	  async function save(compositionDisplayId, agentName, snippetText, timestamp) {
-	    const db = await openDB();
+	    const db  = await openDB();
+	    const now = timestamp || Date.now();
 
-	    // Dedup — check last N saves for THIS agent only
+	    /* Dedup — check last N saves for THIS agent only */
 	    const N = 20;
 	    const isDuplicate = await new Promise(res => {
 	      const tx    = db.transaction(STORE, 'readonly');
@@ -938,40 +940,80 @@
 	      return;
 	    }
 
-	    return new Promise((res, rej) => {
+	    /* Save new snippet */
+	    await new Promise((res, rej) => {
 	      const tx    = db.transaction(STORE, 'readwrite');
 	      const store = tx.objectStore(STORE);
 	      store.add({
 	        compositionDisplayId,
 	        agentName,
 	        text:      snippetText,
-	        timestamp: timestamp || Date.now()
+	        timestamp: now,
 	      });
-	      const countReq = store.count();
-	      countReq.onsuccess = () => {
-	        if (countReq.result > MAX) {
-	          const idx = store.index('timestamp');
-	          idx.openCursor().onsuccess = e => {
-	            const cursor = e.target.result;
-	            if (cursor) cursor.delete();
-	          };
-	        }
-	      };
 	      tx.oncomplete = () => res();
 	      tx.onerror    = e => rej(e.target.error);
+	    });
+
+	    /* ── Prune: 30 per agent + 14 day TTL ──────────────────────────── */
+	    const ttlCutoff = now - (TTL_DAYS * 24 * 60 * 60 * 1000);
+
+	    await new Promise((res) => {
+	      const tx    = db.transaction(STORE, 'readwrite');
+	      const store = tx.objectStore(STORE);
+	      const idx   = store.index('compositionDisplayId');
+	      const range = IDBKeyRange.only(compositionDisplayId);
+
+	      /* Collect all snippets for this agent, oldest first */
+	      const req = idx.getAll(range);
+	      req.onsuccess = () => {
+	        const all = (req.result || []).sort((a, b) => a.timestamp - b.timestamp);
+
+	        /* Delete expired (TTL) */
+	        const expired = all.filter(s => s.timestamp < ttlCutoff);
+
+	        /* After removing expired, keep only last MAX_PER_AGENT */
+	        const remaining = all.filter(s => s.timestamp >= ttlCutoff);
+	        const overflow  = Math.max(0, remaining.length - MAX_PER_AGENT);
+	        const toDelete  = [
+	          ...expired,
+	          ...remaining.slice(0, overflow)  /* oldest of remaining if still over limit */
+	        ];
+
+	        if (toDelete.length > 0) {
+	          /* Re-open a write cursor to delete by primary key */
+	          const delTx    = db.transaction(STORE, 'readwrite');
+	          const delStore = delTx.objectStore(STORE);
+	          const delIdx   = delStore.index('compositionDisplayId');
+	          delIdx.openCursor(range).onsuccess = e => {
+	            const cursor = e.target.result;
+	            if (!cursor) { res(); return; }
+	            const shouldDelete = toDelete.some(
+	              s => s.timestamp === cursor.value.timestamp &&
+	                   s.text      === cursor.value.text
+	            );
+	            if (shouldDelete) cursor.delete();
+	            cursor.continue();
+	          };
+	          delTx.oncomplete = () => res();
+	          delTx.onerror    = () => res();
+	        } else {
+	          res();
+	        }
+	      };
 	    });
 	  }
 
 	  async function getAll(compositionDisplayId) {
-	    const db = await openDB();
+	    const db      = await openDB();
+	    const ttlCutoff = Date.now() - (TTL_DAYS * 24 * 60 * 60 * 1000);
 	    return new Promise((res, rej) => {
 	      const tx    = db.transaction(STORE, 'readonly');
 	      const store = tx.objectStore(STORE);
 	      const index = store.index('compositionDisplayId');
 	      const req   = index.getAll(compositionDisplayId);
 	      req.onsuccess = () => {
-	        // Sort newest first
 	        const results = (req.result || [])
+	          .filter(s => s.timestamp >= ttlCutoff)   // ← TTL filter
 	          .sort((a, b) => b.timestamp - a.timestamp);
 	        res(results);
 	      };
@@ -1808,8 +1850,15 @@
 	       
 	       // Success!
 	       console.log('[OpenRouter] success with model:', fallbackModel.id);
-	       const data = await response.json();
-	       return data.choices[0]?.message?.content || '';
+		   const data = await response.json();
+
+		   // Track usage
+		   const tokens = (data?.usage?.prompt_tokens     || 0)
+		                + (data?.usage?.completion_tokens  || 0);
+		   UsageTracker.trackLLM('openrouter', fallbackModel.id, tokens);
+
+		   workerItem._smartModel = fallbackModel.id;
+		   return data.choices[0]?.message?.content || '';
 	       
 	     } catch (fetchError) {
 	       console.warn(`[OpenRouter] ${fallbackModel.id} failed:`, fetchError.message);
@@ -2828,10 +2877,6 @@
       const matchCount  = e.data.matchCount || 1;
       console.log('[VisualSelector] general:', generalSel, 'specific:', specificSel, 'matches:', matchCount);
 
-      // Hide iframe — prevents further mouse events
-      iframe.style.pointerEvents = 'none';
-      iframe.style.opacity       = '0.4';
-
       // Rebuild header to show two-option choice
       const header = overlay.querySelector('div');
       if (header) {
@@ -2900,22 +2945,33 @@
         }
 
         // Re-select — restore iframe
-        header.querySelector('#vsel-reselect')?.addEventListener('click', () => {
-          pickedSelector = null;
-          iframe.style.pointerEvents = '';
-          iframe.style.opacity       = '1';
-          header.style.background    = '#1a1a2e';
-          header.style.flexWrap      = '';
-          header.innerHTML =
-            '<div style="width:10px;height:10px;border-radius:50%;background:#6c5ce7;flex-shrink:0;"></div>' +
-            '<div style="flex:1;">' +
-              '<div style="font-size:13px;font-weight:600;color:#fff;">🎯 Click any element to select it</div>' +
-              '<div style="font-size:11px;color:#aaa;margin-top:1px;">Works on static pages · JS-rendered sites need Playwright</div>' +
-            '</div>' +
-            '<button id="vsel-cancel-reset" style="background:transparent;border:1px solid #555;color:#aaa;' +
-              'border-radius:6px;padding:7px 12px;font-size:12px;cursor:pointer;">Cancel</button>';
-          header.querySelector('#vsel-cancel-reset')?.addEventListener('click', cleanup);
-        });
+		header.querySelector('#vsel-reselect')?.addEventListener('click', () => {
+		  pickedSelector = null;
+		  
+		  // ── Reset the picker script inside the iframe ──────────────────
+		  try {
+		    iframe.contentWindow._agntsPickerReset();
+		  } catch(e) {
+		    console.warn('[VisualSelector] Could not reset picker:', e);
+		  }
+
+		  // Reset iframe appearance
+		  iframe.style.pointerEvents = '';
+		  iframe.style.opacity       = '1';
+
+		  // Reset header
+		  header.style.background = '#1a1a2e';
+		  header.style.flexWrap   = '';
+		  header.innerHTML =
+		    '<div style="width:10px;height:10px;border-radius:50%;background:#6c5ce7;flex-shrink:0;"></div>' +
+		    '<div style="flex:1;">' +
+		      '<div style="font-size:13px;font-weight:600;color:#fff;">🎯 Click any element to select it</div>' +
+		      '<div style="font-size:11px;color:#aaa;margin-top:1px;">Works on static pages · JS-rendered sites need Playwright</div>' +
+		    '</div>' +
+		    '<button id="vsel-cancel-reset" style="background:transparent;border:1px solid #555;color:#aaa;' +
+		      'border-radius:6px;padding:7px 12px;font-size:12px;cursor:pointer;">Cancel</button>';
+		  header.querySelector('#vsel-cancel-reset')?.addEventListener('click', cleanup);
+		});
 
         header.querySelector('#vsel-cancel-new')?.addEventListener('click', cleanup);
       }
@@ -3558,7 +3614,7 @@
 
 			  // ── Elevate canvas-area so ghosted dot is above card ─────────
 			  const canvasArea = document.querySelector('#canvas-area');
-			  if (canvasArea) canvasArea.style.zIndex = '9995';
+			  if (canvasArea) canvasArea.style.zIndex = '50';
 
 			  // ── Build card ────────────────────────────────────────────────
 			  const card = document.createElement('div');
@@ -4007,19 +4063,20 @@
 
 	      const pill = sourceLabel ? `
 	        <div style="margin-top:8px; pointer-events:auto; display:flex; gap:6px; align-items:center;">
-	          <span class="agnts-snip-expand" data-url="${item.url || ''}" 
-			  onclick="if(this.dataset.url) window.open(this.dataset.url, '_blank')"
-			  style="
-	            display:inline-block;
-	            padding:3px 10px;
-	            border-radius:20px;
-	            background:${c}18;
-	            border:1px solid ${c}44;
-	            font-size:10px;font-weight:700;
-	            letter-spacing:0.06em;
-	            color:${c};
-	            cursor:pointer;
-	          ">${sourceLabel} ↗</span>
+				<span class="agnts-snip-expand" data-url="${item.url || ''}" 
+				  onclick="if(this.dataset.url) window.open(this.dataset.url, '_blank')"
+				  style="
+				    display:inline-flex;align-items:center;gap:4px;
+				    padding:4px 10px;
+				    border-radius:20px;
+				    background:${c}12;
+				    border:1px solid ${c}33;
+				    font-size:10px;font-weight:700;
+				    letter-spacing:0.06em;
+				    color:${c};
+				    cursor:pointer;
+				    transition:background 0.15s;
+				  ">${sourceLabel} ↗</span>
 	        </div>` : '';
 
 	      const divider = i > 0 ? `<div style="
@@ -4044,7 +4101,7 @@
 		        />
 		      </div>` : ''}
 		      <div style="
-		        font-size:20px;font-weight:600;
+		        font-size:15px;font-weight:600;
 		        color:rgba(30,20,60,0.62);
 		        line-height:1.3;letter-spacing:-0.2px;
 		        margin-bottom:4px;word-break:break-word;
@@ -4075,18 +4132,20 @@
 
 		  return `
 		    <div style="
-		      border: 1px solid rgba(30,20,60,0.07);
-		      border-radius:12px;
+		      background:rgba(255,255,255,0.97);
+		      border:1px solid rgba(108,92,231,0.12);
+		      border-radius:16px;
 		      overflow:hidden;
+		      box-shadow:0 8px 32px rgba(108,92,231,0.12),0 2px 8px rgba(0,0,0,0.06);
 		    ">
 		      <div id="agnts-snip-text" style="
 		        opacity:0;
 		        transition:opacity 0.4s ease 0.3s;
-		        max-height:420px;
+		        max-height:400px;
 		        overflow-y:auto;
-		        padding:4px;
+		        padding:16px;
 		        scrollbar-width:thin;
-		        scrollbar-color:rgba(30,20,60,0.15) transparent;
+		        scrollbar-color:rgba(108,92,231,0.15) transparent;
 		      ">
 		        ${rows}
 		        ${dismiss}
@@ -5346,6 +5405,7 @@
         }
       }
 
+	  console.log('[Watcher] next poll interval:', workerItem.pollInterval, 'DEFAULT:', DEFAULT_INTERVAL);
       // Schedule next tick
       if (workerItem.watcherActive && _timers.has(id)) {
         const interval = (workerItem.pollInterval || DEFAULT_INTERVAL) * 1000;
@@ -5356,26 +5416,37 @@
 
     // ── Start / stop polling ───────────────────────────────────────────────
 	function startPolling(orchestrator, compositionItem, workerItem, initialDelayMs = 0) {
-	      const id = workerItem.displayID;
-	      stopPolling(id);
+	  const id = workerItem.displayID;
+	  stopPolling(id);
 
-	      const urls = workerItem.targetUrls?.length ? workerItem.targetUrls : (workerItem.targetUrl ? [workerItem.targetUrl] : []);
-	      if (!urls.length) {
-	        console.warn('[Watcher] No targetUrl set — not starting poll');
-	        return;
-	      }
+	  const urls = workerItem.targetUrls?.length ? workerItem.targetUrls 
+	             : (workerItem.targetUrl ? [workerItem.targetUrl] : []);
+	  if (!urls.length) {
+	    console.warn('[Watcher] No targetUrl set — not starting poll');
+	    return;
+	  }
 
-	      workerItem.watcherActive = true;
-	      _timers.set(id, true);
-	      console.log(`[Watcher] Started polling for ${workerItem.name} every ${workerItem.pollInterval || DEFAULT_INTERVAL}s (first poll in ${initialDelayMs}ms)`);
+	  workerItem.watcherActive = true;
+	  _timers.set(id, true);
 
-	      if (initialDelayMs > 0) {
-	        const t = setTimeout(() => pollTick(orchestrator, compositionItem, workerItem), initialDelayMs);
-	        _timers.set(id, t);
-	      } else {
-	        pollTick(orchestrator, compositionItem, workerItem);
-	      }
-	 }
+	  /* ── Smart resume — respect last run time ──────────────────────────
+	     If watcher ran recently, wait out the remaining interval
+	     instead of firing immediately on page load.                      */
+	  const interval    = (workerItem.pollInterval || DEFAULT_INTERVAL) * 1000;
+	  const lastCheck   = workerItem.lastCheck || 0;
+	  const elapsed     = Date.now() - lastCheck;
+	  const remaining   = Math.max(0, interval - elapsed);
+
+	  /* Use the larger of: stagger delay vs remaining interval time */
+	  const firstDelay  = lastCheck > 0
+	    ? Math.max(initialDelayMs, remaining)
+	    : initialDelayMs;
+
+	  console.log(`[Watcher] Started ${workerItem.name} — interval:${interval/1000}s last:${lastCheck ? Math.round(elapsed/1000)+'s ago' : 'never'} first poll in:${Math.round(firstDelay/1000)}s`);
+
+	  const t = setTimeout(() => pollTick(orchestrator, compositionItem, workerItem), firstDelay);
+	  _timers.set(id, t);
+	}
 
     function stopPolling(watcherId) {
       const timer = _timers.get(watcherId);
@@ -5588,6 +5659,8 @@
               }
             })()}
           </div>
+		  
+		  <div id="watcher-vault-slot-${id}" style="grid-column:1/-1;"></div>
 
             <div>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -5750,6 +5823,29 @@
           }
         }
       });
+	  
+	  // ── Vault auth detection on URL change ─────────────────────────────────
+	  panel.querySelector(`#watcher-url-${id}`)?.addEventListener('change', async () => {
+	      const url = panel.querySelector(`#watcher-url-${id}`)?.value?.trim();
+	      if (!url) return;
+	      workerItem.targetUrl = url;
+
+	      const container = panel.querySelector(`#watcher-vault-slot-${id}`);
+	      if (!container) return;
+
+	      newauthOAuth.onWatcherUrlChange(container, workerItem, function(entryId) {
+	          var entry = newauthOAuth.vaultRegistry.getById(entryId);
+	          if (entry && entry.service === 'gmail') {
+	              newauthOAuth.renderGmailConfig(container, workerItem, entryId, async function(w) {
+	                  await saveConfig(orchestrator, compositionItem, w, panel);
+	              });
+	          } else {
+	              /* Other services — vault connected, just save */
+	              newauthOAuth.clearWatcherPendingVault(workerItem);
+	              saveConfig(orchestrator, compositionItem, workerItem, panel);
+	          }
+	      });
+	  });
 
       // Show/hide condition value input based on condition type
       panel.querySelector(`#watcher-condition-${id}`).addEventListener('change', (e) => {
@@ -5842,6 +5938,7 @@
       },
 
 	  resumeActive(orchestrator, compositionItem, workers) {
+			
 	          const toResume = workers
 	            .filter(w => w.workerType === 'watcher' && w.watcherActive && !isPolling(w.displayID));
 
@@ -7139,6 +7236,7 @@
   
   function showWakeUpSplash(orchestrator) {
       if (window._agntsWakeSplashShown) return;
+	  if (isShareUrl()) return;
 	  
 	  const delay = parseInt(localStorage.getItem('agnts_demo_delay') || '0');
 	   if (delay > 0) {
@@ -9236,6 +9334,10 @@
 	- Industry or domain
 	- Tech stack or skills
 	- Any specific companies mentioned?
+	
+	Also extract:
+	- "jobTitle": the full role title as stated, just remove the word "jobs" if present and any location info
+	- "location": city or country if explicitly mentioned, otherwise always use "remote"
 
 	Step 2 — Build sources in two tiers:
 
@@ -9291,7 +9393,9 @@
 	    {"name": "HN Jobs", "searchUrl": "https://hnrss.org/whoishiring/jobs", "reason": "Tech hiring threads"}
 	  ],
 	  "greenhouseBoards": [],
-	  "leverBoards": []
+	  "leverBoards": [],
+	  "jobTitle": "senior backend engineer",
+	  "location": "remote"
 	}
 	` : `
   Find RSS news sources for topic: "${topic}"
@@ -9407,7 +9511,9 @@
           }
         ],
         greenhouseBoards: [],
-        leverBoards: []
+        leverBoards: [],
+		jobTitle: topic.replace(/\s*jobs?\s*(in\s+\S+)?$/i, '').trim(),
+		location: 'remote'
       } : {
         googleNewsQueries: [{ q: topic, gl: 'US', hl: 'en', label: 'Google News' }],
         feedspotSearches: [topic],
@@ -9514,6 +9620,18 @@
         type: 'lever'
       });
     }
+	
+	if (isRecruiter && strategy.jobTitle) {
+	  discoveredFeeds.push({
+	    name:     'Indeed: ' + strategy.jobTitle + ' in ' + (strategy.location || 'remote'),
+	    url:      'https://www.indeed.com/rss?q=' + encodeURIComponent(strategy.jobTitle) +
+	              '&l=' + encodeURIComponent(strategy.location || 'remote') +
+	              '&sort=date',
+	    reason:   'Indeed job listings for ' + strategy.jobTitle,
+	    selected: true,
+	    type:     'direct'
+	  });
+	}
 
     // Direct RSS hints
     const validHints = (strategy.directRssHints || []).filter(hint => {
@@ -9785,7 +9903,7 @@
 		      cursor:${status.unlocked ? 'pointer' : 'not-allowed'};
 		      transition:all 0.15s;
 		      position:relative;overflow:hidden;
-		      box-shadow:${selected ? `0 2px 12px ${acentColor}25` : 'none'};
+		      box-shadow:${selected ? `0 2px 12px ${accentColor}25` : 'none'};
 		      margin-bottom:6px;
 		      opacity:${opacity};
 		      ${grayscale}
@@ -10218,6 +10336,8 @@
 	                       border-radius:6px;padding:9px 10px;color:#333333;font-family:inherit;font-size:13px;outline:none;"/>`;
 	            })()}
 	          </div>
+			  
+			  <div id="agnts-wiz-vault-slot" style="grid-column:1/-1;"></div>
           <div>
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
               <label style="font-size:12px;font-weight:600;color:#555555;">
@@ -10489,6 +10609,44 @@
       if (state.step > 0) {
         wireProviderModelUpdate(ctx.orchestrator);
         wireConditionToggle();
+		
+		// ── Vault auth detection on URL change ──────────────────────────────
+		var wizUrlInput = document.getElementById('agnts-wiz-targeturl');
+		var wizVaultSlot = document.getElementById('agnts-wiz-vault-slot');
+		if (wizUrlInput && wizVaultSlot && wizUrlInput.type !== 'hidden') {
+		  // Check immediately if URL already populated
+		  if (wizUrlInput.value.trim()) {
+		    var _wizWorkerItem = state.workers[state.step - 1] || {};
+		    _wizWorkerItem.targetUrl = wizUrlInput.value.trim();
+		    newauthOAuth.onWatcherUrlChange(wizVaultSlot, _wizWorkerItem, function(entryId) {
+		      var entry = newauthOAuth.vaultRegistry.getById(entryId);
+		      if (entry && entry.service === 'gmail') {
+		        newauthOAuth.renderGmailConfig(wizVaultSlot, _wizWorkerItem, entryId, function(w) {
+		          state.workers[state.step - 1] = Object.assign(state.workers[state.step - 1] || {}, w);
+		        });
+		      } else {
+		        newauthOAuth.clearWatcherPendingVault(_wizWorkerItem);
+		        state.workers[state.step - 1] = Object.assign(state.workers[state.step - 1] || {}, _wizWorkerItem);
+		      }
+		    });
+		  }
+		  // Also fire on change
+		  wizUrlInput.addEventListener('change', function() {
+		    var _wizWorkerItem = state.workers[state.step - 1] || {};
+		    _wizWorkerItem.targetUrl = wizUrlInput.value.trim();
+		    newauthOAuth.onWatcherUrlChange(wizVaultSlot, _wizWorkerItem, function(entryId) {
+		      var entry = newauthOAuth.vaultRegistry.getById(entryId);
+		      if (entry && entry.service === 'gmail') {
+		        newauthOAuth.renderGmailConfig(wizVaultSlot, _wizWorkerItem, entryId, function(w) {
+		          state.workers[state.step - 1] = Object.assign(state.workers[state.step - 1] || {}, w);
+		        });
+		      } else {
+		        newauthOAuth.clearWatcherPendingVault(_wizWorkerItem);
+		        state.workers[state.step - 1] = Object.assign(state.workers[state.step - 1] || {}, _wizWorkerItem);
+		      }
+		    });
+		  });
+		}
 
         // Wire visual selector picker for watcher steps
         const pickBtn = document.getElementById('agnts-wiz-pick-selector');
@@ -10770,6 +10928,18 @@
               }
               return;
             }
+			
+			// ── Don't advance if vault auth is still pending ──────────────────
+			const wizWorkerItem = state.workers[state.step - 1] || {};
+			if (wizWorkerItem._pendingVault) {
+			  const slot = document.getElementById('agnts-wiz-vault-slot');
+			  if (slot) {
+			    slot.style.outline = '2px solid #6c5ce7';
+			    slot.style.borderRadius = '8px';
+			    setTimeout(function() { slot.style.outline = 'none'; }, 1500);
+			  }
+			  return;
+			}
             // Basic URL format check
             try { new URL(url); } catch {
               if (urlInput) {
@@ -12272,34 +12442,7 @@
       return;
     }
 
-	// ── Intercept constructor to get instance reference ──────────────────
-	if (!window.SchemaOrchestrator._agntsPatchedConstructor) {
-	  window.SchemaOrchestrator._agntsPatchedConstructor = true;
-	  const _OrigClass = window.SchemaOrchestrator;
-	  
-	  window.SchemaOrchestrator = function(...args) {
-	    const instance = new _OrigClass(...args);
-	    window._agntsInstance = instance; // expose for debugging
-	    
-	    // Patch render on instance directly
-	    const _renderOrig = instance.render.bind(instance);
-	    instance.render = function(...renderArgs) {
-	      const res = _renderOrig(...renderArgs);
-	      if (instance.currentApp?.id !== APP_ID) return res;
-	      if (instance.currentPath?.length !== 1) return res;
-	      requestAnimationFrame(() => {
-	        console.log('[agnts] INSTANCE render fired');
-	        // ← all your render content moves here
-	      });
-	      return res;
-	    };
-	    console.log('[agnts] Instance render patched via constructor');
-	    return instance;
-	  };
-	  window.SchemaOrchestrator.prototype = _OrigClass.prototype;
-	  Object.setPrototypeOf(window.SchemaOrchestrator, _OrigClass);
-	}
-	
+
     const proto = window.SchemaOrchestrator.prototype;
 	
 	console.log('[agnts] proto:', typeof proto, !!proto?.render);
@@ -12704,6 +12847,7 @@
 				     : '';
 				 // Populate async content (latest relevant + notification channels) after card renders
 				 setTimeout(() => {
+					  
 				   populateDotCardAsync(item, this);
 				   
 				   // Wire replay button — stop propagation on the whole card
@@ -12720,6 +12864,18 @@
 				       startSnippetReplay(item.displayID, item.name);
 				     }, true); // ← capture phase, fires before dot handler
 				   }
+				   
+				   const shareBtn = document.getElementById(`agnts-share-btn-${item.displayID}`);
+				   if (shareBtn) {
+				     shareBtn.addEventListener('mousedown', e => {
+				       e.stopPropagation();
+				       e.stopImmediatePropagation();
+				       e.preventDefault();
+				       console.log('[share] mousedown → opening modal');
+				       openShareModal(item.displayID);
+				     }, false);
+				   }				   
+				   
 				 }, 80);
 
 				 return '<div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;">' +
@@ -12730,12 +12886,23 @@
 				       '<div style="font-size:13px;font-weight:700;color:#1a1a1a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + item.name + '</div>' +
 				       '<div style="font-size:10px;color:' + color + ';font-weight:600;text-transform:uppercase;letter-spacing:0.08em;">' + tplKey + ' agent</div>' +
 				     '</div>' +
-					 '<button id="agnts-replay-btn-' + item.displayID + '" data-no-nav="true" ' +
-					   'style="padding:4px 8px;background:' + color + '18;border:1px solid ' + color + '33;' +
-					   'border-radius:6px;font-size:11px;cursor:pointer;color:' + color + ';font-weight:600;' +
-					   'flex-shrink:0;white-space:nowrap;" title="Replay past snippets">' +
-					   '▶︎ replay' +
-					 '</button>' +
+					 '<div style="display:flex;gap:5px;flex-shrink:0;">' +
+					   '<button id="agnts-replay-btn-' + item.displayID + '" data-no-nav="true" ' +
+					     'style="padding:4px 8px;background:' + color + '18;border:1px solid ' + color + '33;' +
+					     'border-radius:6px;font-size:11px;cursor:pointer;color:' + color + ';font-weight:600;' +
+					     'white-space:nowrap;" title="Replay past snippets">' +
+					     '▶︎ replay' +
+					   '</button>' +
+					   (!_compositionHasVault(item)
+					     ? '<button id="agnts-share-btn-' + item.displayID + '" class="dot-action-btn" ' +
+					     'data-no-nav="true" ' +
+					     'style="padding:4px 8px;background:#f0eeff;border:1px solid #d4c8fc;' +
+					     'border-radius:6px;font-size:11px;cursor:pointer;color:#6c5ce7;font-weight:600;' +
+					     'white-space:nowrap;" title="Share this agent">' +
+					     '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="18" cy="5" r="2"/><circle cx="6" cy="12" r="2"/><circle cx="18" cy="19" r="2"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>' +
+					   '</button>'
+					     : '') +
+					 '</div>' +
 				   '</div>' +
 				 // Last relevant snippet — loaded async after card renders
 				   '<div id="agnts-card-relevant-' + item.displayID + '" style="' +
@@ -12801,11 +12968,23 @@
 	             createStarterAgents(this, newAgntuser).finally(() => {
 	               window._starterAgentsCreating  = false;
 	               window._starterAgentsCreated   = true;
+				   // ── Clone pending shared agent if any ──────────────────────────
+				     if (window._agntsPendingSharedComp) {
+				       var _pendingComp = window._agntsPendingSharedComp;
+				       window._agntsPendingSharedComp = null;
+				       _cloneAgent(orchestrator, _pendingComp, null);
+				     }
 	             });
 	           } else if (hasAgntuser) {
 	             createStarterAgents(this, agntuser).finally(() => {
 	               window._starterAgentsCreating  = false;
 	               window._starterAgentsCreated   = true;
+				   // ── Clone pending shared agent if any ──────────────────────────
+				     if (window._agntsPendingSharedComp) {
+				       var _pendingComp = window._agntsPendingSharedComp;
+				       window._agntsPendingSharedComp = null;
+				       _cloneAgent(orchestrator, _pendingComp, null);
+				     }
 	             });
 	           } else {
 	             window._starterAgentsCreating = false;
@@ -12875,6 +13054,40 @@
 		     checkReminders(orchestrator);
 		     // Re-check every hour
 		     setInterval(() => checkReminders(orchestrator), 60 * 60 * 1000);
+		   }
+		   
+		   // ── Flake prompt test mode ──────────────────────────────────────────
+		   if (!window._agntFlakeTestDone) {
+		     window._agntFlakeTestDone = true;
+		     window._agntFlakeTestMode = true;  // ← flip to true to test
+		     window._agntFlakeImages   = [
+		       { id: 'img_001', src: 'https://picsum.photos/seed/alpha/400/200' },
+		       { id: 'img_002', src: 'https://picsum.photos/seed/beta/400/200'  },
+		       { id: 'img_003', src: 'https://picsum.photos/seed/gamma/400/200' },
+		     ];
+		     if (window._agntFlakeTestMode) {
+		       var testWatcher = compositions[0]?._composite?.worker
+		         ?.find(w => w.workerType === 'watcher');
+		       if (testWatcher) newauthOAuth.setWatcherPendingFlake(testWatcher);
+		     }
+		   }
+		   
+		   console.log('[share] installing, orchestrator:', !!orchestrator);
+		   //installAgentShare(orchestrator);
+		   installAgentShare(orchestrator);
+		   
+		   // ── Flake prompt — check once per render if any vault watchers are paused ──
+		   if (!document.getElementById('agnts-flake-overlay')) {
+		     const needsFlake = newauthOAuth.getWatchersNeedingFlake(compositions);
+		     if (needsFlake.length) {
+		       newauthOAuth.checkAndShowFlakePrompt(compositions, function() {
+		         // Vault unlocked — resume watchers
+		         compositions.forEach(comp => {
+		           const workers = comp._composite?.worker || [];
+		           WatcherPanel.resumeActive(orchestrator, comp, workers);
+		         });
+		       });
+		     }
 		   }
 		   
 		   const s = GlobalSettings.load();
@@ -13185,6 +13398,25 @@
       return _init.call(this);
     };
 	
+	// ── Share URL — suppress deep link routing ──────────────────────────
+	const _parseUrl = proto.parseUrlForDataFetch;
+	proto.parseUrlForDataFetch = function() {
+	  const result = _parseUrl.call(this);
+	  if (result && result.pathIds && result.pathIds.length >= 2) {
+	    const lastId = result.pathIds[result.pathIds.length - 1];
+	    if (lastId && lastId.startsWith('shr_')) {
+	      console.log('[agnts] Share URL detected — returning root level');
+	      return {
+	        appId:    result.appId,
+	        tenantId: null,
+	        pathIds:  [],   // ← depth 0, no tenant
+	        shortUrl: false,
+	      };
+	    }
+	  }
+	  return result;
+	};
+	
 	
 	const _navigateTo = proto.navigateTo;
 	proto.navigateTo = function(item, entityType, ...args) {
@@ -13308,6 +13540,14 @@
 			  e.preventDefault();
 			  e.stopPropagation();
 			  e.stopImmediatePropagation();
+			  
+			  // ── Skip invite check for share URL recipients ──────────────────
+		    if (isShareUrl()) {
+		      form.removeEventListener('submit', submitHandler, { capture: true });
+		      _showAgentMasterCreatingOverlay();
+		      if (_nativeSubmit) _nativeSubmit.call(form, e);
+		      return;
+		    }
 
 			  const email = form.querySelector('input[name="contactemail"]')?.value?.trim();
 			  if (email) {
@@ -13733,11 +13973,20 @@
         instance._agntsPatchedRender = true;
         window._agntsInstance = instance;
         
+		// ── Share URL — show import card immediately, skip everything else ──
+		  if (isShareUrl() && !window._agntsShareChecked) {
+		    window._agntsShareChecked = true;
+		    // Suppress wake-up splash for share URLs
+		    window._agntsSplashShown = true;
+		    showSharePreview(instance);
+		    return true;  // ← don't patch render, don't do anything else
+		  }
+		  
         const _renderOrig = instance.render.bind(instance);
         instance.render = function(...renderArgs) {
           const res = _renderOrig(...renderArgs);
           if (instance.currentApp?.id !== APP_ID) return res;
-          if (instance.currentPath?.length !== 1) return res;
+          if (instance.currentPath?.length !== 1 && !isShareUrl()) return res;
           requestAnimationFrame(() => {
             console.log('[agnts] INSTANCE render fired ✓');
             // ← all your render content here
@@ -13785,6 +14034,660 @@
     console.log('[agnts] Bootstrap complete');
   }
 
+  /**
+   * agnts-share.js
+   * Agent sharing — frontend logic.
+   *
+   * 1. Share button in composition panel (hidden if vault-connected)
+   * 2. Share modal — copy link UI
+   * 3. RAF detection — is this URL a shared agent?
+   * 4. Share preview overlay — shown to recipient
+   * 5. Clone flow — into existing or new workspace
+   *
+   * Build order: include after newauth-oauth.js, before agnts-app-ext.js
+   * Exposes: window.AgentShare
+   */
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     STYLES
+     ───────────────────────────────────────────────────────────────────────────── */
+
+  (function _injectShareStyles() {
+    if (document.getElementById('agnts-share-styles')) return;
+    var style       = document.createElement('style');
+    style.id        = 'agnts-share-styles';
+    style.textContent = [
+
+      /* Share modal */
+      '#agnts-share-modal-backdrop{',
+        'position:fixed;inset:0;z-index:9000;',
+        'background:rgba(10,8,24,0.5);backdrop-filter:blur(4px);',
+        'display:flex;align-items:center;justify-content:center;',
+        'animation:shareBackdropIn 0.2s ease;',
+      '}',
+      '@keyframes shareBackdropIn{from{opacity:0}to{opacity:1}}',
+      '#agnts-share-modal{',
+        'background:#fff;border-radius:18px;width:360px;',
+        'max-width:calc(100vw - 32px);',
+        'box-shadow:0 24px 64px rgba(0,0,0,0.2);',
+        'overflow:hidden;',
+        'animation:shareModalIn 0.24s cubic-bezier(0.34,1.56,0.64,1);',
+        'font-family:-apple-system,BlinkMacSystemFont,sans-serif;',
+      '}',
+      '@keyframes shareModalIn{from{opacity:0;transform:scale(0.9) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}',
+      '.sm-header{',
+        'padding:20px 20px 16px;border-bottom:1px solid #f0f0f0;',
+        'display:flex;align-items:center;gap:12px;',
+      '}',
+      '.sm-icon{',
+        'width:40px;height:40px;border-radius:10px;',
+        'display:flex;align-items:center;justify-content:center;',
+        'font-size:20px;flex-shrink:0;',
+      '}',
+      '.sm-title{font-size:14px;font-weight:700;color:#1a1a2e;}',
+      '.sm-sub{font-size:11px;color:#888;margin-top:2px;}',
+      '.sm-body{padding:16px 20px 20px;}',
+      '.sm-label{font-size:10px;font-weight:700;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;}',
+      '.sm-url-row{',
+        'display:flex;align-items:center;gap:6px;',
+        'background:#f5f3ff;border:1.5px solid #ede9fe;border-radius:10px;',
+        'padding:10px 12px;margin-bottom:14px;',
+      '}',
+      '.sm-url-text{',
+        'flex:1;font-size:11px;color:#6c5ce7;font-weight:600;',
+        'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
+      '}',
+      '.sm-copy-btn{',
+        'flex-shrink:0;padding:5px 10px;border:none;border-radius:6px;',
+        'background:#6c5ce7;color:#fff;font-size:10px;font-weight:700;',
+        'cursor:pointer;transition:opacity 0.15s;white-space:nowrap;',
+      '}',
+      '.sm-copy-btn:hover{opacity:0.85;}',
+      '.sm-note{font-size:10px;color:#aaa;line-height:1.5;}',
+      '.sm-close{',
+        'width:100%;padding:11px;border:none;border-radius:10px;',
+        'background:#f5f5f5;color:#555;font-size:12px;font-weight:600;',
+        'cursor:pointer;margin-top:12px;',
+      '}',
+
+      /* Share preview overlay — shown to recipient */
+      '#agnts-share-preview{',
+        'position:fixed;inset:0;z-index:9999;',
+        'background:linear-gradient(135deg,#0a0818 0%,#1a1040 100%);',
+        'display:flex;align-items:center;justify-content:center;',
+        'font-family:-apple-system,BlinkMacSystemFont,sans-serif;',
+        'animation:shareBackdropIn 0.3s ease;',
+      '}',
+      '.sp-card{',
+        'background:#fff;border-radius:20px;width:400px;',
+        'max-width:calc(100vw - 32px);',
+        'box-shadow:0 32px 80px rgba(0,0,0,0.4);',
+        'overflow:hidden;',
+        'animation:shareModalIn 0.28s cubic-bezier(0.34,1.56,0.64,1);',
+      '}',
+      '.sp-banner{',
+        'padding:24px 24px 20px;',
+        'background:linear-gradient(135deg,#6c5ce7 0%,#a29bfe 100%);',
+        'text-align:center;',
+      '}',
+      '.sp-banner-icon{font-size:36px;margin-bottom:8px;}',
+      '.sp-banner-title{font-size:18px;font-weight:700;color:#fff;margin-bottom:4px;}',
+      '.sp-banner-sub{font-size:12px;color:rgba(255,255,255,0.7);}',
+      '.sp-body{padding:20px 24px;}',
+      '.sp-agent-card{',
+        'background:#f8f7ff;border:1px solid #ede9fe;border-radius:12px;',
+        'padding:14px;margin-bottom:16px;',
+      '}',
+      '.sp-agent-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;}',
+      '.sp-agent-icon{',
+        'width:38px;height:38px;border-radius:9px;',
+        'display:flex;align-items:center;justify-content:center;',
+        'font-size:18px;flex-shrink:0;',
+      '}',
+      '.sp-agent-name{font-size:14px;font-weight:700;color:#1a1a2e;}',
+      '.sp-agent-type{font-size:10px;font-weight:600;color:#6c5ce7;text-transform:uppercase;letter-spacing:0.08em;}',
+      '.sp-workers{display:flex;flex-direction:column;gap:5px;}',
+      '.sp-worker-row{',
+        'display:flex;align-items:center;gap:7px;',
+        'font-size:11px;color:#555;',
+      '}',
+      '.sp-email-wrap{margin-bottom:14px;}',
+      '.sp-email-label{font-size:11px;font-weight:600;color:#555;margin-bottom:5px;}',
+      '.sp-email-input{',
+        'width:100%;box-sizing:border-box;',
+        'padding:10px 12px;border:1.5px solid #e8e8f0;border-radius:9px;',
+        'font-size:13px;font-family:inherit;color:#1a1a2e;',
+        'outline:none;transition:border-color 0.15s;',
+      '}',
+      '.sp-email-input:focus{border-color:#6c5ce7;}',
+      '.sp-add-btn{',
+        'width:100%;padding:13px;border:none;border-radius:11px;',
+        'background:linear-gradient(135deg,#6c5ce7,#a29bfe);',
+        'color:#fff;font-size:13px;font-weight:700;cursor:pointer;',
+        'transition:opacity 0.15s;letter-spacing:0.02em;',
+      '}',
+      '.sp-add-btn:hover{opacity:0.88;}',
+      '.sp-add-btn:disabled{opacity:0.45;cursor:not-allowed;}',
+      '.sp-skip{',
+        'display:block;text-align:center;margin-top:10px;',
+        'font-size:11px;color:#aaa;cursor:pointer;background:none;border:none;width:100%;',
+      '}',
+
+    ].join('');
+    document.head.appendChild(style);
+  })();
+
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     1. SHARE BUTTON — rendered inside composition panel action row
+     Call AgentShare.renderShareButton(compositionItem, color) → HTML string
+     Wire with AgentShare.wireShareButton(compositionItem, orchestrator)
+     ───────────────────────────────────────────────────────────────────────────── */
+
+  function _compositionHasVault(compositionItem) {
+    var workers = (compositionItem._composite && compositionItem._composite.worker) || [];
+    for (var i = 0; i < workers.length; i++) {
+      if (workers[i]._vaultRef || workers[i].workerType === 'vault') return true;
+    }
+    return false;
+  }
+
+  
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     2. SHARE MODAL — opens when share button clicked
+     ───────────────────────────────────────────────────────────────────────────── */
+
+  var _orchestratorRef = null;  /* set by installShareHandler */
+
+  async function openShareModal(compositionDisplayId) {
+    console.log('[share] openShareModal called, id:', compositionDisplayId, 'ref:', !!_orchestratorRef);
+    if (!_orchestratorRef) return;
+    
+    var orchestrator = _orchestratorRef;
+    var agntuser     = orchestrator.data && orchestrator.data.items && orchestrator.data.items[0];
+    console.log('[share] agntuser:', !!agntuser);
+    if (!agntuser) return;
+
+    var comp = (agntuser.compositions || []).find(function(c) {
+      return c.displayID === compositionDisplayId;
+    });
+    console.log('[share] comp found:', !!comp, compositionDisplayId);
+    if (!comp) return;
+
+    /* Close any existing modal */
+    var existing = document.getElementById('agnts-share-modal-backdrop');
+    if (existing) existing.remove();
+
+    /* Show generating state */
+    var backdrop = document.createElement('div');
+    backdrop.id  = 'agnts-share-modal-backdrop';
+
+    var templates = (typeof getCompositionTemplates === 'function')
+      ? getCompositionTemplates(orchestrator) : {};
+    var tplKey    = comp.compositionType || '';
+    var tpl       = templates[tplKey] || {};
+    var color     = tpl.color || '#6c5ce7';
+    var icon      = (typeof getTemplateIcon === 'function')
+      ? getTemplateIcon(tplKey, tpl) : '🤖';
+
+    backdrop.innerHTML =
+      '<div id="agnts-share-modal">' +
+        '<div class="sm-header">' +
+          '<div class="sm-icon" style="background:' + color + '18;border:1px solid ' + color + '33;">' + icon + '</div>' +
+          '<div>' +
+            '<div class="sm-title">' + (comp.name || 'Agent') + '</div>' +
+            '<div class="sm-sub">Generating share link…</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="sm-body">' +
+          '<div style="text-align:center;padding:20px 0;color:#aaa;font-size:12px;">⏳ Saving agent config…</div>' +
+        '</div>' +
+      '</div>';
+
+    document.body.appendChild(backdrop);
+    backdrop.addEventListener('click', function(e) {
+      if (e.target === backdrop) backdrop.remove();
+    });
+
+    try {
+		var shareComp = _stripVaultRefs(JSON.parse(JSON.stringify(comp)));
+		
+		// ── Add display metadata for recipient card ──────────────────────
+		var aiWorkers = (comp._composite && comp._composite.worker || [])
+		  .filter(function(w) { return w.provider || w.workerType === 'classifier'; });
+
+		var estTokensPerRun = aiWorkers.reduce(function(sum, w) {
+		  var promptLen = w.systemPrompt ? Math.round(w.systemPrompt.length / 4) : 200;
+		  return sum + promptLen + 300;
+		}, 0);
+
+		var watcherWorkers = (comp._composite && comp._composite.worker || [])
+		  .filter(function(w) { return w.workerType === 'watcher'; });
+
+		var runsPerDay = watcherWorkers.reduce(function(sum, w) {
+		  var interval = w.pollInterval || 300;
+		  return sum + Math.round(86400 / interval);
+		}, 0);
+
+		var estTokensPerDay = estTokensPerRun * runsPerDay;
+
+		var canRunOnWebLLM = aiWorkers.every(function(w) {
+		  return !w.provider || w.provider === 'webllm';
+		});
+
+		var sourceCount = watcherWorkers.reduce(function(sum, w) {
+		  return sum + (w.targetUrls && w.targetUrls.length ? w.targetUrls.length : (w.targetUrl ? 1 : 0));
+		}, 0);
+
+		shareComp._shareMeta = {
+		  name:            comp.name            || comp.dotLabel || 'Agent',
+		  compositionType: comp.compositionType || '',
+		  dotLabel:        comp.dotLabel        || '',
+		  hit:             comp.hit             || 0,
+		  totalCost:       comp.totalCost       || 0,
+		  sourceCount:     sourceCount,
+		  estTokensPerDay: estTokensPerDay,
+		  runsPerDay:      runsPerDay,
+		  canRunOnWebLLM:  canRunOnWebLLM,
+		  workerSummary:   (comp._composite && comp._composite.worker || []).map(function(w) {
+		    return {
+		      name:         w.name        || w.workerType,
+		      workerType:   w.workerType,
+		      provider:     w.provider    || null,
+		      pollInterval: w.pollInterval|| null,
+		      urlCount:     (w.targetUrls && w.targetUrls.length) || (w.targetUrl ? 1 : 0),
+		    };
+		  }),
+		};
+
+		var tenantId   = agntuser.displayID || agntuser.ID;
+		var shareToken = 'shr_' + comp.displayID;
+		var shareUrl   = window.location.origin + '/.apps/agnts/' + tenantId + '/' + shareToken;
+
+		var entityPath = ['apps', 'agnts', tenantId, shareToken].join('/');
+		await orchestrator.db.saveEntityData(entityPath, shareComp, true);
+
+		_renderShareModalContent(backdrop, comp, color, icon, shareUrl);
+
+    } catch(err) {
+      console.error('[AgentShare] Share failed:', err);
+      var modal = document.getElementById('agnts-share-modal');
+      if (modal) {
+        modal.querySelector('.sm-body').innerHTML =
+          '<div style="color:#e53935;font-size:12px;text-align:center;padding:16px 0;">' +
+          '❌ Could not generate share link. Please try again.</div>' +
+          '<button class="sm-close" onclick="document.getElementById(\'agnts-share-modal-backdrop\').remove()">Close</button>';
+      }
+    }
+  }
+
+  function _renderShareModalContent(backdrop, comp, color, icon, shareUrl) {
+    var modal = document.getElementById('agnts-share-modal');
+    if (!modal) return;
+
+    modal.innerHTML =
+      '<div class="sm-header">' +
+        '<div class="sm-icon" style="background:' + color + '18;border:1px solid ' + color + '33;">' + icon + '</div>' +
+        '<div>' +
+          '<div class="sm-title">' + (comp.name || 'Agent') + '</div>' +
+          '<div class="sm-sub">Share this agent with anyone</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="sm-body">' +
+        '<div class="sm-label">Share link</div>' +
+        '<div class="sm-url-row">' +
+          '<div class="sm-url-text" id="sm-url-text">' + shareUrl + '</div>' +
+          '<button class="sm-copy-btn" id="sm-copy-btn">Copy</button>' +
+        '</div>' +
+        '<div class="sm-note">' +
+          'Anyone with this link can add this agent to their workspace. ' +
+          'Your credentials are never shared.' +
+        '</div>' +
+        '<button class="sm-close" id="sm-close-btn">Done</button>' +
+      '</div>';
+
+    modal.querySelector('#sm-copy-btn').addEventListener('click', function() {
+      navigator.clipboard.writeText(shareUrl).then(function() {
+        var btn = document.getElementById('sm-copy-btn');
+        if (btn) { btn.textContent = 'Copied ✓'; setTimeout(function() { btn.textContent = 'Copy'; }, 2000); }
+      });
+    });
+
+    modal.querySelector('#sm-close-btn').addEventListener('click', function() {
+      backdrop.remove();
+    });
+  }
+
+  function _stripVaultRefs(comp) {
+    if (comp._composite && comp._composite.worker) {
+      comp._composite.worker = comp._composite.worker
+        .filter(function(w) { return w.workerType !== 'vault'; })
+        .map(function(w) {
+          var cleaned = Object.assign({}, w);
+          delete cleaned._vaultRef;
+          delete cleaned._pendingVault;
+          delete cleaned._pendingFlake;
+          delete cleaned.gmailQuery;
+          delete cleaned.sourceType;
+          /* Reset runtime state */
+          cleaned.hit          = 0;
+          cleaned.lastRun      = null;
+          cleaned.lastCheck    = null;
+          cleaned.lastSnapshot = null;
+          cleaned.watcherActive = false;
+          cleaned.writerActive  = false;
+          return cleaned;
+        });
+    }
+    comp.hit       = 0;
+    comp.totalCost = 0;
+    comp.timestamp = Date.now();
+    comp._starter  = false;
+    return comp;
+  }
+
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     3. RAF DETECTION — called from agnts RAF
+     Returns true if current URL is a share URL (shr_ token detected)
+     ───────────────────────────────────────────────────────────────────────────── */
+
+  function isShareUrl() {
+    var parts = window.location.pathname.split('/').filter(Boolean);
+    /* /apps/agnts/{tenantId}/{shareToken} */
+    var tokenIdx = parts.indexOf('agnts') + 2;
+    if (tokenIdx < 2) return false;
+    var token = parts[tokenIdx];
+    return token && token.startsWith('shr_');
+  }
+
+  function getShareParams() {
+    var parts     = window.location.pathname.split('/').filter(Boolean);
+    var agntsIdx  = parts.indexOf('agnts');
+    if (agntsIdx < 0) return null;
+    return {
+      tenantId:   parts[agntsIdx + 1] || null,
+      shareToken: parts[agntsIdx + 2] || null,
+    };
+  }
+
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     4. SHARE PREVIEW OVERLAY — shown to recipient
+     ───────────────────────────────────────────────────────────────────────────── */
+
+	 async function showSharePreview(orchestrator) {
+	   if (document.getElementById('agnts-share-preview')) return;
+	  
+	   var params = getShareParams();
+	   if (!params || !params.shareToken) return;
+	  
+	   /* Fetch composition from server */
+	   var comp = null;
+	   try {
+	     var res = await fetch('/newauth/api/getappdata/agnts/' + params.tenantId + '/' + params.shareToken, {
+	       credentials: 'include',
+	     });
+	     if (!res.ok) {
+	       _showShareError('This share link is invalid or has expired.');
+	       return;
+	     }
+	     comp = await res.json();
+		 
+		 /* getAppData returns { items: [...] } — unwrap to get the composition */
+		 if (comp && comp.items && comp.items[0]) {
+		   comp = comp.items[0];
+		 } else if (comp && comp[params.shareToken]) {
+		   /* fallback: keyed by shareToken */
+		   comp = comp[params.shareToken];
+		 }
+
+		 if (!comp) {
+		   _showShareError('This share link is invalid or has expired.');
+		   return;
+		 }
+	   } catch(err) {
+	     _showShareError('Could not load the shared agent. Please try again.');
+	     return;
+	   }
+	  
+	   var meta           = comp._shareMeta || {};
+	   var sourceCount    = meta.sourceCount    || 0;
+	   var estTokensPerDay = meta.estTokensPerDay || 0;
+	   var runsPerDay     = meta.runsPerDay     || 0;
+	   var canRunOnWebLLM = meta.canRunOnWebLLM !== false;
+	   var hasAI          = (meta.workerSummary || []).some(function(w) {
+	     return w.provider || w.workerType === 'classifier';
+	   });
+
+	   var summaryStr = (sourceCount > 0 ? sourceCount + ' source' + (sourceCount !== 1 ? 's' : '') : '') +
+	     (hasAI ? ' · AI filtering' : '');
+
+	   var tokensStr = estTokensPerDay > 0
+	     ? '~' + (estTokensPerDay > 1000
+	         ? Math.round(estTokensPerDay / 1000) + 'K'
+	         : estTokensPerDay) + ' tokens/day'
+	     : 'Minimal token use';
+
+	   var webllmBadge = canRunOnWebLLM
+	     ? '<span style="font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;' +
+	         'background:#f0fdf4;color:#166534;border:1px solid #bbf7d0;">🧠 Runs free in browser</span>'
+	     : '<span style="font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;' +
+	         'background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;">☁️ Needs API key</span>';
+	  
+		 var templates = (typeof getCompositionTemplates === 'function')
+		   ? getCompositionTemplates(orchestrator) : {};
+		 var tplKey = meta.compositionType || comp.compositionType || '';
+		 var tpl    = templates[tplKey] || {};
+		 var color  = tpl.color || '#6c5ce7';
+		 var icon   = (typeof getTemplateIcon === 'function') ? getTemplateIcon(tplKey, tpl) : '🤖';
+
+		 var overlay = document.createElement('div');
+		 overlay.id  = 'agnts-share-preview';
+	  
+	   overlay.innerHTML =
+	     '<div class="sp-card">' +
+	  
+	       /* Banner — agent color + icon */
+	       '<div class="sp-banner" style="background:linear-gradient(135deg,' + color + ' 0%,' + color + 'cc 100%);">' +
+	         '<div class="sp-banner-icon" style="background:rgba(255,255,255,0.2);">' + icon + '</div>' +
+	         '<div class="sp-banner-title">' + (meta.name || comp.name || 'Agent') + '</div>' +
+	         '<div class="sp-banner-sub">Super Agents · ' + (tplKey || 'agent') + ' · shared with you</div>' +
+	       '</div>' +
+	  
+	       '<div class="sp-body">' +
+	         /* Agent workers */
+			 '<div class="sp-agent-card">' +
+			   (summaryStr
+			     ? '<div style="font-size:11px;color:#888;margin-bottom:10px;">' + summaryStr + '</div>'
+			     : '') +
+			   '<div class="sp-stats-row">' +
+			     '<div class="sp-stat">⚡ <span class="sp-stat-val">' + tokensStr + '</span></div>' +
+			   '</div>' +
+			   '<div style="margin-top:8px;">' + webllmBadge + '</div>' +
+			 '</div>' +
+	  
+	         /* Single CTA — no email, let normal flow handle workspace creation */
+	         '<button class="sp-add-btn" id="sp-add-btn" ' +
+	           'style="background:linear-gradient(135deg,' + color + ',' + color + 'aa);">' +
+	           '➕ Add to my workspace →' +
+	         '</button>' +
+	         '<button class="sp-skip" id="sp-skip-btn">Maybe later</button>' +
+	       '</div>' +
+	     '</div>';
+	  
+	   document.body.appendChild(overlay);
+	  
+	   /* Add to workspace — store comp for after workspace creation, then dismiss overlay */
+	   document.getElementById('sp-add-btn').addEventListener('click', function() {
+	     /* Store the shared comp so the RAF can pick it up after workspace creation */
+	     window._agntsPendingSharedComp = comp;
+	     overlay.remove();
+	     /* Let normal depth-0 flow run — openAddDialog will fire */
+	   });
+	  
+	   document.getElementById('sp-skip-btn').addEventListener('click', function() {
+	     overlay.remove();
+	     window.history.replaceState({}, '', '/apps/agnts');
+	     orchestrator.render();
+	   });
+	 }
+
+
+  function _showShareError(message) {
+    var overlay = document.createElement('div');
+    overlay.id  = 'agnts-share-preview';
+    overlay.innerHTML =
+      '<div class="sp-card" style="text-align:center;padding:40px 24px;">' +
+        '<div style="font-size:36px;margin-bottom:12px;">🔗</div>' +
+        '<div style="font-size:15px;font-weight:700;color:#1a1a2e;margin-bottom:8px;">Link not found</div>' +
+        '<div style="font-size:12px;color:#888;margin-bottom:20px;">' + message + '</div>' +
+        '<button onclick="window.location.href=\'/apps/agnts\'" ' +
+          'style="padding:10px 20px;background:#6c5ce7;color:#fff;border:none;border-radius:8px;' +
+          'font-size:12px;font-weight:600;cursor:pointer;">Go to my workspace</button>' +
+      '</div>';
+    document.body.appendChild(overlay);
+  }
+
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     5. CLONE FLOW
+     ───────────────────────────────────────────────────────────────────────────── */
+
+  function _userHasWorkspace() {
+    /* Check if localStorage has agnts app data */
+    try {
+      var keys = Object.keys(localStorage);
+      for (var i = 0; i < keys.length; i++) {
+        if (keys[i].indexOf('schema_app_app_data_agnts') >= 0 ||
+            keys[i].indexOf('app_data_agnts') >= 0) {
+          var raw = localStorage.getItem(keys[i]);
+          if (raw) {
+            var data = JSON.parse(raw);
+            return !!(data && data.items && data.items.length > 0);
+          }
+        }
+      }
+    } catch(e) {}
+    return false;
+  }
+
+  async function _cloneAgent(orchestrator, comp, email) {
+    try {
+      var agntuser = orchestrator.data && orchestrator.data.items && orchestrator.data.items[0];
+
+      /* If no workspace, create one */
+      if (!agntuser) {
+        var newId = generateId();
+        agntuser = {
+          ID:           newId,
+          displayID:    newId,
+          entityType:   'agntuser',
+          name:         email || newId,
+          email:        email || null,
+          compositions: [],
+          timestamp:    Date.now(),
+        };
+        if (!orchestrator.data) orchestrator.data = { items: [] };
+        if (!Array.isArray(orchestrator.data.items)) orchestrator.data.items = [];
+        orchestrator.data.items.push(agntuser);
+
+        /* Update currentPath to new tenant */
+        orchestrator.currentPath = [{
+          id:         newId,
+          displayID:  newId,
+          shortName:  email ? email.split('@')[0] : newId.substring(0, 8),
+          entityType: 'agntuser',
+        }];
+
+        /* Update URL to their workspace */
+        var newUrl = '/apps/agnts/' + newId;
+        window.history.replaceState({}, '', newUrl);
+      }
+
+      /* Clone composition with new IDs */
+      var cloned          = JSON.parse(JSON.stringify(comp));
+      var newCompId = generateId();
+      cloned.ID           = newCompId;
+      cloned.displayID    = newCompId;
+      cloned.hit          = 0;
+      cloned.totalCost    = 0;
+      cloned.timestamp    = Date.now();
+      cloned._starter     = false;
+      cloned._sharedFrom  = comp.displayID;
+
+      /* New worker IDs */
+      if (cloned._composite && cloned._composite.worker) {
+        cloned._composite.worker = cloned._composite.worker.map(function(w) {
+          var wid = generateId();
+          return Object.assign({}, w, {
+            ID:           wid,
+            displayID:    wid,
+            hit:          0,
+            lastRun:      null,
+            lastCheck:    null,
+            lastSnapshot: null,
+            watcherActive: false,
+            writerActive:  false,
+          });
+        });
+      }
+
+      /* Add to workspace */
+      if (!Array.isArray(agntuser.compositions)) agntuser.compositions = [];
+      agntuser.compositions.push(cloned);
+
+      /* Save */
+      await orchestrator.db.saveAppData('agnts', orchestrator.data);
+
+      /* Fire starters if new workspace */
+      if (email && typeof createStarterAgents === 'function') {
+        await createStarterAgents(orchestrator, agntuser);
+      }
+
+      /* Render */
+      orchestrator.render();
+
+      /* Brief success notification */
+      if (typeof orchestrator.showNotification === 'function') {
+        orchestrator.showNotification(
+          '✅ "' + (cloned.name || 'Agent') + '" added to your workspace!', 'success'
+        );
+      }
+
+    } catch(err) {
+      console.error('[AgentShare] Clone failed:', err);
+      if (typeof orchestrator.showNotification === 'function') {
+        orchestrator.showNotification('❌ Could not add agent: ' + err.message, 'error');
+      }
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────────────
+     INSTALL — call from agnts RAF
+     AgentShare.install(orchestrator) — sets up ref + checks for share URL
+     ───────────────────────────────────────────────────────────────────────────── */
+
+  function installAgentShare(orchestrator) {
+    _orchestratorRef = orchestrator;
+
+    /* Only run share preview once */
+    if (window._agntsShareChecked) return;
+    window._agntsShareChecked = true;
+
+    if (isShareUrl()) {
+      /* Delay slightly to let canvas render first */
+      setTimeout(function() {
+        showSharePreview(orchestrator);
+      }, 600);
+    }
+  }
+
+  window.AgentShare = {
+    openShareModal:    openShareModal,
+
+  };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootstrap);

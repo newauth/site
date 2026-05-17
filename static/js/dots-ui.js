@@ -3676,10 +3676,9 @@ function createClickHandler(div, obj) {
 
 var pinnedDotId = null;
 
-function updateSidepanelCount() {
-    var header = document.getElementById('sp-header');
-    if (!header) return;
+var accuracyLoaded = false;
 
+function updateSidepanelCount() {
     var listContainer = document.getElementById('sp-list');
     if (!listContainer) return;
 
@@ -3689,26 +3688,50 @@ function updateSidepanelCount() {
         if (allCards[i].style.display !== 'none') visibleCount++;
     }
 
-    // Fetch accuracy stats
+    // Update count immediately
+    var recEl = document.getElementById('sp-records');
+    if (recEl) recEl.textContent = 'Records: ' + visibleCount;
+
+    // ✅ Only fetch accuracy once
+    if (accuracyLoaded) return;
+    accuracyLoaded = true;
+
     fetch('/newauth/api/earnings/accuracy')
         .then(function(res) { return res.json(); })
         .then(function(stats) {
-            var buyPct  = stats.BUY  ? Math.round(100 * stats.BUY.correct  / stats.BUY.total)  : '--';
-            var sellPct = stats.SELL ? Math.round(100 * stats.SELL.correct / stats.SELL.total) : '--';
+            var header = document.getElementById('sp-header');
+            if (!header) return;
 
-            header.innerHTML = [
-                '<div style="display:flex;justify-content:space-between;font-size:13px;font-weight:bold;">',
-                    '<span>Records: ' + visibleCount + '</span>',
-                '</div>',
-                '<div style="display:flex;gap:8px;margin-top:6px;font-size:11px;">',
-                    '<span style="color:#16a34a;font-weight:700;">BUY ' + buyPct + '%</span>',
-                    '<span style="color:#dc2626;font-weight:700;">SELL ' + sellPct + '%</span>',
-                '</div>'
-            ].join('');
+            var lines = ['<div style="font-size:13px;font-weight:bold;" id="sp-records">Records: ' + visibleCount + '</div>'];
+            
+            var signals = ['BUY', 'SELL', 'WATCH', 'AVOID'];
+            var colors  = { BUY: '#16a34a', SELL: '#dc2626', WATCH: '#d97706', AVOID: '#6b7280' };
+            
+            var statParts = [];
+            signals.forEach(function(sig) {
+                if (stats[sig] && stats[sig].total > 0) {
+                    statParts.push(
+                        '<span style="color:' + colors[sig] + ';font-weight:700;">' +
+                        sig + ' ' + stats[sig].pct + '%' +
+                        '<span style="color:#888;font-weight:400;font-size:10px;"> ' + 
+                        stats[sig].correct + '/' + stats[sig].total + '</span>' +
+                        '</span>'
+                    );
+                } else {
+                    statParts.push(
+                        '<span style="color:#ccc;font-weight:400;">' + sig + ' –%</span>'
+                    );
+                }
+            });
+
+            lines.push('<div style="display:flex;gap:8px;margin-top:4px;font-size:11px;flex-wrap:wrap;">' + 
+                statParts.join('') + '</div>');
+
+            header.innerHTML = lines.join('');
         })
         .catch(function() {
-            // fallback — just show count
-            header.querySelector('span').textContent = 'Records: ' + visibleCount;
+            var recEl = document.getElementById('sp-records');
+            if (recEl) recEl.textContent = 'Records: ' + visibleCount;
         });
 }
 
