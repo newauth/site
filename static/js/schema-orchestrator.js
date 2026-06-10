@@ -2258,9 +2258,13 @@ class SchemaOrchestrator {
 	    
 	    // Get responsive font sizes
 	    const getFontSizes = () => {
-	        if (isMobile) {
-	            return { base: 12, increment: 6, max: 48 };
-	        } else if (isTablet) {
+			if (isMobile) {
+			    const focusText = this.currentPath[this.currentPath.length - 1]?.shortName || '';
+			    const dynamicMax = focusText.length > 10 
+			        ? Math.max(24, Math.floor(380 / focusText.length)) 
+			        : 48;
+			    return { base: 12, increment: 6, max: dynamicMax };
+			} else if (isTablet) {
 	            return { base: 16, increment: 8, max: 64 };
 	        } else {
 	            return { base: 20, increment: 10, max: 80 };
@@ -2286,7 +2290,10 @@ class SchemaOrchestrator {
 	    
 		if (isMobile) {
 		    const breadcrumb = document.getElementById('breadcrumb');
-		    const topOffset = breadcrumb ? (breadcrumb.offsetHeight + 20) : 100;
+		    const contextBar = document.getElementById('context-bar');
+		    const breadcrumbHeight = breadcrumb ? breadcrumb.offsetHeight : 0;
+		    const contextBarHeight = contextBar ? contextBar.offsetHeight : 0;
+		    const topOffset = breadcrumbHeight + contextBarHeight + 44;
 		    watermarkPositionStyle = `
 		        position: absolute;
 		        top: ${topOffset}px;
@@ -6327,7 +6334,7 @@ class SchemaOrchestrator {
 			// ── Non-owner: Create your own poll ──────────────────────────────────────────
 			if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && !this.isDataOwner()) {
 			    const createBtn = document.createElement('button');
-			    createBtn.textContent = '✨ Create your own poll';
+			    createBtn.textContent = '✨ Create poll';
 			    createBtn.style.cssText = `
 			        background: none; border: 1px solid #b2bec3; border-radius: 12px;
 			        padding: 3px 10px; font-size: 12px; color: #6c5ce7;
@@ -8723,20 +8730,18 @@ class SchemaOrchestrator {
 	    
 	    fields.forEach(field => {
 	        // Skip system/internal fields
-	        if (field.writePermission === 'system' || 
-	            ['ID', 'displayID', 'dotLabel', 'timestamp', 'count', 'hidden', 'hashed', 'parentId', 'path', 'image'].includes(field.name)) {
-	            return;
-	        }
+			const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+
+			const isScoringField = field.name === sortConfig?.scoreField || 
+			                       field.name === sortConfig?.aggregateField;
+
+			if (!isScoringField && field.writePermission === 'system') return;
+			if (['ID', 'displayID', 'dotLabel', 'timestamp', 'count', 
+			     'hidden', 'hashed', 'parentId', 'path', 'image'].includes(field.name)) return;
 	        
 			let value = item[field.name];
 
-			const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
-
-			// ✅ Default scoring fields to 0 if undefined — they're always numeric
-			const isScoringField = 
-			    field.name === sortConfig?.scoreField || 
-			    field.name === sortConfig?.aggregateField;
-
+			
 			// Derive voteCount from actual vote children if available
 			if ((value === undefined || value === null) && isScoringField && field.type === 'number') {
 			    // For poll answers, count actual vote children
