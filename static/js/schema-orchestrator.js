@@ -1268,6 +1268,38 @@ class SchemaOrchestrator {
 		    const pollDisplayID    = this.currentPath[1]?.displayID;
 		    if (!creatorDisplayID || !pollDisplayID) return;
 
+		    // ✅ Check localStorage FIRST — instant feedback, no network call
+		    const votedKey = `poll_voted_${pollDisplayID}`;
+		    let votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
+
+		    // ✅ Quick voteMode check from cached poll — no network needed
+		    const cachedPoll = this._getCurrentPoll();
+		    const quickVoteMode = cachedPoll?.voteMode || 'single';
+
+		    // ✅ Changeable mode: ensure only one entry — clean up stale entries
+		    if (quickVoteMode === 'changeable' && Object.keys(votedAnswers).length > 1) {
+		        const entries = Object.entries(votedAnswers);
+		        const mostRecent = entries.sort((a, b) =>
+		            (b[1].timestamp || 0) - (a[1].timestamp || 0)
+		        )[0];
+		        votedAnswers = { [mostRecent[0]]: mostRecent[1] };
+		        localStorage.setItem(votedKey, JSON.stringify(votedAnswers));
+		    }
+
+		    // ✅ Instant voteMode enforcement — no network call needed
+		    if (quickVoteMode === 'single' && Object.keys(votedAnswers).length > 0) {
+		        this.showNotification('⚠️ You have already voted on this poll.', 'error');
+		        return;
+		    }
+		    if (quickVoteMode === 'multi' && votedAnswers[answerId]?.voteId) {
+		        this.showNotification('⚠️ You have already voted for this option.', 'error');
+		        return;
+		    }
+		    if (quickVoteMode === 'changeable' && votedAnswers[answerId]) {
+		        this.showNotification('⚠️ You already chose this option.', 'error');
+		        return;
+		    }
+
 		    const voterId = this._getPollUserId();
 		    const voterDisplayId = this.db.hashUUID(voterId);
 
@@ -1276,7 +1308,7 @@ class SchemaOrchestrator {
 		        || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
 		        || this.data?.items?.[0]?.polls?.[0];
 
-		    // Fresh poll fetch for close enforcement
+		    // Fresh poll fetch for close enforcement only
 		    let poll = fullTreePoll;
 		    try {
 		        const fresh = await this.db.getAppData(
@@ -1308,34 +1340,6 @@ class SchemaOrchestrator {
 		    }
 
 		    const voteMode = poll?.voteMode || 'single';
-
-		    // ✅ Check if voter already voted using localStorage
-		    const votedKey = `poll_voted_${pollDisplayID}`;
-		    let votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
-
-		    // ✅ Changeable mode: ensure only one entry — clean up stale entries
-		    if (voteMode === 'changeable' && Object.keys(votedAnswers).length > 1) {
-		        const entries = Object.entries(votedAnswers);
-		        const mostRecent = entries.sort((a, b) => 
-		            (b[1].timestamp || 0) - (a[1].timestamp || 0)
-		        )[0];
-		        votedAnswers = { [mostRecent[0]]: mostRecent[1] };
-		        localStorage.setItem(votedKey, JSON.stringify(votedAnswers));
-		    }
-
-		    // voteMode enforcement
-		    if (voteMode === 'single' && Object.keys(votedAnswers).length > 0) {
-		        this.showNotification('⚠️ You have already voted on this poll.', 'error');
-		        return;
-		    }
-		    if (voteMode === 'multi' && votedAnswers[answerId]?.voteId) {
-		        this.showNotification('⚠️ You have already voted for this option.', 'error');
-		        return;
-		    }
-		    if (voteMode === 'changeable' && votedAnswers[answerId]) {
-		        this.showNotification('⚠️ You already chose this option.', 'error');
-		        return;
-		    }
 
 		    // ✅ Changeable — get single previous entry
 		    const prevEntry = voteMode === 'changeable' && Object.keys(votedAnswers).length > 0
@@ -1408,97 +1412,11 @@ class SchemaOrchestrator {
 		            : pathContext;
 		        this.data = await this.db.getAppData('poll', fetchContext, { bypassCache: true });
 		        this.render();
-
-		        // ✅ Vote feedback pulse
-		        requestAnimationFrame(() => {
-		            const dots = document.querySelectorAll('.dot');
-		            const votedDot = Array.from(dots).find(d =>
-		                d.itemData?.displayID === answerDisplayId ||
-		                d.itemData?.ID === answerId
-		            );
-		            if (!votedDot) return;
-		            let count = 0;
-		            const pulse = () => {
-		                if (count >= 3) {
-		                    votedDot.style.transform = '';
-		                    votedDot.style.transition = '';
-		                    return;
-		                }
-		                votedDot.style.transition = 'transform 0.15s ease-in-out';
-		                votedDot.style.transform = count % 2 === 0 ? 'scale(1.3)' : 'scale(0.9)';
-		                count++;
-		                setTimeout(pulse, 150);
-		            };
-		            pulse();
-		        });
-
 		        this.showNotification(supersedesId ? '✅ Vote changed!' : '✅ Vote added!', 'success');
 
 		    } catch (err) {
 		        console.error('[castVote] failed:', err);
 		        this.showNotification('❌ Failed to cast vote. Please try again.', 'error');
-		    }
-		}
-
-		// ─── POLL: add menu ───────────────────────────────────────────────────────────
-		_openPollAddMenu() {
-		    const depth = this.currentPath.length;
-
-		    // Depth 3 — answer view, votes cast from poll view
-		    if (depth === 3) {
-		        this.showNotification('💡 Votes are cast by clicking an answer dot on the poll view.', 'info');
-		        return;
-		    }
-
-		    // Depth 1 — creator view, adding polls
-		    if (depth === 1) {
-		        this.openAddDialog('poll');
-		        return;
-		    }
-
-		    // Depth 2 — poll view
-		    if (depth === 2) {
-				const pollDisplayID = this.currentPath[1]?.displayID;
-				const poll = this.data?.items?.find(i => i.entityType === 'poll')
-				    || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
-				    || this.data?.items?.[0]?.polls?.[0];
-				const answerMode = poll?.answerMode || 'owner_defined';
-		        const canAddAnswer = isowner || answerMode === 'voter_added' || answerMode === 'both';
-
-		        if (this.isDataOwner()) {
-		            this._showPollAddPicker([
-		                {
-		                    label: '💬 Add Answer',
-		                    desc: 'Add an option voters can choose',
-		                    action: () => this.openAddDialog('answer')
-		                },
-						{
-						    label: '📨 Invite Voters',
-						    desc: 'Share via WhatsApp, Telegram, email or link',
-						    action: () => {
-						        // Use existing share popup — anchor to center of canvas
-						        const canvas = document.getElementById('canvas-area');
-						        this.showSharePopup(canvas);
-						    }
-						}
-		            ]);
-		        } else if (canAddAnswer) {
-		            // Check if contributor has email stored
-		            const pollDisplayID = this.currentPath[1]?.displayID;
-		            const contributorKey = `poll_contributor_${pollDisplayID}`;
-		            const stored = (() => {
-		                try { return JSON.parse(localStorage.getItem(contributorKey)); }
-		                catch (e) { return null; }
-		            })();
-
-		            if (stored?.email) {
-		                this.openAddDialog('answer');
-		            } else {
-		                this._showPollContributorEmailModal(() => this.openAddDialog('answer'));
-		            }
-		        } else {
-		            this.showNotification('💡 The poll creator has disallowed new answer options.', 'info');
-		        }
 		    }
 		}
 
@@ -1551,6 +1469,51 @@ class SchemaOrchestrator {
 		    }, 100);
 		}
 
+		_openPollAddMenu() {
+		    const depth = this.currentPath.length;
+
+		    if (depth === 3) {
+		        this.showNotification('💡 Votes are cast by clicking an answer dot on the poll view.', 'info');
+		        return;
+		    }
+
+		    if (depth === 1) {
+		        this.openAddDialog('poll');
+		        return;
+		    }
+
+		    if (depth === 2) {
+		        const pollDisplayID = this.currentPath[1]?.displayID;
+		        const poll = this.data?.items?.find(i => i.entityType === 'poll')
+		            || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
+		            || this.data?.items?.[0]?.polls?.[0];
+		        const answerMode = poll?.answerMode || 'owner_defined';
+		        const canAddAnswer = this.isDataOwner() || answerMode === 'voter_added' || answerMode === 'both';
+
+		        if (this.isDataOwner()) {
+		            this._showPollAddPicker([
+		                {
+		                    label: '💬 Add Answer',
+		                    desc: 'Add an option voters can choose',
+		                    action: () => this.openAddDialog('answer')
+		                },
+		                {
+		                    label: '📨 Invite Voters',
+		                    desc: 'Share via WhatsApp, Telegram, email or link',
+		                    action: () => {
+		                        const canvas = document.getElementById('canvas-area');
+		                        this.showSharePopup(canvas);
+		                    }
+		                }
+		            ]);
+		        } else if (canAddAnswer) {
+		            this.openAddDialog('answer');
+		        } else {
+		            this.showNotification('💡 The poll creator has disallowed new answer options.', 'info');
+		        }
+		    }
+		}
+		
 		// ─── POLL: contributor email modal (for voter-added answers) ──────────────────
 		_showPollContributorEmailModal(onSuccess) {
 		    document.getElementById('poll-contributor-modal')?.remove();
@@ -2480,6 +2443,26 @@ class SchemaOrchestrator {
 				`;
 				
 				if (item.isFocus) {
+					// ✅ Poll depth 2: show total vote count
+				    if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && this.isDataOwner()) {
+				        const currentPoll = this._getCurrentPoll();
+				        const totalVotes = currentPoll?.answers?.reduce((sum, a) => sum + (a.hit || 0), 0) || 0;
+				        html += `
+				            <div style="
+				                font-size: ${Math.round(sizes.max * 0.3)}px;
+				                font-weight: 600;
+				                color: #aaa;
+				                letter-spacing: 2px;
+				                margin-top: 6px;
+				                margin-left: auto;
+				                margin-right: auto;
+				                max-width: 90%;
+				                text-transform: uppercase;
+				                line-height: 1.2;
+				                text-align: ${isMobile ? 'center' : 'left'};
+				            ">${totalVotes} vote${totalVotes !== 1 ? 's' : ''}</div>
+				        `;
+				    }
 				    const totalPages = Math.ceil((this._dotPageItemCount || 0) / (this._dotPageSize || 30));
 				    if (totalPages > 1) {
 				        const pageNum = (this._dotPage || 0) + 1;
@@ -3826,6 +3809,9 @@ class SchemaOrchestrator {
 	 * Generate tenant welcome email HTML template
 	 */
 	getTenantEmailTemplate(tenantData, appUrl, config, templateData) {
+		
+		// In getTenantEmailTemplate, before calling replaceTemplateVariables
+		
 		const featuresList = config.features.map(feature =>
 			`<li style="margin-bottom: 10px;">${this.replaceTemplateVariables(feature, templateData)}</li>`
 		).join('');
@@ -5217,10 +5203,10 @@ class SchemaOrchestrator {
 	            hoverText = 'Add new item';
 	        }
 			const addBtn = self._createAddButton(() => {
-			    if (self.currentApp?.id === 'poll') {
-			        self._openPollAddMenu();
+			    if (this.currentApp?.id === 'poll') {
+			        this._openPollAddMenu();
 			    } else {
-			        self.openAddDialog();
+			        this.openAddDialog();
 			    }
 			});
 	        addBtn.style.left = `${rect.width / 2}px`;
@@ -5327,9 +5313,7 @@ class SchemaOrchestrator {
 		const SOFT_BAND = 5;
 
 	    // ── Search filter (unchanged) ─────────────────────────────────
-	    items = this.searchResults
-	        ? items.filter(item => this.shouldShowItemInSearch(item) !== 'hide')
-	        : items;
+	    // ✅ Search filtering handled in dot loop — keep full array for stable positions
 
 		console.log('[render] items resolved:', items.map(i => ({name: i.name, entityType: i.entityType})));
 	    const entityType = this.currentApp.hierarchy[this.currentPath.length] || this.currentApp.hierarchy[0];
@@ -5565,9 +5549,13 @@ class SchemaOrchestrator {
 		        }
 
 		        // ── Search override ───────────────────────────────────
-		        const searchState = this.searchResults ? this.shouldShowItemInSearch(item) : null;
-		        let filterStyle = '';
-		        if (searchState === 'match') {
+				const searchState = this.searchResults ? this.shouldShowItemInSearch(item) : null;
+
+				// ✅ Skip hidden items — don't render dot but preserve position slot
+				if (searchState === 'hide') return;
+
+				let filterStyle = '';
+				if (searchState === 'match') {
 		            dotOpacity  = 1.0;
 		            filterStyle = 'brightness(1.2)';
 		        } else if (searchState === 'ancestor') {
@@ -5976,18 +5964,19 @@ class SchemaOrchestrator {
 
 		    const sortedScores = [...engagementScores].sort((a, b) => a - b);
 		    const len = sortedScores.length;
-		    const topThreshold = Math.max(
-			    sortedScores[Math.floor(len * 0.75)] ?? 0,
-			    0.01  // ✅ Ensure at least some differentiation
-			);
+			const maxScore = sortedScores[len - 1] ?? 0;
+			const topThreshold = maxScore > 0
+			    ? Math.max(maxScore * 0.9, 0.01)
+			    : Math.max(sortedScores[Math.floor(len * 0.75)] ?? 0, 0.01);
+				
 		    const bottomThreshold = sortedScores[Math.floor(len * 0.25)] ?? 0;
 		    const midThreshold = (topThreshold + bottomThreshold) / 2;
 
 		    const dotSizes = engagementScores.map((score, i) => {
 		        if (isIncomplete[i]) return minSize + (maxSize - minSize) * 0.5;
 		        if (score >= topThreshold) return maxSize;
-		        if (score >= midThreshold) return minSize + (maxSize - minSize) * 0.65;
-		        if (score > bottomThreshold) return minSize + (maxSize - minSize) * 0.35;
+		        if (score >= midThreshold) return minSize + (maxSize - minSize) * 0.5;
+		        if (score > bottomThreshold) return minSize + (maxSize - minSize) * 0.3;
 		        return minSize;
 		    });
 
@@ -7178,7 +7167,20 @@ class SchemaOrchestrator {
 			        
 					// ✅ Poll answer dots at depth 2 — vote instead of navigate
 					if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && entityType === 'answer') {
-					    await this.castVote(item.ID, item.displayID, item.name);
+					    // ✅ Remove fade-in class so it doesn't conflict with pulse animation
+					    dot.classList.remove('dot-fade-in');
+					    // Force reflow
+					    void dot.offsetWidth;
+					    
+					    dot.style.transition = 'transform 0.15s ease-in-out';
+					    dot.style.transform = 'scale(1.3)';
+					    setTimeout(() => { dot.style.transform = 'scale(0.9)'; }, 150);
+					    setTimeout(() => { dot.style.transform = 'scale(1.3)'; }, 300);
+					    setTimeout(() => { dot.style.transform = ''; dot.style.transition = ''; }, 450);
+
+					    setTimeout(() => {
+					        self.castVote(item.ID, item.displayID, item.name);
+					    }, 100);
 					    return;
 					}
 
@@ -7248,8 +7250,21 @@ class SchemaOrchestrator {
 				        const entityConfig = self.currentApp.entityConfigs[entityType];
 						// In the else block:
 						// ✅ Poll answer dots at depth 2 — vote instead of navigate
-						if (self.currentApp?.id === 'poll' && self.currentPath.length === 2 && entityType === 'answer') {
-						    await self.castVote(item.ID, item.displayID, item.name);
+						if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && entityType === 'answer') {
+						    // ✅ Remove fade-in class so it doesn't conflict with pulse animation
+						    dot.classList.remove('dot-fade-in');
+						    // Force reflow
+						    void dot.offsetWidth;
+						    
+						    dot.style.transition = 'transform 0.15s ease-in-out';
+						    dot.style.transform = 'scale(1.3)';
+						    setTimeout(() => { dot.style.transform = 'scale(0.9)'; }, 150);
+						    setTimeout(() => { dot.style.transform = 'scale(1.3)'; }, 300);
+						    setTimeout(() => { dot.style.transform = ''; dot.style.transition = ''; }, 450);
+
+						    setTimeout(() => {
+						        self.castVote(item.ID, item.displayID, item.name);
+						    }, 100);
 						    return;
 						}
 
@@ -11416,7 +11431,7 @@ class SchemaOrchestrator {
 	        }
 
 	        // ✅ Post-save: notification email for direct children of root
-	        const isDirectChildOfRoot = (this.currentPath.length === 1);
+	        const isDirectChildOfRoot = (this.currentPath.length === 1) && !isRootLevel;
 	        if (isDirectChildOfRoot && newItem.contactemail) {
 	            try {
 	                const pathWithNew = [...this.currentPath, {
