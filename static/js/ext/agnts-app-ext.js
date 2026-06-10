@@ -260,6 +260,377 @@
 	  }
 	}
 
+	// ── Add this helper — mirrors callProvider's routing logic ────────
+	function resolveProviderForDisplay(classifierWorker) {
+	  // If worker has explicit provider, use it
+	  if (classifierWorker.provider) return classifierWorker.provider;
+	  
+	  // Mirror smart routing to get provider without actually calling it
+	  const smart = resolveSmartModel(classifierWorker.workerType, classifierWorker);
+	  if (smart?.provider && smart.provider !== 'none') return smart.provider;
+	  
+	  // Fall back to global settings
+	  const globals = GlobalSettings.getDefaults();
+	  return globals.provider || 'unknown';
+	}
+	
+	// ── LLM Activity Indicator ─────────────────────────────────────────────────
+	// A persistent bot icon in the bottom-right corner that appears whenever
+	// any agent is running LLM inference. Hover to see which agents are active.
+
+	const LLMActivityIndicator = (() => {
+	  const _active = new Map(); // displayId → { name, action, provider, startedAt }
+
+	  const PROVIDERS = {
+	    webllm:      { label: 'WebLLM',      color: '#00b894', icon: '⚡' },
+	    claude:      { label: 'Claude',      color: '#f59e0b', icon: '✦'  },
+	    anthropic:   { label: 'Claude',      color: '#f59e0b', icon: '✦'  },
+	    openai:      { label: 'OpenAI',      color: '#10a37f', icon: '⬡'  },
+	    gemini:      { label: 'Gemini',      color: '#4285f4', icon: '✧'  },
+	    mistral:     { label: 'Mistral',     color: '#ff7043', icon: '▲'  },
+	    openrouter:  { label: 'OpenRouter',  color: '#6c5ce7', icon: '⊕'  },
+	    local:       { label: 'Local',       color: '#636e72', icon: '⌬'  },
+	    unknown:     { label: 'AI',          color: '#b0b0b0', icon: '●'  },
+	  };
+
+	  // Normalize provider key — claude + anthropic are same
+	  function _providerKey(provider) {
+	    if (!provider) return 'unknown';
+	    const p = provider.toLowerCase();
+	    if (p === 'anthropic') return 'claude';
+	    return PROVIDERS[p] ? p : 'unknown';
+	  }
+
+	  // Get active agents grouped by provider
+	  function _byProvider() {
+	    const map = new Map(); // providerKey → [{ name, action, startedAt }]
+	    _active.forEach(({ name, action, provider, startedAt }) => {
+	      const key = _providerKey(provider);
+	      if (!map.has(key)) map.set(key, []);
+	      map.get(key).push({ name, action, startedAt });
+	    });
+	    return map;
+	  }
+
+	  function _injectStyles() {
+	    if (document.getElementById('agnts-llm-indicator-style')) return;
+	    const s = document.createElement('style');
+	    s.id = 'agnts-llm-indicator-style';
+	    s.textContent = `
+			#agnts-llm-column {
+			  position: fixed;
+			  right: 0;
+			  bottom: 32px;        
+			  top: unset;
+			  transform: none;
+			  z-index: 9999;
+			  display: flex;
+			  flex-direction: column;
+			  align-items: flex-end;
+			  gap: 8px;
+			  padding: 8px 0;
+			  pointer-events: none;
+			}
+
+	      .agnts-llm-provider {
+	        position: relative;
+	        display: flex;
+	        align-items: center;
+	        pointer-events: auto;
+	        cursor: default;
+	      }
+
+	      /* The circle itself */
+	      .agnts-llm-circle {
+	        width: 36px;
+	        height: 36px;
+	        border-radius: 50% 0 0 50%;
+	        display: flex;
+	        align-items: center;
+	        justify-content: center;
+	        font-size: 14px;
+	        color: white;
+	        box-shadow: -2px 2px 12px rgba(0,0,0,0.15);
+	        position: relative;
+	        transition: transform 0.2s ease, border-radius 0.2s ease;
+	        flex-shrink: 0;
+	      }
+
+	      .agnts-llm-provider:hover .agnts-llm-circle {
+	        border-radius: 50%;
+	        transform: translateX(-4px);
+	      }
+
+	      /* Pulse ring */
+	      .agnts-llm-circle::after {
+	        content: '';
+	        position: absolute;
+	        inset: -3px;
+	        border-radius: 50%;
+	        border: 2px solid currentColor;
+	        opacity: 0;
+	        animation: llmRingPulse 2s ease-out infinite;
+	      }
+
+	      @keyframes llmRingPulse {
+	        0%   { transform: scale(0.85); opacity: 0.6; }
+	        100% { transform: scale(1.5);  opacity: 0;   }
+	      }
+
+	      /* Count badge */
+	      .agnts-llm-badge {
+	        position: absolute;
+	        top: -4px;
+	        right: -2px;
+	        width: 16px;
+	        height: 16px;
+	        border-radius: 50%;
+	        background: white;
+	        font-size: 9px;
+	        font-weight: 700;
+	        display: flex;
+	        align-items: center;
+	        justify-content: center;
+	        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+	        border: 1.5px solid rgba(0,0,0,0.08);
+	        pointer-events: none;
+	      }
+
+	      /* Tooltip — slides in from right on hover */
+	      .agnts-llm-tooltip {
+	        position: absolute;
+	        right: 40px;
+	        top: 50%;
+	        transform: translateY(-50%) translateX(8px);
+	        background: rgba(255,255,255,0.97);
+	        border: 1px solid rgba(0,0,0,0.08);
+	        border-radius: 10px;
+	        padding: 8px 0;
+	        min-width: 200px;
+	        max-width: 260px;
+	        box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+	        opacity: 0;
+	        pointer-events: none;
+	        transition: opacity 0.2s ease, transform 0.2s ease;
+	        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+	        backdrop-filter: blur(12px);
+	        -webkit-backdrop-filter: blur(12px);
+	      }
+
+	      .agnts-llm-provider:hover .agnts-llm-tooltip {
+	        opacity: 1;
+	        transform: translateY(-50%) translateX(0);
+	        pointer-events: auto;
+	      }
+
+	      .agnts-llm-tooltip-header {
+	        font-size: 10px;
+	        font-weight: 600;
+	        letter-spacing: 0.06em;
+	        text-transform: uppercase;
+	        color: rgba(26,26,46,0.4);
+	        padding: 0 12px 6px;
+	        border-bottom: 1px solid rgba(0,0,0,0.06);
+	        margin-bottom: 4px;
+	      }
+
+	      .agnts-llm-tooltip-row {
+	        display: flex;
+	        align-items: center;
+	        gap: 8px;
+	        padding: 5px 12px;
+	      }
+
+	      .agnts-llm-tooltip-row:hover {
+	        background: rgba(0,0,0,0.03);
+	      }
+
+	      .agnts-llm-tooltip-dot {
+	        width: 6px;
+	        height: 6px;
+	        border-radius: 50%;
+	        flex-shrink: 0;
+	        animation: llmDotBlink 1.5s ease-in-out infinite;
+	      }
+
+	      @keyframes llmDotBlink {
+	        0%,100% { opacity: 1; }
+	        50%     { opacity: 0.3; }
+	      }
+
+	      .agnts-llm-tooltip-name {
+	        font-size: 12px;
+	        font-weight: 600;
+	        color: #1a1a2e;
+	        flex: 1;
+	        overflow: hidden;
+	        text-overflow: ellipsis;
+	        white-space: nowrap;
+	      }
+
+	      .agnts-llm-tooltip-action {
+	        font-size: 10px;
+	        font-weight: 500;
+	        opacity: 0.6;
+	        flex-shrink: 0;
+	      }
+
+	      .agnts-llm-tooltip-elapsed {
+	        font-size: 10px;
+	        color: rgba(26,26,46,0.3);
+	        flex-shrink: 0;
+	        min-width: 24px;
+	        text-align: right;
+	      }
+
+	      /* Enter/exit animation for each provider circle */
+	      .agnts-llm-provider {
+	        animation: llmProviderIn 0.3s cubic-bezier(0.34,1.56,0.64,1) both;
+	      }
+
+	      @keyframes llmProviderIn {
+	        from { opacity: 0; transform: translateX(20px); }
+	        to   { opacity: 1; transform: translateX(0); }
+	      }
+	    `;
+	    document.head.appendChild(s);
+	  }
+
+	  function _render() {
+	    _injectStyles();
+	    const byProvider = _byProvider();
+
+	    let col = document.getElementById('agnts-llm-column');
+
+	    // ── Nothing active — remove column immediately ─────────────────
+	    if (byProvider.size === 0) {
+	      if (col) {
+	        col.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+	        col.style.opacity    = '0';
+	        col.style.transform  = 'translateX(20px)';
+	        setTimeout(() => col?.remove(), 300);
+	      }
+	      return; // ← exit early, don't recreate
+	    }
+
+	    // ── Create column if needed ────────────────────────────────────
+	    if (!col) {
+	      col = document.createElement('div');
+	      col.id = 'agnts-llm-column';
+	      document.body.appendChild(col);
+	    }
+
+	    // Remove providers no longer active
+	    col.querySelectorAll('.agnts-llm-provider').forEach(el => {
+	      if (!byProvider.has(el.dataset.provider)) {
+	        el.style.animation = 'llmProviderIn 0.2s ease reverse both';
+	        setTimeout(() => el.remove(), 200);
+	      }
+	    });
+
+	    // Add/update active providers
+	    byProvider.forEach((agents, providerKey) => {
+	      const cfg = PROVIDERS[providerKey] || PROVIDERS.unknown;
+	      let provEl = col.querySelector(`.agnts-llm-provider[data-provider="${providerKey}"]`);
+
+	      if (!provEl) {
+	        // Create new provider circle
+	        provEl = document.createElement('div');
+	        provEl.className = 'agnts-llm-provider';
+	        provEl.dataset.provider = providerKey;
+	        provEl.innerHTML = `
+	          <div class="agnts-llm-tooltip">
+	            <div class="agnts-llm-tooltip-header">${cfg.label}</div>
+	          </div>
+	          <div class="agnts-llm-circle" style="background:${cfg.color};color:${cfg.color};">
+	            <span style="color:white;font-size:14px;">${cfg.icon}</span>
+	            <span class="agnts-llm-badge" style="color:${cfg.color};">
+	              ${agents.length}
+	            </span>
+	          </div>
+	        `;
+	        col.appendChild(provEl);
+	      }
+
+	      // Update badge count
+	      const badge = provEl.querySelector('.agnts-llm-badge');
+	      if (badge) {
+	        badge.textContent = agents.length;
+	        badge.style.display = agents.length > 1 ? 'flex' : 'none';
+	      }
+
+	      // Update tooltip rows
+	      const tooltip = provEl.querySelector('.agnts-llm-tooltip');
+	      if (tooltip) {
+	        const now = Date.now();
+	        let rows = `<div class="agnts-llm-tooltip-header">${cfg.label}</div>`;
+	        agents.forEach(({ name, action, startedAt }) => {
+	          const elapsed = Math.floor((now - startedAt) / 1000);
+	          const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed/60)}m`;
+	          rows += `
+	            <div class="agnts-llm-tooltip-row">
+	              <div class="agnts-llm-tooltip-dot" style="background:${cfg.color};"></div>
+	              <span class="agnts-llm-tooltip-name">${name}</span>
+	              <span class="agnts-llm-tooltip-action">${action}</span>
+	              <span class="agnts-llm-tooltip-elapsed">${elapsedStr}</span>
+	            </div>
+	          `;
+	        });
+	        tooltip.innerHTML = rows;
+	      }
+	    });
+
+	    
+	  }
+
+	  // Update elapsed times every second while any tooltip is hovered
+	  setInterval(() => {
+	    const hovered = document.querySelector('.agnts-llm-provider:hover');
+	    if (!hovered) return;
+	    const providerKey = hovered.dataset.provider;
+	    const cfg = PROVIDERS[providerKey] || PROVIDERS.unknown;
+	    const agents = _byProvider().get(providerKey) || [];
+	    const tooltip = hovered.querySelector('.agnts-llm-tooltip');
+	    if (!tooltip) return;
+
+	    const now = Date.now();
+	    let rows = `<div class="agnts-llm-tooltip-header">${cfg.label}</div>`;
+	    agents.forEach(({ name, action, startedAt }) => {
+	      const elapsed = Math.floor((now - startedAt) / 1000);
+	      const elapsedStr = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed/60)}m`;
+	      rows += `
+	        <div class="agnts-llm-tooltip-row">
+	          <div class="agnts-llm-tooltip-dot" style="background:${cfg.color};"></div>
+	          <span class="agnts-llm-tooltip-name">${name}</span>
+	          <span class="agnts-llm-tooltip-action">${action}</span>
+	          <span class="agnts-llm-tooltip-elapsed">${elapsedStr}</span>
+	        </div>
+	      `;
+	    });
+	    tooltip.innerHTML = rows;
+	  }, 1000);
+
+	  return {
+	    start(displayId, agentName, action = 'classifying', provider = 'unknown') {
+	      _active.set(displayId, {
+	        name:      agentName,
+	        action,
+	        provider:  provider || 'unknown',
+	        startedAt: Date.now()
+	      });
+	      _render();
+	    },
+
+	    stop(displayId) {
+	      _active.delete(displayId);
+		  console.log('[LLM] stop called for', displayId, '— active remaining:', _active.size, [..._active.keys()]);
+	      _render();
+	    }
+	  };
+	})();
+	
+	window.LLMActivityIndicator = LLMActivityIndicator;
+	
 	// ══════════════════════════════════════════════════════════════════════════
 	// Agent Query Orchestrator - Shared by Telegram Bot and Assistant Chat
 	// ══════════════════════════════════════════════════════════════════════════
@@ -652,6 +1023,32 @@
 	  coder:       3,  // code generation — needs strong model
 	  tester:      3,  // test generation — needs strong model
 	};
+	
+	
+	function getAgentTier(compositionItem) {
+	  const workers = compositionItem._composite?.worker || [];
+	  const compType = compositionItem.compositionType || '';
+	  
+	  const needsStructured = ['recruiter', 'analyst', 'coder'].includes(compType);
+	  
+	  // Get max WORKER_MIN_TIER across all workers
+	  let maxTier = -1;
+	  workers.forEach(w => {
+	    const workerTier = WORKER_MIN_TIER[w.workerType] ?? 0;
+	    if (workerTier > maxTier) maxTier = workerTier;
+	  });
+
+	  // Bump tier if structured output needed but only small WebLLM available
+	  const webllmSizeB = window._webllmModel
+	    ? parseFloat(window._webllmModel.match(/(\d+)B/i)?.[1] || '0')
+	    : 0;
+	  
+	  if (needsStructured && maxTier === 0 && webllmSizeB < 7) {
+	    maxTier = 1; // needs at least 7B — bump to tier 1
+	  }
+
+	  return maxTier;
+	}
 	
 	function getModelTier(modelId, provider) {
 	  if (!modelId || provider === 'webllm') return 0;
@@ -1722,6 +2119,7 @@
 
 	  const provider = effective.provider;
 	  
+	  workerItem._resolvedProvider = provider;
 	  console.log('[callProvider] effective.provider:', effective.provider, 'effective.model:', effective.model);
 	  console.log('[callProvider] callOpenRouter type:', typeof callOpenRouter);
 	  
@@ -2128,22 +2526,49 @@
 		      const tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
 		      UsageTracker.trackLLM('webllm', model, tokens);
 		      return reply.choices[0]?.message?.content || '';
-		    } catch(useErr) {
-		      if (useErr.message?.includes('disposed') ||
-		          useErr.message?.includes('not loaded') ||
-		          useErr.message?.includes('has been disposed')) {
-		        console.warn('[WebLLM] Engine disposed (sleep/wake) — resetting and reloading silently');
-		        window._webllmEngine       = null;
-		        window._webllmModel        = null;
-		        window._webllmEngineReady  = false;
-		        window._webllmLoadingPromise = null;
-		        window._webllmCached       = {};
-		        // Fall through to reload — skip download prompt since model is cached
-		        window._skipDownloadPrompt = true;
-		      } else {
-		        throw useErr;
-		      }
+		    } 	catch(useErr) {
+		    if (useErr.message?.includes('disposed') ||
+		        useErr.message?.includes('not loaded') ||
+		        useErr.message?.includes('has been disposed')) {
+		      console.warn('[WebLLM] Engine disposed (sleep/wake) — resetting and reloading silently');
+		      window._webllmEngine        = null;
+		      window._webllmModel         = null;
+		      window._webllmEngineReady   = false;
+		      window._webllmLoadingPromise = null;
+		      window._webllmCached        = {};
+		      window._skipDownloadPrompt  = true;
+		      // Fall through to reload
+
+		    } else if (useErr.message?.includes('DXGI_ERROR_DEVICE_REMOVED')
+		            || useErr.message?.includes('requestDevice')
+		            || useErr.message?.includes('GPUAdapter')
+		            || useErr instanceof DOMException && useErr.name === 'OperationError') {
+		      console.warn('[WebLLM] GPU device lost — resetting engine, falling back to cloud');
+
+		      try { await window._webllmEngine?.unload(); } catch(_) {}
+		      window._webllmEngine        = null;
+		      window._webllmModel         = null;
+		      window._webllmEngineReady   = false;
+		      window._webllmLoadingPromise = null;
+		      // Keep _webllmCached — model download is still valid
+		      // Keep _webllmFailures — increment below
+
+		     showSnippetCard(
+		        'system',
+		        '⚡ WebLLM GPU reset — switching to cloud fallback',
+		        'System',
+		        Date.now()
+		      );
+
+		      const fallbackErr = new Error('WebLLM GPU device lost — falling back');
+		      fallbackErr.rateLimitHit = true;
+		      fallbackErr.isGpuLoss    = true;
+		      throw fallbackErr;
+
+		    } else {
+		      throw useErr;
 		    }
+		  }
 		  }
 
 	      // If engine is currently loading — wait for it instead of starting a second load
@@ -3152,61 +3577,367 @@
 
   // ── Intent Detection ─────────────────────────────────────────────────────────
   async function detectIntent(text) {
+    console.log('[detectIntent] called with:', text);
     const today = new Date().toISOString().split('T')[0];
     const prompt = `Today is ${today}.
-
+   
   Classify this message and extract any relevant information.
   Return ONLY valid JSON, no markdown:
   {
-    "type": "reminder|fact|question|agent_command|general",
+    "type": "reminder|fact|question|web_search|action|general",
     "subject": "brief subject (person, event, topic)",
     "summary": "short display text for snippet card (max 60 chars)",
     "date": "ISO date if mentioned (YYYY-MM-DD) or null",
     "remindDate": "ISO date to remind user (day before date, or user-specified) or null",
-    "reply": "friendly acknowledgment to send back to user"
+    "reply": "friendly acknowledgment to send back to user",
+    "searchQuery": "optimized web search query if type is web_search, else null",
+    "action": {
+      "verb": "send_telegram|start_agent|stop_agent|poll_agent|get_status|null",
+      "target": "agent name or null",
+      "payload": "exact message text to send, or null"
+    }
   }
-
-  Message: "${text}"
-
-  Rules:
+   
+  Message: "${text.replace(/"/g, '\\"')}"
+   
+  Classification rules:
   - reminder: has a future date AND needs action/remembering (birthday, meeting, deadline)
   - fact: personal info to remember but no date action needed (preferences, names, context)
-  - question: asking for information
-  - agent_command: controlling agents (activate, stop, status)
+  - question: asking about the user's agents or their collected data
+  - web_search: needs current real-world data — weather, prices, news, sports scores,
+                stock prices, currency rates, facts about the world, any "what is / who is /
+                how much" question that requires live data
+  - action: user wants to DO something — send a telegram/message, start an agent,
+            stop an agent, poll an agent now, check agent status
   - general: everything else
+   
+  Additional rules:
+  - For web_search: distill the question into the best possible search query in searchQuery
+    e.g. "whats the weather like in tokyo?" → searchQuery: "Tokyo weather today"
+    e.g. "how much is bitcoin right now?" → searchQuery: "Bitcoin price USD today"
+  - For send_telegram: extract the exact message the user wants sent into action.payload
+    e.g. "send a message to telegram saying hello world" → verb: send_telegram, payload: "hello world"
+  - For agent actions: extract the agent name into action.target
+    e.g. "stop my recruiter agent" → verb: stop_agent, target: "recruiter"
   - For remindDate: default to day before date unless user specifies otherwise
-  - reply should confirm what was understood, e.g. "Got it! I'll remind you about Jack's birthday on Aug 1 🎂"`;
-
-    const smart  = resolveSmartModel('chat', null);
-    const s      = GlobalSettings.load();
+  - reply should confirm what was understood
+  - If unsure between question and web_search, prefer web_search for anything factual/current`;
+   
+    const smart    = resolveSmartModel('chat', null);
+    const s        = GlobalSettings.load();
     const provider = smart.provider || s.defaultProvider || 'openrouter';
     const model    = smart.model    || s.defaultModel    || '';
-
+   
     try {
       const raw = await callProvider(
-        { provider, model, include_reasoning: false, maxTokens: 300 },
+        { provider, model, include_reasoning: false, maxTokens: 400 },
         [],
         prompt
       );
       const clean = (raw || '').replace(/```json|```/g, '').trim();
-      return JSON.parse(clean);
+      const parsed = JSON.parse(clean);
+      // Ensure action always exists with defaults
+      if (!parsed.action) parsed.action = { verb: null, target: null, payload: null };
+      return parsed;
     } catch(e) {
       console.error('[AssistantNotes] Intent detection failed:', e.message);
-      return { type: 'general', reply: null };
+      return { type: 'general', reply: null, action: { verb: null, target: null, payload: null } };
     }
   }
+
+  
+  async function handleWebSearch(intent, token, chatId) {
+   
+    // Local Telegram sender — avoids dependency on reply() closure
+    const tgReply = async (text) => {
+      if (!token || !chatId) return; // browser path — no-op, caller handles display
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id:                  chatId,
+          text,
+          parse_mode:               'Markdown',
+          disable_web_page_preview: true
+        })
+      }).catch(e => console.error('[handleWebSearch] tgReply failed:', e.message));
+    };
+   
+    await tgReply('_🔍 searching..._');
+   
+    const query = intent.searchQuery || intent.subject || '';
+    const PROXY = '/newauth/api/dotappsproxy?url=';
+    const parts = [];
+   
+    // 1. DuckDuckGo instant answer (best for weather, prices, facts)
+    try {
+      const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+      const ddg = await fetch(PROXY + encodeURIComponent(ddgUrl)).then(r => r.json());
+      if (ddg.Answer)       parts.push({ src: 'Answer',      text: ddg.Answer });
+      if (ddg.AbstractText) parts.push({ src: ddg.AbstractSource || 'Wikipedia', text: ddg.AbstractText });
+      if (ddg.Definition)   parts.push({ src: 'Definition',  text: ddg.Definition });
+      (ddg.RelatedTopics || []).slice(0, 4).forEach(t => {
+        if (t.Text) parts.push({ src: 'Related', text: t.Text });
+      });
+    } catch(e) {
+      console.log('[WebSearch] DDG failed:', e.message);
+    }
+   
+    // 2. Google News RSS fallback — good for current events, news
+    if (parts.length < 2) {
+      try {
+        const newsUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
+        const xml = await fetch(PROXY + encodeURIComponent(newsUrl)).then(r => r.text());
+        const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 5);
+        items.forEach(m => {
+          const titleMatch = m[1].match(/<title><!\[CDATA\[(.*?)\]\]>/);
+          const descMatch  = m[1].match(/<description><!\[CDATA\[(.*?)\]\]>/);
+          const title = titleMatch?.[1] || '';
+          const desc  = descMatch?.[1]?.replace(/<[^>]+>/g, '').substring(0, 120) || '';
+          if (title) parts.push({ src: 'News', text: desc ? `${title} — ${desc}` : title });
+        });
+      } catch(e) {
+        console.log('[WebSearch] News RSS failed:', e.message);
+      }
+    }
+   
+    // 3. No results
+    if (!parts.length) {
+      const msg = `❌ Couldn't find results for: _${query}_\n\nTry rephrasing your question.`;
+      await tgReply(msg);
+      return msg;
+    }
+   
+    // 4. Synthesize with LLM
+    const smart    = resolveSmartModel('chat', null);
+    const s        = GlobalSettings.load();
+    const provider = smart.provider || s.defaultProvider || 'openrouter';
+    const model    = smart.model    || s.defaultModel    || '';
+   
+    const systemPrompt = `You are a helpful assistant. Answer the user's question directly and concisely based on the search results.
+  Be factual. Use **bold** for key facts (temperatures, prices, names, scores).
+  Keep the answer under 120 words. Do not mention that you searched — just answer naturally.
+  If the results don't contain the answer, say so briefly.`;
+   
+    const userMessage = `User asked: "${intent.subject || query}"
+   
+  Search results:
+  ${parts.map(p => `[${p.src}]: ${p.text}`).join('\n\n')}
+   
+  Answer the question directly.`;
+   
+    try {
+      const answer = await callProvider(
+        { provider, model, systemPrompt, include_reasoning: false, maxTokens: 300 },
+        [],
+        userMessage
+      );
+      const result = answer || parts[0].text;
+      await tgReply(result);
+      return result;
+    } catch(e) {
+      console.error('[WebSearch] LLM synthesis failed:', e.message);
+      const fallback = parts.slice(0, 2).map(p => `*${p.src}:* ${p.text}`).join('\n\n');
+      await tgReply(fallback);
+      return fallback;
+    }
+  }
+
+   
+   
+  // ── PIECE 3: handleAction (NEW — add after handleWebSearch) ──────────────────
+  async function handleAction(intent, token, chatId, orchestrator) {
+   
+    // Local Telegram sender — avoids dependency on reply() closure
+    const tgReply = async (text) => {
+      if (!token || !chatId) return; // browser path — no-op
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id:                  chatId,
+          text,
+          parse_mode:               'Markdown',
+          disable_web_page_preview: true
+        })
+      }).catch(e => console.error('[handleAction] tgReply failed:', e.message));
+    };
+   
+    const { verb, target, payload } = intent.action || {};
+    const comps = orchestrator?.data?.items?.[0]?.compositions || [];
+    const s     = GlobalSettings.load();
+   
+    // ── send_telegram ─────────────────────────────────────────────────────────
+    if (verb === 'send_telegram') {
+      if (!payload?.trim()) {
+        const msg = '❌ I couldn\'t figure out what message to send. Try: _"Send a telegram saying Hello!"_';
+        await tgReply(msg);
+        return msg;
+      }
+      // Send the actual payload message
+      await fetch(`https://api.telegram.org/bot${s.telegramBotToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id:    s.telegramChatId,
+          text:       payload.trim(),
+          parse_mode: 'Markdown'
+        })
+      }).catch(e => console.error('[handleAction] send_telegram failed:', e.message));
+      const confirm = `✅ Sent to Telegram: _"${payload.trim()}"_`;
+      await tgReply(confirm);
+      return confirm;
+    }
+   
+    // ── get_status ────────────────────────────────────────────────────────────
+    if (verb === 'get_status') {
+      if (!comps.length) {
+        const msg = 'No agents configured.';
+        await tgReply(msg);
+        return msg;
+      }
+      const lines = comps.map(c => {
+        const watcher   = c._composite?.worker?.find(w => w.workerType === 'watcher');
+        const active    = watcher?.watcherActive ? '🟢' : '⚪';
+        const errors    = watcher?._consecutiveErrors > 0 ? ` ⚠️ ${watcher._consecutiveErrors} errors` : '';
+        const lastCheck = watcher?.lastCheck
+          ? new Date(watcher.lastCheck).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : 'never';
+        return `${active} *${c.name}* — ${c.hit || 0} runs — last: ${lastCheck}${errors}`;
+      });
+      const msg = `*Agent Status*\n\n${lines.join('\n')}`;
+      await tgReply(msg);
+      return msg;
+    }
+   
+    // ── start_agent / stop_agent ──────────────────────────────────────────────
+    if (verb === 'start_agent' || verb === 'stop_agent') {
+      if (!target) {
+        const msg = '❌ Which agent? Try: _"Stop my Recruiter agent"_';
+        await tgReply(msg);
+        return msg;
+      }
+      const comp = comps.find(c =>
+        c.name?.toLowerCase().includes(target.toLowerCase()) ||
+        c.compositionType?.toLowerCase().includes(target.toLowerCase())
+      );
+      if (!comp) {
+        const names = comps.map(c => c.name).join(', ');
+        const msg = `❌ Agent _"${target}"_ not found.\n\nAvailable agents: ${names}`;
+        await tgReply(msg);
+        return msg;
+      }
+      const watcher = comp._composite?.worker?.find(w => w.workerType === 'watcher');
+      if (!watcher) {
+        const msg = `❌ No watcher found on _"${comp.name}"_`;
+        await tgReply(msg);
+        return msg;
+      }
+      const starting = verb === 'start_agent';
+      watcher.watcherActive      = starting;
+      watcher._stopped           = !starting;
+      watcher._consecutiveErrors = 0;
+      if (starting) watcher.disabled = false;
+      try {
+        await agntsUpsertAndSave(orchestrator, comp);
+        const msg = `${starting ? '▶️' : '⏹️'} Agent _"${comp.name}"_ ${starting ? 'started' : 'stopped'}.`;
+        await tgReply(msg);
+        return msg;
+      } catch(e) {
+        const msg = `❌ Failed to save state: ${e.message}`;
+        await tgReply(msg);
+        return msg;
+      }
+    }
+   
+    // ── poll_agent ────────────────────────────────────────────────────────────
+    if (verb === 'poll_agent') {
+      if (!target) {
+        const msg = '❌ Which agent should I poll?';
+        await tgReply(msg);
+        return msg;
+      }
+      const comp = comps.find(c =>
+        c.name?.toLowerCase().includes(target.toLowerCase()) ||
+        c.compositionType?.toLowerCase().includes(target.toLowerCase())
+      );
+      if (!comp) {
+        const msg = `❌ Agent _"${target}"_ not found.`;
+        await tgReply(msg);
+        return msg;
+      }
+      const watcher = comp._composite?.worker?.find(w => w.workerType === 'watcher');
+      if (!watcher) {
+        const msg = `❌ No watcher on _"${comp.name}"_`;
+        await tgReply(msg);
+        return msg;
+      }
+      const btn = document.getElementById(`watcher-pollnow-${watcher.displayID}`);
+      if (btn) {
+        btn.click();
+        const msg = `🔄 Polling _"${comp.name}"_ now — check back in a moment.`;
+        await tgReply(msg);
+        return msg;
+      } else {
+        const msg = `⚠️ _"${comp.name}"_ poll button not found — is the agent active?`;
+        await tgReply(msg);
+        return msg;
+      }
+    }
+   
+    // ── Unknown verb — fall through to natural language ───────────────────────
+    console.warn('[handleAction] Unknown verb:', verb, '— falling through to NL');
+    const fallback = await orchestrateAgentQuery(
+      intent.reply || payload || target || 'help',
+      comps
+    );
+    await tgReply(fallback);
+    return fallback;
+  }
+
+
+
 
   // ── Find assistant composition ────────────────────────────────────────────────
   function getAssistantComposition(orchestrator) {
     return orchestrator?.data?.items?.[0]?.compositions
       ?.find(c => c.compositionType === 'assistant');
   }
+  
+  // ── Natural language handler ──────────────────────────────────────
+  async function handleNaturalLanguage(text, token, chatId, compositions) {
+    const tgReply = async (msg) => {
+      if (!token || !chatId) return;
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id:    chatId,
+          text:       msg,
+          parse_mode: 'Markdown',
+          disable_web_page_preview: true
+        })
+      }).catch(e => console.error('[handleNaturalLanguage] tgReply failed:', e.message));
+    };
+
+    try {
+      await tgReply('_thinking..._');
+      const answer = await orchestrateAgentQuery(text, compositions);
+      await tgReply(answer);
+      return answer;
+    } catch(e) {
+      console.error('[TelegramBot] NL handler error:', e.message);
+      await tgReply(`❌ Error: ${e.message}`);
+      throw e;
+    }
+  }
 
   // ── Handle assistant message ──────────────────────────────────────────────────
   async function handleAssistantMessage(text, token, chatId, orchestrator) {
     const intent = await detectIntent(text);
     console.log('[Assistant] intent:', intent);
-
+   
+    // ── Save reminders and facts ──────────────────────────────────────────────
     if (intent.type === 'reminder' || intent.type === 'fact') {
       const note = {
         id:         'note-' + Date.now(),
@@ -3216,29 +3947,42 @@
         fired:      false
       };
       await saveNote(note);
-
-      // Show snippet on assistant dot immediately
       const comp = getAssistantComposition(orchestrator);
       if (comp) showSnippetCard(comp.displayID, intent.summary || text, 'Assistant', Date.now());
-
       return reply(token, chatId, intent.reply || `Got it! I've noted: _${text}_`);
     }
-
+   
+    // ── Web search — weather, prices, news, live facts ────────────────────────
+    if (intent.type === 'web_search') {
+      return handleWebSearch(intent, token, chatId);
+    }
+   
+    // ── Action — send telegram, start/stop/poll agent ─────────────────────────
+    if (intent.type === 'action') {
+      return handleAction(intent, token, chatId, orchestrator);
+    }
+   
+    // ── Question about agents — use full orchestrateAgentQuery context ─────────
     if (intent.type === 'question') {
-      // Check notes first for relevant context
-      const notes = await getNotes();
+      const notes = await getNotes().catch(() => []);
       const notesCtx = notes.length
         ? `My notes:\n${notes.map(n => `- ${n.parsedNote?.summary || n.text} (${relativeTime(n.timestamp)})`).join('\n')}\n\n`
         : '';
-      // Fall through to NL handler with notes context injected
-      return handleNaturalLanguage(notesCtx + text, token, chatId,
-        orchestrator?.data?.items?.[0]?.compositions || []);
+      return handleNaturalLanguage(
+        notesCtx + text,
+        token, chatId,
+        orchestrator?.data?.items?.[0]?.compositions || []
+      );
     }
-
-    // agent_command or general — existing handler
-    return handleNaturalLanguage(text, token, chatId,
-      orchestrator?.data?.items?.[0]?.compositions || []);
+   
+    // ── agent_command or general fallback ─────────────────────────────────────
+    return handleNaturalLanguage(
+      text, token, chatId,
+      orchestrator?.data?.items?.[0]?.compositions || []
+    );
   }
+
+
 
   // ── Reminder checker ──────────────────────────────────────────────────────────
   async function checkReminders(orchestrator) {
@@ -3430,7 +4174,7 @@
 
 	  function showSnippetCard(compositionDisplayId, text, agentName, queuedAt) {
 		const wasEmpty = _snippetQueue.length === 0 && _dotSnippetCount.size === 0;
-	      _snippetQueue.push({ compositionDisplayId, text, agentName, queuedAt});
+	      _snippetQueue.push({ compositionDisplayId, text, agentName, queuedAt: queuedAt || Date.now() });
 	      _ensureSnippetPoller();
 		  _updateTabTitle();
 	    }
@@ -4370,7 +5114,7 @@
             btn.addEventListener('click', () => {
               const url = btn.dataset.addUrl;
               if (url && !existing.includes(url)) {
-                existing.push(url);
+                existing.push({ url: url, cssSelector: null, type: 'direct' });
                 renderModal();
               }
             });
@@ -4382,7 +5126,7 @@
             const url   = input?.value?.trim();
             if (!url) return;
             try { new URL(url); } catch { input.style.borderColor = '#e53935'; setTimeout(() => { input.style.borderColor = '#ddd'; }, 1500); return; }
-            if (!existing.includes(url)) { existing.push(url); renderModal(); }
+            if (!existing.some(e => e.url === url)) { existing.push({ url: url, cssSelector: null, type: 'direct' }); renderModal(); }
           });
           overlay.querySelector('#agnts-feeds-manual')?.addEventListener('keydown', e => {
             if (e.key === 'Enter') overlay.querySelector('#agnts-feeds-add-manual')?.click();
@@ -4491,92 +5235,148 @@
       // Tracks active rings: compositionDisplayId → { el, rafId }
       const _dotRings = new Map();
 
-	  function setDotState(compositionDisplayId, state) {
-	        injectDotStateCSS();
+	  // ── Shared RAF Scheduler ───────────────────────────────────────────────────
+	  // Replaces all individual requestAnimationFrame loops in setDotState
+	  // One loop, throttled to 10fps, handles all ring tracking + heartbeat checks
 
-	        // Remove existing ring for this dot
-	        const existing = _dotRings.get(compositionDisplayId);
-	        if (existing) {
-	          existing.el.remove();
-	          if (existing.rafId) cancelAnimationFrame(existing.rafId);
-	          _dotRings.delete(compositionDisplayId);
+	  const AgntRAFScheduler = (() => {
+	    const _tasks   = new Map(); // id → fn
+	    let _running   = false;
+	    let _lastTick  = 0;
+	    const THROTTLE = 100; // 10fps
+
+	    function _loop(ts) {
+	      if (_tasks.size === 0) { _running = false; return; }
+	      requestAnimationFrame(_loop);
+	      if (ts - _lastTick < THROTTLE) return;
+	      _lastTick = ts;
+	      _tasks.forEach((fn, id) => {
+	        try { fn(); }
+	        catch(e) { console.error('[RAF]', id, e); _tasks.delete(id); }
+	      });
+	    }
+
+	    return {
+	      add(id, fn) {
+	        _tasks.set(id, fn);
+	        if (!_running) {
+	          _running = true;
+	          requestAnimationFrame(_loop);
 	        }
+	      },
+	      remove(id) { _tasks.delete(id); },
+	      has(id)    { return _tasks.has(id); }
+	    };
+	  })();
 
-	        const dot = document.querySelector(`.dot[data-id="${compositionDisplayId}"]`);
-	        if (!dot) return;
 
-	        // Heartbeat animates the dot itself — no ring needed
-			if (state === 'heartbeat') {
-		        dot.style.animation = 'agntsHeartbeat 2.8s ease-in-out infinite';
-		        dot.style.transformOrigin = 'center center';
+	  // ── setDotState ────────────────────────────────────────────────────────────
+	  // States: 'heartbeat' | 'polling' | 'classifying' | 'alerting' | null
+	  // All RAF loops consolidated into AgntRAFScheduler — no individual loops
 
-		        // Pause animation when dot becomes a card
-		        function heartbeatLoop() {
-		          if (!_dotRings.has(compositionDisplayId)) return;
-		          if (dot.classList.contains('transformed-card') || dot._isTransforming) {
-		            dot.style.animationPlayState = 'paused';
-		          } else {
-		            dot.style.animationPlayState = 'running';
-		          }
-		          requestAnimationFrame(heartbeatLoop);
-		        }
-		        const rafId = requestAnimationFrame(heartbeatLoop);
+	  function setDotState(compositionDisplayId, state) {
+	    injectDotStateCSS();
 
-		        _dotRings.set(compositionDisplayId, { el: { remove: () => {
-		          dot.style.animation = '';
-		          dot.style.transformOrigin = '';
-		          dot.style.animationPlayState = '';
-		        }}, rafId });
-		        return;
-		      }
+	    // ── Clean up previous state for this dot ──────────────────────────
+	    const existing = _dotRings.get(compositionDisplayId);
+	    if (existing) {
+	      existing.el?.remove();
+	      AgntRAFScheduler.remove(`ring-${compositionDisplayId}`);
+	      AgntRAFScheduler.remove(`heartbeat-${compositionDisplayId}`);
+	      _dotRings.delete(compositionDisplayId);
+	    }
 
-	        // Clear any dot-level animation from previous heartbeat
-	        dot.style.animation = '';
-	        dot.style.transformOrigin = '';
+	    const dot = document.querySelector(`.dot[data-id="${compositionDisplayId}"]`);
+	    if (!dot) return;
 
-	        if (!state) return;
+	    // ── Helper: get stored float animation ────────────────────────────
+	    function getFloatAnim() { return dot._agntsFloatAnim || ''; }
 
-        // Create ring appended to body — never touches the dot's overflow or position
-        const ring = document.createElement('div');
-        ring.className = `agnts-ring agnts-ring-${state}`;
-        document.body.appendChild(ring);
+	    // ── Helper: set animation preserving float ─────────────────────────
+	    function setAnim(newAnim) {
+	      const float = getFloatAnim();
+	      dot.style.animation = (newAnim && float)
+	        ? `${newAnim}, ${float}`
+	        : (newAnim || float || '');
+	    }
 
-        // Position ring over dot using fixed coords — updated every frame for polling
-        function positionRing() {
-          const rect = dot.getBoundingClientRect();
-          if (!rect.width) return; // dot not visible
-          const pad = 5;
-          ring.style.left   = (rect.left   - pad) + 'px';
-          ring.style.top    = (rect.top    - pad) + 'px';
-          ring.style.width  = (rect.width  + pad * 2) + 'px';
-          ring.style.height = (rect.height + pad * 2) + 'px';
-        }
+	    // ── HEARTBEAT ─────────────────────────────────────────────────────
+	    if (state === 'heartbeat') {
+	      setAnim('agntsHeartbeat 2.8s ease-in-out infinite');
+	      dot.style.transformOrigin = 'center center';
+	      dot.style.willChange      = 'transform';
 
-        positionRing();
+	      AgntRAFScheduler.add(`heartbeat-${compositionDisplayId}`, () => {
+	        if (!document.contains(dot)) {
+	          AgntRAFScheduler.remove(`heartbeat-${compositionDisplayId}`);
+	          return;
+	        }
+	        const isCard = dot.classList.contains('transformed-card') || dot._isTransforming;
+	        dot.style.animationPlayState = isCard ? 'paused' : 'running';
+	      });
 
-        // For polling ring — keep repositioning every frame so it follows the dot
-        // if canvas scrolls or dot moves. Other rings are short-lived so one shot is fine.
-        let rafId = null;
-		if (state === 'polling' || state === 'heartbeat') {
-			function trackLoop() {
-		          if (!_dotRings.has(compositionDisplayId)) return;
-		          // Hide ring if dot has expanded into a card — check multiple signals
-		          const isCard = dot.classList.contains('transformed-card')
-		                      || dot._isTransforming
-		                      || dot.getBoundingClientRect().width > 120; // card is much wider than any dot
-		          if (isCard) {
-		            ring.style.display = 'none';
-		          } else {
-		            ring.style.display = '';
-		            positionRing();
-		          }
-		          rafId = requestAnimationFrame(trackLoop);
-		        }
-	        rafId = requestAnimationFrame(trackLoop);
+	      _dotRings.set(compositionDisplayId, {
+	        el: {
+	          remove: () => {
+	            AgntRAFScheduler.remove(`heartbeat-${compositionDisplayId}`);
+	            dot.style.animation       = getFloatAnim();
+	            dot.style.transformOrigin = '';
+	            dot.style.animationPlayState = '';
+	          }
+	        },
+	        rafId: null // managed by scheduler now
+	      });
+	      return;
+	    }
+
+	    // ── Restore animation for non-heartbeat states ─────────────────
+	    dot.style.animation       = getFloatAnim();
+	    dot.style.transformOrigin = '';
+
+	    if (!state) return;
+
+	    // ── Create ring ────────────────────────────────────────────────
+	    const ring = document.createElement('div');
+	    ring.className = `agnts-ring agnts-ring-${state}`;
+	    document.body.appendChild(ring);
+
+	    function positionRing() {
+	      if (!document.contains(dot)) return;
+	      const rect = dot.getBoundingClientRect();
+	      if (!rect.width) return;
+	      const pad       = 5;
+	      ring.style.left   = `${rect.left   - pad}px`;
+	      ring.style.top    = `${rect.top    - pad}px`;
+	      ring.style.width  = `${rect.width  + pad * 2}px`;
+	      ring.style.height = `${rect.height + pad * 2}px`;
+	    }
+
+	    // Initial position
+	    positionRing();
+
+	    // ── Track ring position — all states use scheduler now ─────────
+	    AgntRAFScheduler.add(`ring-${compositionDisplayId}`, () => {
+	      // Stop tracking if dot or ring removed
+	      if (!document.contains(dot) || !document.contains(ring)) {
+	        AgntRAFScheduler.remove(`ring-${compositionDisplayId}`);
+	        return;
 	      }
 
-        _dotRings.set(compositionDisplayId, { el: ring, rafId });
-      }
+	      // Hide ring if dot has expanded into a card
+	      const isCard = dot.classList.contains('transformed-card')
+	                  || dot._isTransforming
+	                  || dot.getBoundingClientRect().width > 120;
+
+	      if (isCard) {
+	        ring.style.display = 'none';
+	      } else {
+	        ring.style.display = '';
+	        positionRing(); // follows float translate via getBoundingClientRect
+	      }
+	    });
+
+	    _dotRings.set(compositionDisplayId, { el: ring, rafId: null });
+	  }
 
       function clearDotState(compositionDisplayId) {
         setDotState(compositionDisplayId, null);
@@ -4784,7 +5584,131 @@
 	     }
 	   }
 	   
-	 function applyDotDisabledState(compositionItem, orchestrator) {
+	   // ── Dot Float Animation ────────────────────────────────────────────────────
+	   // Call once per composition in the render RAF loop alongside applyGoldenGlow
+	   // setTimeout(() => applyDotFloat(compositionItem), 200);
+
+	   function applyDotFloat(compositionItem, orchestrator) {
+	     try {
+	       const workers  = compositionItem._composite?.worker || [];
+	       const watcher  = workers.find(w => w.workerType === 'watcher');
+
+	       // ── Mirror applyDotDisabledState exactly ──────────────────────
+	       const isDisabled = watcher?.disabled === true;
+	       const isStopped  = watcher && !watcher.disabled && !watcher.watcherActive
+	                        && !!(watcher.targetUrl || watcher.targetUrls?.length);
+
+	       if (isDisabled || isStopped) return;
+
+	       const dot = findDotByComposition(compositionItem.displayID, compositionItem.ID);
+	       if (!dot) return;
+
+	       // ── Inject keyframes once ──────────────────────────────────────
+	       if (!document.getElementById('agnts-float-style')) {
+	         const s = document.createElement('style');
+	         s.id = 'agnts-float-style';
+	         s.textContent = `
+	           @keyframes agntFloatA {
+	             0%   { transform: translate(0px, 0px);     }
+	             25%  { transform: translate(1.5px, -6px);  }
+	             55%  { transform: translate(-1px, -9px);   }
+	             80%  { transform: translate(0.8px, -4px);  }
+	             100% { transform: translate(0px, 0px);     }
+	           }
+	           @keyframes agntFloatB {
+	             0%   { transform: translate(0px, 0px);     }
+	             30%  { transform: translate(-1.8px, -7px); }
+	             60%  { transform: translate(1.2px, -9px);  }
+	             85%  { transform: translate(-0.8px, -3px); }
+	             100% { transform: translate(0px, 0px);     }
+	           }
+	           @keyframes agntFloatC {
+	             0%   { transform: translate(0px, 0px);     }
+	             20%  { transform: translate(1px, -5px);    }
+	             50%  { transform: translate(-1.5px, -8px); }
+	             75%  { transform: translate(1.2px, -3px);  }
+	             100% { transform: translate(0px, 0px);     }
+	           }
+	           @keyframes agntFloatSoft {
+	             0%   { transform: translate(0px, 0px);     }
+	             35%  { transform: translate(0.8px, -4px);  }
+	             65%  { transform: translate(-0.8px, -5px); }
+	             100% { transform: translate(0px, 0px);     }
+	           }
+	           @keyframes agntFloatBg {
+	             0%   { transform: translate(0px, 0px);      }
+	             40%  { transform: translate(0.5px, -2.5px); }
+	             70%  { transform: translate(-0.5px, -3px);  }
+	             100% { transform: translate(0px, 0px);      }
+	           }
+	         `;
+	         document.head.appendChild(s);
+	       }
+
+	       // ── Seed from full ID ──────────────────────────────────────────
+	       const id   = compositionItem.displayID || compositionItem.ID || 'x';
+	       const seed = id.split('').reduce((acc, ch, i) => {
+	         return acc + ch.charCodeAt(0) * (i + 1) * 31;
+	       }, id.length * 17);
+
+	       const duration = 8 + (seed % 600) / 100;           // 8s → 14s
+	       const delay    = (seed % 53) / 53 * duration;
+	       const animName = ['agntFloatA', 'agntFloatB', 'agntFloatC'][seed % 3];
+
+	       // ── Layer classification ───────────────────────────────────────
+	       const isBg   = dot.classList.contains('dot-bg');
+	       const isSoft = !isBg && !dot.classList.contains('dot-fade-in');
+
+	       const finalAnim = isBg   ? 'agntFloatBg'
+	                       : isSoft ? 'agntFloatSoft'
+	                       : animName;
+	       const finalDur  = isBg   ? `${(28 + (seed % 18)).toFixed(2)}s`
+	                       : isSoft ? `${(duration + 4).toFixed(2)}s`
+	                       : `${duration.toFixed(2)}s`;
+
+		  
+		  // ── At the end of applyDotFloat ───────────────────────────────────
+
+		   const floatValue = `${finalAnim} ${finalDur} ease-in-out -${delay.toFixed(2)}s infinite both`;
+		   dot._agntsFloatAnim  = floatValue;
+		   dot.style.willChange = 'transform'; // GPU layer — prevents repaint on float
+
+		   // Combine with heartbeat if already running
+		   const existingAnim  = dot.style.animation || '';
+		   const hasHeartbeat  = existingAnim.includes('agntsHeartbeat');
+		   dot.style.animation = hasHeartbeat
+		     ? `agntsHeartbeat 2.8s ease-in-out infinite, ${floatValue}`
+		     : floatValue;
+
+		   // ── Pause float when dot leaves viewport ──────────────────────────
+		   if (dot._agntsFloatObserver) {
+		     dot._agntsFloatObserver.disconnect(); // clean up previous before recreating
+		   }
+		   dot._agntsFloatObserver = new IntersectionObserver(entries => {
+		     entries.forEach(e => {
+		       e.target.style.animationPlayState = e.isIntersecting ? 'running' : 'paused';
+		     });
+		   }, { threshold: 0 });
+		   dot._agntsFloatObserver.observe(dot);
+
+	     } catch(e) {
+	       console.error('[float] error:', e);
+	     }
+	   }
+
+	   function applyBackgroundDotFloat() {
+	     if (!document.getElementById('agnts-float-style')) return;
+	     const canvas = document.getElementById('canvas-area');
+	     if (!canvas) return;
+
+	     canvas.querySelectorAll('.dot-bg').forEach((dot, idx) => {
+	       const duration = 28 + (idx * 4.3) % 18;
+	       const delay    = (idx * 7.9) % duration;
+	       dot.style.animation = `agntFloatBg ${duration.toFixed(2)}s ease-in-out -${delay.toFixed(2)}s infinite both`;
+	     });
+	   }
+	   
+	   function applyDotDisabledState(compositionItem, orchestrator) {
 	     const dot = document.querySelector(`.dot[data-id="${compositionItem.displayID}"]`);
 	     if (!dot) return;
 
@@ -4800,6 +5724,10 @@
 		   'hasUrl:', !!(watcher?.targetUrl || watcher?.targetUrls?.length),
 		   'isStopped:', isStopped);
 
+	   if (isDisabled || isStopped) {
+	     dot.style.willChange = 'auto'; // release GPU layer for inactive dots
+	     
+	   }
 		if (isDisabled) {
 		  dot.style.background = '#d1d5db';
 		  dot.style.opacity    = '0.55';
@@ -4958,6 +5886,74 @@
 	      return raw;
 	    }
 	  }
+	  
+	  function parseJsonLd(raw) {
+	    try {
+	      // Split on the separator we added server-side
+	      const jsonPart = raw.split('\n---\n')[0];
+	      const results  = [];
+
+	      // May be multiple JSON-LD blocks separated by newlines
+	      const blocks = jsonPart.split('\n').filter(Boolean);
+
+	      for (const block of blocks) {
+	        let data;
+	        try { data = JSON.parse(block); } catch { continue; }
+
+	        const items = Array.isArray(data) ? data : [data];
+
+	        for (const item of items) {
+	          const type = item['@type'];
+
+	          if (type === 'JobPosting') {
+	            const title    = item.title || '';
+	            const company  = item.hiringOrganization?.name || '';
+	            const location = item.jobLocation?.address?.addressLocality
+	                          || item.jobLocation?.address?.addressRegion
+	                          || (item.jobLocationType === 'TELECOMMUTE' ? 'Remote' : '');
+	            const salary   = item.baseSalary?.value?.value
+	                          || item.baseSalary?.value?.minValue
+	                          ? `$${item.baseSalary?.value?.minValue}-${item.baseSalary?.value?.maxValue}`
+	                          : '';
+	            const desc     = (item.description || '')
+	                              .replace(/<[^>]+>/g, ' ')
+	                              .replace(/\s+/g, ' ').trim()
+	                              .substring(0, 400);
+	            const url      = item.url || '';
+	            results.push(
+	              [`${title} at ${company}`, location, salary, url, '', desc]
+	                .filter(Boolean).join(' | ')
+	            );
+
+	          } else if (type === 'NewsArticle' || type === 'Article') {
+	            const title   = item.headline || item.name || '';
+	            const desc    = (item.description || item.articleBody || '')
+	                              .replace(/<[^>]+>/g, ' ')
+	                              .replace(/\s+/g, ' ').trim()
+	                              .substring(0, 400);
+	            const url     = item.url || '';
+	            results.push([title, url, '', desc].filter(Boolean).join(' | '));
+
+	          } else if (type === 'Event') {
+	            const title = item.name || '';
+	            const date  = item.startDate || '';
+	            const desc  = (item.description || '').substring(0, 300);
+	            const url   = item.url || '';
+	            results.push([title, date, url, '', desc].filter(Boolean).join(' | '));
+	          }
+	        }
+	      }
+
+	      if (results.length > 0) {
+	        console.log(`[parseJsonLd] extracted ${results.length} items`);
+	        return results.join('\n');
+	      }
+	      return null; // no structured data found — fall through to raw
+	    } catch(e) {
+	      console.warn('[parseJsonLd] failed:', e.message);
+	      return null;
+	    }
+	  }
 
 	  function parseRssFeed(xmlText) {
 	    try {
@@ -4982,7 +5978,21 @@
 	        const image          = mediaContent || mediaThumbnail ||
 	          (enclosure.match(/\.(jpg|jpeg|png|webp|gif)/i) ? enclosure : '');
 
-	        return [title, link.trim(), image].filter(Boolean).join(' | ');
+	        // ── Description — new ─────────────────────────────────────
+	        const descRaw = isAtom
+	          ? (item.querySelector('content')?.textContent || item.querySelector('summary')?.textContent || '')
+	          : (item.querySelector('description')?.textContent || item.querySelector('summary')?.textContent || '');
+
+	        const desc = descRaw
+	          .replace(/<[^>]+>/g, ' ')
+	          .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+	          .replace(/&nbsp;/g, ' ').replace(/&#\d+;/g, ' ')
+	          .replace(/\s+/g, ' ')
+	          .trim()
+	          .substring(0, 500);
+
+	        // desc at end — preserves all existing index-based splits
+	        return [title, link.trim(), image, desc].filter(Boolean).join(' | ');
 	      }).filter(Boolean).join('\n');
 	    } catch (e) {
 	      console.warn('[Watcher] RSS parse error:', e.message);
@@ -4990,14 +6000,34 @@
 	    }
 	  }
 
+	  // Keep only this one, renamed:
+	  function normalizeUrlEntry(entry) {
+	    if (!entry) return null;
+	    let url = typeof entry === 'string' ? entry : entry.url;
+	    if (!url) return null;
+	    url = url.trim()
+	      .replace(/^(?!https?:\/\/)/, 'https://')
+	      .replace(/reddit\.com\/r\/(\w+)\.rss$/, 'reddit.com/r/$1/.rss');
+	    return {
+	      url,
+	      cssSelector: typeof entry === 'string' ? null : (entry.cssSelector || null),
+	      type:        typeof entry === 'string' ? 'direct' : (entry.type || 'direct')
+	    };
+	  }
+
+	  function normalizeTargetUrls(arr) {
+	    if (!Array.isArray(arr)) return [];
+	    return arr.map(normalizeUrlEntry).filter(e => e?.url);
+	  }
+	  
     async function fetchContent(targetUrl, cssSelector, targetUrls) {
       // Multi-URL mode — fetch all and concatenate
-      const urls = targetUrls?.length ? targetUrls : (targetUrl ? [targetUrl] : []);
+      const urls = normalizeTargetUrls(targetUrls?.length ? targetUrls : (targetUrl ? [targetUrl] : []));
       if (!urls.length) return '';
 
-      const results = await Promise.allSettled(
-        urls.map(url => fetchSingleUrl(url, cssSelector))
-      );
+	  const results = await Promise.allSettled(
+	    urls.map(entry => fetchSingleUrl(entry.url, entry.cssSelector || cssSelector))
+	  );
 
       return results
         .map((r, i) => r.status === 'fulfilled' ? r.value : '')
@@ -5038,14 +6068,24 @@
       // Proxy path — for non-RSS URLs, CSS selectors, or when direct fetch failed
       const params = new URLSearchParams({ url: targetUrl });
       if (cssSelector) params.set('selector', cssSelector);
+	  // In fetchSingleUrl, right before the proxy fetch
+	  console.log('[fetchSingleUrl] Going to proxy for:', targetUrl.substring(0, 80));
 	  UsageTracker.trackProxy(targetUrl);
       const res = await fetch(`${PROXY()}?${params.toString()}`, {
         credentials: 'include'
       });
       if (!res.ok) throw new Error(`Proxy returned ${res.status}`);
-      const data = await res.json();
-      const raw  = (data.content || '').trim();
+	  const data = await res.json();
+	  const raw  = (data.content || '').trim();
 
+	  // ── Google Jobs plain text → structured format ─────────────────
+	  if (targetUrl.includes('google.com/search') && targetUrl.includes('ibp=htl;jobs')) {
+	    const parsed = parseGoogleJobsInnerText(raw);
+	    console.log('[fetchSingleUrl] Google Jobs parsed:', parsed.split('\n').length, 'jobs');
+	    return parsed;
+	  }
+
+ 
 	  // HN Algolia and Reddit JSON APIs
         if (targetUrl.includes('hn.algolia.com') || 
             (targetUrl.includes('reddit.com') && targetUrl.includes('.json'))) {
@@ -5054,9 +6094,64 @@
         if (isRssUrl(targetUrl) || raw.startsWith('<?xml') || raw.includes('<rss') || raw.includes('<feed')) {
           return parseRssFeed(raw);
         }
+		
+		if (raw.includes('"@type"') && 
+		   (raw.includes('JobPosting') || raw.includes('Article') || 
+		    raw.includes('NewsArticle') || raw.includes('Event'))) {
+		  const parsed = parseJsonLd(raw);
+		  if (parsed) return parsed;
+		}
+
         return raw;
     }
 
+	
+	function parseGoogleJobsInnerText(raw) {
+	  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+	  const jobs   = [];
+	  let i = 0;
+
+	  while (i < lines.length) {
+	    const line = lines[i];
+
+	    const isJobTitle = line.length > 15
+	      && line.length < 120
+	      && !line.match(/^\d+\s*(hour|day|week|month|min)/i)
+	      && !line.match(/\$|K–|K a year|per year|per hour/i)
+	      && !line.match(/^(Anywhere|Remote|Hybrid|Full-time|Part-time|Contract|Work from home)/i)
+	      && !line.match(/^[A-Z]{1,2}$/)                          // single/double letters
+	      && !line.match(/^\[/)                                    // reddit [Hiring] posts
+	      && !line.match(/^(via |•|·)/i)
+	      && !line.match(/^(AI Mode|All|News|Forums|Jobs|Web|More|Tools|Remote|No degree)/i)
+	      && !line.match(/^(Sign in|Search|Follow|Saved|Following|Job postings|Choose area)/i)
+	      && !line.match(/^(Accessibility|Terms|Privacy|Settings|Help)/i)
+	      && !line.match(/^(Date posted|Job type|Easy Apply|New|Saved|Apply)/i);
+
+	    if (isJobTitle) {
+	      const company  = lines[i + 1] || '';
+	      const via      = lines[i + 2] || '';  // "Anywhere • via DailyRemote"
+	      const salary   = lines[i + 3]?.match(/K|year|\$|per/) ? lines[i + 3] : '';
+	      const timeAgo  = salary ? (lines[i + 4] || '') : (lines[i + 3] || '');
+
+	      // Build description
+	      const desc = [company, via, salary].filter(Boolean).join(' — ');
+
+	      // Build Google Jobs search URL for this specific role
+	      const searchUrl = `https://www.google.com/search?q=${
+	        encodeURIComponent(line + ' ' + company)}&ibp=htl;jobs`;
+
+	      // Format: title | url | image | desc
+	      jobs.push(`${line} | ${searchUrl} | | ${desc}`);
+
+	      i += salary ? 4 : 3;
+	    } else {
+	      i++;
+	    }
+	  }
+
+	  console.log('[parseGoogleJobsInnerText] parsed:', jobs.length, 'jobs from', lines.length, 'lines');
+	  return jobs.length > 3 ? jobs.join('\n') : raw;
+	}
     // ── Condition evaluation ───────────────────────────────────────────────
     function evaluateCondition(newContent, lastContent, conditionType, conditionValue) {
       const type  = conditionType  || 'any_change';
@@ -5183,6 +6278,8 @@
 		updateStatusBadge(id, 'checking', compositionItem.displayID, compositionItem);
       try {
         const newContent  = await fetchContent(workerItem.targetUrl, workerItem.cssSelector, workerItem.targetUrls);
+		
+			
         const lastContent = workerItem.lastSnapshot || '';
         const { triggered, desc } = evaluateCondition(
           newContent, lastContent,
@@ -5310,12 +6407,24 @@
 		        await agntsUpsertAndSave(orchestrator, compositionItem);
 		        showSnippetCard(compositionItem.displayID, snippetText, compositionItem.name, Date.now());
 		        if (shouldAlert) {
-		          const cleanText = snippetText
-		            .split('\n')
-		            .map(line => line.split('|')[0].trim())
-		            .filter(line => line && line !== '---')
-		            .join('\n');
-		          GlobalSettings.sendAlert(`${compositionItem.name}`, cleanText);
+					const cleanText = relevantArticles
+					  .slice(0, 3)
+					  .map(article => {
+					    const parts = article.split(' | ');
+					    const title    = parts[0]?.trim() || '';
+					    const link     = parts[1]?.trim() || '';
+					    const desc     = parts[3]?.trim() || '';  // description at index 3
+					    
+					    // Build a rich single line per job
+					    const lines = [title];
+					    if (desc) lines.push(desc.substring(0, 150));
+					    if (link) lines.push(link);
+					    return lines.join('\n');
+					  })
+					  .filter(Boolean)
+					  .join('\n\n─────\n\n');
+
+					GlobalSettings.sendAlert(`🎯 ${compositionItem.name}`, cleanText);
 		        }
 		      } else {
 		        showSnippetCard(compositionItem.displayID, snippetText, compositionItem.name, Date.now());
@@ -5628,7 +6737,9 @@
             ${(() => {
               const feedCount = workerItem.targetUrls?.length || (workerItem.targetUrl ? 1 : 0);
 			  if (feedCount > 1) {
-				const feedList = (workerItem.targetUrls || [workerItem.targetUrl])
+				const feedList = (workerItem.targetUrls?.length 
+				  ? workerItem.targetUrls.map(e => e.url) 
+				  : [workerItem.targetUrl])
 				  .map(url => {
 				    const label = url.replace(/^https?:\/\/(www\.)?/, '').split('/')[0];
 				    return `
@@ -5748,7 +6859,7 @@
     async function saveConfig(orchestrator, compositionItem, workerItem, panel) {
       const id = workerItem.displayID;
 	  const url = panel.querySelector(`#watcher-url-${id}`)?.value?.trim()
-	           || workerItem.targetUrls?.[0]  // ← fallback to first of multiple feeds
+	           || workerItem.targetUrls?.[0]?.url  // ← fallback to first of multiple feeds
 	           || '';
 
 	  // And update the validation:
@@ -5885,9 +6996,9 @@
         btn.addEventListener('click', async () => {
           const url = btn.dataset.url;
           if (workerItem.targetUrls) {
-            workerItem.targetUrls = workerItem.targetUrls.filter(u => u !== url);
+            workerItem.targetUrls = workerItem.targetUrls.filter(u => u.url !== url);
             if (workerItem.targetUrls.length <= 1) {
-              workerItem.targetUrl  = workerItem.targetUrls[0] || workerItem.targetUrl;
+              workerItem.targetUrl = workerItem.targetUrls[0]?.url || workerItem.targetUrl;
               workerItem.targetUrls = [];
             }
           }
@@ -6622,11 +7733,27 @@
     }
 
     // ── Core classification ──────────────────────────────────────────────
-	async function runClassification(__orchestrator__, __compositionItem__, classifierWorker, content, topic) {
+	async function runClassification(orchestrator, compositionItem, classifierWorker, content, topic) {
+		
+	  const compositionType = compositionItem.compositionType || 'sentinel';
+
+	  const defaultPrompts = {
+	    recruiter:  'You are a job listing filter. Only mark RELEVANT if the item is an actual job opening (employer hiring) that matches the topic. Ignore: news about jobs, freelancer ads, portfolio posts, unrelated roles.',
+	    journalist: 'You are a news filter. Mark RELEVANT if the item is a news article or development directly related to the topic. Ignore: ads, job posts, unrelated content.',
+	    researcher: 'You are a research filter. Mark RELEVANT if the item contains substantive information, data, or findings related to the topic. Ignore: ads, shallow content, unrelated items.',
+	    sentinel:   'You are a content monitor. Mark RELEVANT if the item matches or is directly related to the topic.',
+	    trader:     'You are a financial news filter. Mark RELEVANT if the item contains actionable financial information related to the topic.',
+	    default:    'You are a content filter. Mark RELEVANT if the item is directly related to the topic.'
+	  };
+
+	  const systemInstruction = classifierWorker.systemPrompt?.trim()
+	    || defaultPrompts[compositionType]
+	    || defaultPrompts.default;
+
 	  const articles = content.split('\n').filter(Boolean);
 	  
 	  // Batching logic - ~2000 chars per batch (increased from 1500)
-	  const MAX_BATCH_CHARS = 2000;
+	  const MAX_BATCH_CHARS = 4000;
 	  const batches = [];
 	  let currentBatch = [];
 	  let currentChars = 0;
@@ -6662,22 +7789,37 @@
 	    console.log(`[Classifier] Batch ${batchNum}/${batches.length}: ${batch.length} articles, ${batch.reduce((sum, b) => sum + b.article.length, 0)} chars`);
 	    
 	    // Build prompt with line numbers relative to THIS batch
-	    const numberedArticles = batch
-	      .map((item, i) => `${i + 1}. ${item.article.substring(0, 300)}`)
-	      .join('\n');
+		const numberedArticles = batch
+		  .map((item, i) => {
+		    const parts = item.article.split(' | ');
+		    const title = parts[0] || '';
+		    const desc  = parts[3] || '';  // description is at index 3
+
+		    // Always include full title, add description if there's room
+		    const base    = `${i + 1}. ${title}`;
+		    const withDesc = desc ? `${base} — ${desc}` : base;
+
+		    // Only truncate if genuinely long
+		    return withDesc.length > 600 ? withDesc.substring(0, 600) : withDesc;
+		  })
+		  .join('\n');
 	    
-	    const prompt = `You are filtering job listings. Topic: ${topic}
+		  const prompt = `${systemInstruction}
 
-	Analyze each listing below and determine if it's RELEVANT:
+		  Topic: ${topic}
 
-	${numberedArticles}
+		  Analyze each item below — be INCLUSIVE, mark RELEVANT if it could plausibly match:
 
-	Respond with ONLY the line numbers of RELEVANT listings, comma-separated.
-	Example: 1,3,5
-	If none are relevant, respond: NONE`;
+		  ${numberedArticles}
+
+		  Respond with ONLY the line numbers of RELEVANT items, comma-separated.
+		  Example: 1,3,5
+		  If none are relevant, respond: NONE`;
 
 	    const callStartTime = Date.now();
+		//console.log('[Classifier] Prompt DEBUG:', prompt);
 	    const response = await callProvider(classifierWorker, [], prompt);
+		console.log('[Classifier] Prompt DEBUG Raw response:', response);
 	    const callDuration = ((Date.now() - callStartTime) / 1000).toFixed(1);
 	    
 	    if (!response) {
@@ -6737,7 +7879,10 @@
 
 	    // Show classifying ring
 	    setDotState(compId, 'classifying');
-
+		
+		const displayProvider = resolveProviderForDisplay(classifierWorker);
+		LLMActivityIndicator.start(compId, compositionItem.name, 'classifying', displayProvider);
+		
 	    // 180 second timeout (increased from 120s for larger batches)
 	    const timeoutPromise = new Promise((_, reject) =>
 	      setTimeout(() => reject(new Error('Classifier timeout after 3m')), 180000)
@@ -6747,7 +7892,9 @@
 	      runClassification(orchestrator, compositionItem, classifierWorker, content, topic),
 	      timeoutPromise
 	    ]);
-
+		
+		LLMActivityIndicator.stop(compId);
+		
 	    // Flash relevant then restore polling ring
 	    if (verdict === 'RELEVANT') {
 	      setDotState(compId, 'relevant');
@@ -6799,7 +7946,7 @@
 	        `⚠️ ${compositionItem.name}`,
 	        fallbackMsg
 	      );
-
+		  LLMActivityIndicator.stop(compositionItem.displayID);
 	      console.warn(`[Classifier] Rate limit for ${compositionItem.name}:`, err.message);
 	    }
 
@@ -6813,6 +7960,7 @@
 	    
 	    console.error(`[Classifier(${compositionItem.name})] Error after ${elapsed}s: ${err.message} | chars: ${content.length} | provider: ${classifierWorker.provider || 'unknown'}`);
 	    setDotState(compositionItem.displayID, 'polling');
+		LLMActivityIndicator.stop(compositionItem.displayID);
 	    
 	    return { verdict: 'UNSURE', reason: 'Classification failed: ' + err.message };
 	  }
@@ -7777,18 +8925,222 @@
 
 		return panel;
 	}
+	
+	function _formatText(text) {
+	  if (!text) return '';
+	  return text
+	    // Bold: **text**
+	    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+	    // Italic: _text_ or *text*
+	    .replace(/(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)/g, '<em>$1</em>')
+	    .replace(/_(.*?)_/g, '<em>$1</em>')
+	    // Inline code: `text`
+	    .replace(/`([^`]+)`/g, '<code style="background:#f0f0f0;padding:1px 4px;border-radius:3px;font-size:11px;">$1</code>')
+	    // URLs — convert to clickable links
+		.replace(/(https?:\/\/[^\s<>"{}|\\^`\[\]]+)/g,
+		  '<a href="$1" target="_blank" rel="noopener" ' +
+		  'style="color:inherit;text-decoration:underline;opacity:0.75;word-break:break-all;">$1</a>')
+	    // Newlines
+	    .replace(/\n/g, '<br>');
+	}
 
-    function renderMsg(container, role, text) {
-      const isUser = role === 'user';
-      const el = document.createElement('div');
-      el.style.cssText = `display:flex;justify-content:${isUser ? 'flex-end' : 'flex-start'};`;
-      el.innerHTML = '<div style="max-width:80%;padding:8px 12px;border-radius:12px;font-size:12px;line-height:1.5;' +
-        `background:${isUser ? '#6c5ce7' : '#ffffff'};color:${isUser ? '#fff' : '#333'};` +
-        `border:1px solid ${isUser ? '#6c5ce7' : '#eeeeee'};` +
-        `border-${isUser ? 'bottom-right' : 'bottom-left'}-radius:2px;">${text.replace(/\n/g, '<br>')}</div>`;
-      container.appendChild(el);
-      container.scrollTop = container.scrollHeight;
-    }
+	function renderMsg(container, role, content) {
+	  const isUser = role === 'user';
+	  const el     = document.createElement('div');
+	  el.style.cssText = `display:flex;justify-content:${isUser ? 'flex-end' : 'flex-start'};margin-bottom:6px;`;
+	 
+	  const bubble = document.createElement('div');
+	  bubble.style.cssText = `
+	    max-width:80%;padding:8px 12px;border-radius:12px;font-size:12px;line-height:1.5;
+	    background:${isUser ? '#6c5ce7' : '#ffffff'};
+	    color:${isUser ? '#fff' : '#333'};
+	    border:1px solid ${isUser ? '#6c5ce7' : '#eeeeee'};
+	    border-${isUser ? 'bottom-right' : 'bottom-left'}-radius:2px;
+	  `;
+	 
+	  // ── Plain text ──────────────────────────────────────────────────────────
+	  if (typeof content === 'string') {
+	    bubble.innerHTML = _formatText(content);
+	    el.appendChild(bubble);
+	    container.appendChild(el);
+	    container.scrollTop = container.scrollHeight;
+	    return el;
+	  }
+	 
+	  // ── Media content object ────────────────────────────────────────────────
+	  const { type, url, name, mimeType, fileId, token } = content;
+	 
+	  if (type === 'image') {
+	    // Inline image
+	    const img = document.createElement('img');
+	    img.src = url;
+	    img.style.cssText = 'max-width:100%;border-radius:8px;display:block;cursor:pointer;';
+	    img.title = name || 'Image';
+	    img.onclick = () => window.open(url, '_blank');
+	    bubble.appendChild(img);
+	 
+	    // Analyse button
+	    bubble.appendChild(_makeAnalyseBtn({ type, url, name, mimeType, fileId, token }, bubble, isUser));
+	 
+	  } else if (type === 'video') {
+	    // Inline video player
+	    const video = document.createElement('video');
+	    video.src     = url;
+	    video.controls = true;
+	    video.style.cssText = 'max-width:100%;border-radius:8px;display:block;';
+	    bubble.appendChild(video);
+	    bubble.appendChild(_makeAnalyseBtn({ type, url, name, mimeType, fileId, token }, bubble, isUser));
+	 
+	  } else if (type === 'audio') {
+	    // Audio player
+	    const audio = document.createElement('audio');
+	    audio.src      = url;
+	    audio.controls = true;
+	    audio.style.cssText = 'width:100%;margin-top:4px;';
+	    const label = document.createElement('div');
+	    label.textContent = `🎵 ${name || 'Audio'}`;
+	    label.style.cssText = 'font-size:11px;margin-bottom:4px;opacity:0.8;';
+	    bubble.appendChild(label);
+	    bubble.appendChild(audio);
+	 
+	  } else {
+	    // Document / generic file chip
+	    const chip = document.createElement('div');
+	    chip.style.cssText = `
+	      display:flex;align-items:center;gap:8px;padding:6px 10px;
+	      background:${isUser ? 'rgba(255,255,255,0.15)' : '#f5f5f5'};
+	      border-radius:8px;cursor:pointer;
+	    `;
+	    chip.innerHTML = `
+	      <span style="font-size:20px;">${_fileEmoji(mimeType)}</span>
+	      <span style="font-size:11px;word-break:break-all;">${name || 'File'}</span>
+	      <span style="font-size:11px;opacity:0.7;">↗</span>
+	    `;
+	    chip.onclick = () => window.open(url, '_blank');
+	    bubble.appendChild(chip);
+	    bubble.appendChild(_makeAnalyseBtn({ type, url, name, mimeType, fileId, token }, bubble, isUser));
+	  }
+	 
+	  el.appendChild(bubble);
+	  container.appendChild(el);
+	  container.scrollTop = container.scrollHeight;
+	  return el;
+	}
+	 
+	// Returns an emoji for common file types
+	function _fileEmoji(mimeType = '') {
+	  if (mimeType.includes('pdf'))        return '📄';
+	  if (mimeType.includes('word'))       return '📝';
+	  if (mimeType.includes('sheet') || mimeType.includes('excel')) return '📊';
+	  if (mimeType.includes('zip') || mimeType.includes('rar'))     return '🗜️';
+	  if (mimeType.includes('text'))       return '📃';
+	  return '📎';
+	}
+	 
+	// Renders the "🔍 Analyse" button beneath a media bubble
+	function _makeAnalyseBtn(fileInfo, bubble, isUser) {
+	  const btn = document.createElement('button');
+	  btn.textContent = '🔍 Analyse';
+	  btn.style.cssText = `
+	    margin-top:6px;padding:3px 10px;font-size:11px;border-radius:6px;cursor:pointer;
+	    background:transparent;
+	    border:1px solid ${isUser ? 'rgba(255,255,255,0.5)' : '#ccc'};
+	    color:${isUser ? '#fff' : '#555'};
+	    display:block;
+	  `;
+	  btn.onclick = async () => {
+	    btn.disabled     = true;
+	    btn.textContent  = '⏳ Analysing...';
+	    const result     = await analyseFile(fileInfo);
+	    // Insert result as a new assistant bubble after the current one
+	    const resultEl   = document.createElement('div');
+	    resultEl.style.cssText = 'display:flex;justify-content:flex-start;margin-bottom:6px;';
+	    const resultBubble = document.createElement('div');
+	    resultBubble.style.cssText = `
+	      max-width:80%;padding:8px 12px;border-radius:12px;font-size:12px;line-height:1.5;
+	      background:#fff;color:#333;border:1px solid #eee;border-bottom-left-radius:2px;
+	    `;
+	    resultBubble.innerHTML = result.replace(/\n/g, '<br>');
+	    resultEl.appendChild(resultBubble);
+	    bubble.closest('div').insertAdjacentElement('afterend', resultEl);
+	    btn.textContent = '✅ Done';
+	  };
+	  return btn;
+	}
+	 
+	 
+	// ── PIECE 2: analyseFile (NEW — add after renderMsg) ─────────────────────────
+	async function analyseFile({ type, url, name, mimeType, fileId, token }) {
+	  const s        = GlobalSettings.load();
+	  const smart    = resolveSmartModel('chat', null);
+	  const provider = smart.provider || s.defaultProvider || 'openrouter';
+	  const model    = smart.model    || s.defaultModel    || '';
+	 
+	  try {
+	    // ── Image: use vision via base64 ───────────────────────────────────────
+	    if (type === 'image') {
+	      // Fetch image and convert to base64
+	      const blob      = await fetch(url).then(r => r.blob());
+	      const base64    = await new Promise((res, rej) => {
+	        const reader  = new FileReader();
+	        reader.onload = () => res(reader.result.split(',')[1]);
+	        reader.onerror = rej;
+	        reader.readAsDataURL(blob);
+	      });
+	      const imgMime   = mimeType || blob.type || 'image/jpeg';
+	 
+	      // Call Anthropic API directly with vision
+	      const response  = await fetch('https://api.anthropic.com/v1/messages', {
+	        method:  'POST',
+	        headers: { 'Content-Type': 'application/json' },
+	        body: JSON.stringify({
+	          model:      'claude-sonnet-4-20250514',
+	          max_tokens: 1000,
+	          messages: [{
+	            role:    'user',
+	            content: [
+	              { type: 'image', source: { type: 'base64', media_type: imgMime, data: base64 } },
+	              { type: 'text',  text:   'Describe this image in detail. If it contains text, extract it. If it contains data or a chart, summarise it.' }
+	            ]
+	          }]
+	        })
+	      });
+	      const data = await response.json();
+	      return data?.content?.[0]?.text || '❌ Could not analyse image.';
+	    }
+	 
+	    // ── Document: fetch text and summarise ────────────────────────────────
+	    if (type === 'document' || type === 'file') {
+	      // For PDFs and text files we can fetch and extract
+	      const resp = await fetch(url);
+	      const text = await resp.text();
+	      const excerpt = text.substring(0, 4000); // trim to avoid token overflow
+	 
+	      return await callProvider(
+	        {
+	          provider, model, include_reasoning: false, maxTokens: 500,
+	          systemPrompt: 'You are a helpful assistant. Summarise the document content concisely. Extract key points, dates, names, and any action items.'
+	        },
+	        [],
+	        `Document name: ${name || 'unknown'}\n\nContent:\n${excerpt}`
+	      );
+	    }
+	 
+	    // ── Video: not analysable directly ────────────────────────────────────
+	    if (type === 'video') {
+	      return '📹 Video analysis is not supported yet. You can download the video using the player above.';
+	    }
+	 
+	    return '❌ This file type cannot be analysed.';
+	 
+	  } catch(e) {
+	    console.error('[analyseFile] Error:', e.message);
+	    return `❌ Analysis failed: ${e.message}`;
+	  }
+	}
+	 
+	 
+
 
     function wireHandlers(orchestrator, compositionItem, workerItem, panel) {
       const id         = workerItem.displayID;
@@ -7809,6 +9161,7 @@
 	      }
 	    }
 
+		
 		async function sendMessage() {
 		  const text = inputEl.value.trim();
 		  if (!text) return;
@@ -7822,25 +9175,22 @@
 		  scrollToBottom();
 
 		  try {
-		    // ═══ USE ORCHESTRATOR LOGIC (same as Telegram bot) ═══
-		    const compositions = orchestrator.data?.items?.[0]?.compositions || [];
-		    const reply = await orchestrateAgentQuery(text, compositions);
-		    // ═══════════════════════════════════════════════════════
-		    
-		    if (reply === null) {
-		      renderMsg(messagesEl, 'assistant', '⚠️ No AI model configured.\n\nPlease add an API key or configure WebLLM in Settings.');
-		      history.push({ 
-		        role: 'assistant', 
-		        content: '⚠️ No AI model configured.\n\nPlease add an API key or configure WebLLM in Settings.' 
-		      });
+		    // Route through unified assistant handler
+		    // null token/chatId = browser path (tgReply is no-op, return value used directly)
+		    const answer = await handleAssistantMessage(text, null, null, orchestrator);
+
+		    if (answer === null || answer === undefined) {
+		      const errMsg = '⚠️ No AI model configured.\n\nPlease add an API key or configure WebLLM in Settings.';
+		      renderMsg(messagesEl, 'assistant', errMsg);
+		      history.push({ role: 'assistant', content: errMsg });
 		    } else {
-		      renderMsg(messagesEl, 'assistant', reply);
-		      history.push({ role: 'assistant', content: reply });
+		      renderMsg(messagesEl, 'assistant', answer);
+		      history.push({ role: 'assistant', content: answer });
 		    }
-		    
+
 		    await ChatWorkerPanel.saveHistory(workerItem.displayID, history);
 		    scrollToBottom();
-		    
+
 		  } catch(e) {
 		    console.error('[Assistant] Error:', e);
 		    renderMsg(messagesEl, 'assistant', '⚠ Error: ' + (e?.message || 'Unknown error'));
@@ -7856,8 +9206,114 @@
 		    }
 		  }
 		}
+		
+		// ── PIECE 3: sendFile (NEW — add near sendMessage) ────────────────────────────
+		// Called when user picks a file from the paperclip input.
+		// Sends to Telegram and shows preview in browser chat.
+		async function sendFile(file, token, chatId) {
+		  if (!file) return;
+		 
+		  const s          = GlobalSettings.load();
+		  const tgToken    = token    || s.telegramBotToken;
+		  const tgChatId   = chatId   || s.telegramChatId;
+		  const objectUrl  = URL.createObjectURL(file);
+		  const mime       = file.type || '';
+		 
+		  // Determine content type for renderMsg and Telegram endpoint
+		  let mediaType = 'document';
+		  if (mime.startsWith('image/'))  mediaType = 'image';
+		  if (mime.startsWith('video/'))  mediaType = 'video';
+		  if (mime.startsWith('audio/'))  mediaType = 'audio';
+		 
+		  // Show preview immediately in browser chat
+		  renderMsg(messagesEl, 'user', {
+		    type:     mediaType,
+		    url:      objectUrl,
+		    name:     file.name,
+		    mimeType: mime
+		  });
+		  scrollToBottom();
+		 
+		  // Send to Telegram
+		  if (!tgToken || !tgChatId) {
+		    console.warn('[sendFile] No Telegram token/chatId configured — skipping send');
+		    return;
+		  }
+		 
+		  try {
+		    const tgEndpoint = {
+		      image:    'sendPhoto',
+		      video:    'sendVideo',
+		      audio:    'sendAudio',
+		      document: 'sendDocument'
+		    }[mediaType];
+		 
+		    const fieldName = {
+		      image:    'photo',
+		      video:    'video',
+		      audio:    'audio',
+		      document: 'document'
+		    }[mediaType];
+		 
+		    const formData = new FormData();
+		    formData.append('chat_id', tgChatId);
+		    formData.append(fieldName, file, file.name);
+		    if (mediaType === 'document') {
+		      formData.append('caption', `📎 ${file.name}`);
+		    }
+		 
+		    const resp = await fetch(`https://api.telegram.org/bot${tgToken}/${tgEndpoint}`, {
+		      method: 'POST',
+		      body:   formData
+		    });
+		 
+		    const result = await resp.json();
+		    if (!result.ok) {
+		      console.error('[sendFile] Telegram error:', result.description);
+		      renderMsg(messagesEl, 'assistant', `❌ Failed to send to Telegram: ${result.description}`);
+		    } else {
+		      renderMsg(messagesEl, 'assistant', `✅ ${file.name} sent to Telegram`);
+		    }
+		  } catch(e) {
+		    console.error('[sendFile] Error:', e.message);
+		    renderMsg(messagesEl, 'assistant', `❌ Upload error: ${e.message}`);
+		  }
+		 
+		  scrollToBottom();
+		}
+
 
       sendBtn.addEventListener('click', sendMessage);
+	  
+	   const fileInput = document.createElement('input');
+	   fileInput.type    = 'file';
+	   fileInput.accept  = 'image/*,video/*,audio/*,.pdf,.doc,.docx,.txt,.csv,.zip';
+	   fileInput.style.display = 'none';
+	   fileInput.addEventListener('change', () => {
+	     const file = fileInput.files[0];
+	     if (file) {
+	       const s = GlobalSettings.load();
+	       sendFile(file, s.telegramBotToken, s.telegramChatId);
+	       fileInput.value = ''; // reset so same file can be picked again
+	     }
+	   });
+
+	   // Paperclip button
+	   const clipBtn = document.createElement('button');
+	   clipBtn.textContent = '📎';
+	   clipBtn.title       = 'Send file';
+	   clipBtn.style.cssText = `
+	     padding:6px 10px;border-radius:8px;border:1px solid #ddd;
+	     background:#fff;cursor:pointer;font-size:14px;
+	     margin-right:4px;
+	   `;
+	   clipBtn.addEventListener('click', () => fileInput.click());
+
+	   // Insert paperclip before sendBtn
+	   sendBtn.parentNode.insertBefore(fileInput, sendBtn);
+	   sendBtn.parentNode.insertBefore(clipBtn,   sendBtn);
+
+	   
       inputEl.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
       });
@@ -7962,7 +9418,9 @@
     }
 
     // ── Send alert via configured channels ────────────────────────────────
-    async function sendAlert(title, message) {
+	async function sendAlert(title, message) {
+	  console.log('[sendAlert] raw message:', message);  // add this
+		
       const s = load();
 
       // Browser notification
@@ -7975,20 +9433,65 @@
 	    try {
 	      const lines = message.split('\n').filter(Boolean);
 	      const imageUrl = lines.map(l => l.split(' | ')[2]).find(Boolean);
-	      const cleanText = lines
-	        .map(l => l.split(' | ')[0].trim())
-	        .filter(l => l && l !== '---')
-	        .join('\n');
+
+	      // ── Build rich message with clickable links ──────────────────
+		  // Group lines into {title, url} pairs
+		  const groups = [];
+		  let i = 0;
+		  while (i < lines.length) {
+		    const line = lines[i].trim();
+		    if (!line || line.startsWith('─') || line.startsWith('---')) { i++; continue; }
+
+		    // Pipe format
+		    if (line.includes(' | ')) {
+		      const parts = line.split(' | ');
+		      groups.push({ title: parts[0]?.trim(), url: parts[1]?.trim(), desc: parts[3]?.trim() });
+		      i++;
+		      continue;
+		    }
+
+		    // Title + next line is URL
+		    const nextLine = lines[i + 1]?.trim();
+		    if (nextLine?.startsWith('http')) {
+		      groups.push({ title: line, url: nextLine, desc: lines[i + 2]?.trim() });
+		      i += 2;
+		      continue;
+		    }
+
+		    // Plain line, no URL
+		    groups.push({ title: line, url: null, desc: null });
+		    i++;
+		  }
+
+		  const formattedLines = groups
+		    .filter(g => g.title && g.title !== '---')
+		    .map(g => {
+		      // Shorten Google News redirect URLs to just the domain for display
+		      let displayUrl = g.url;
+		      if (displayUrl?.includes('news.google.com/rss/articles/')) {
+		        displayUrl = 'news.google.com';
+		      }
+		      let line = g.url
+		        ? `<a href="${g.url}">${g.title}</a>`
+		        : g.title;
+		      if (g.desc && !g.desc.startsWith('http')) {
+		        line += `\n<i>${g.desc.substring(0, 100)}</i>`;
+		      }
+		      return line;
+		    })
+		    .join('\n\n');
+
+	      const fullMessage = `<b>${title}</b>\n\n${formattedLines}`;
 
 	      if (imageUrl) {
 	        await fetch(`https://api.telegram.org/bot${s.telegramBotToken}/sendPhoto`, {
 	          method: 'POST',
 	          headers: { 'Content-Type': 'application/json' },
 	          body: JSON.stringify({
-	            chat_id: s.telegramChatId,
-	            photo: imageUrl,
-	            caption: `*${title}*\n${cleanText}`,
-	            parse_mode: 'Markdown'
+	            chat_id:    s.telegramChatId,
+	            photo:      imageUrl,
+	            caption:    fullMessage,
+	            parse_mode: 'HTML'
 	          })
 	        });
 	      } else {
@@ -7996,9 +9499,10 @@
 	          method: 'POST',
 	          headers: { 'Content-Type': 'application/json' },
 	          body: JSON.stringify({
-	            chat_id: s.telegramChatId,
-	            text: `*${title}*\n${cleanText}`,
-	            parse_mode: 'Markdown'
+	            chat_id:                  s.telegramChatId,
+	            text:                     fullMessage,
+	            parse_mode:               'HTML',
+	            disable_web_page_preview: true  // ← prevents URL preview cards
 	          })
 	        });
 	      }
@@ -9301,421 +10805,532 @@
 
   })();
 
+  // ── discoverSources (REPLACE existing) ───────────────────────────────────────
   async function discoverSources(topic, hint = 'auto') {
-    const s = GlobalSettings.load();
-    const apiKeys = s.apiKeys || [];
-    let provider = s.defaultProvider;
+    const s        = GlobalSettings.load();
+    const apiKeys  = s.apiKeys || [];
+    let provider   = s.defaultProvider;
     if (!provider || provider === 'cloud' || provider === 'webllm') {
       const firstKey = apiKeys.find(k => k.provider !== 'webllm' && k.provider !== 'local');
       provider = firstKey?.provider || 'openrouter';
     }
-    const model  = s.defaultModel || '';
-    const apiKey = apiKeys.find(k => k.provider === provider)?.key || '';
+    const model = s.defaultModel || '';
 
     const isFreeOrLocal = s.defaultProvider === 'webllm' || s.defaultProvider === 'local';
-
-    const hasCloudKey = (s.apiKeys || []).some(k => k.key && k.provider !== 'webllm');
+    const hasCloudKey   = (s.apiKeys || []).some(k => k.key && k.provider !== 'webllm');
 
     if (isFreeOrLocal && !hasCloudKey) {
       throw { code: 'NO_CAPABLE_MODEL', message: 'Source discovery requires a cloud API key.' };
     }
 
-    const PROXY = '/newauth/api/dotappsproxy?url=';
+    const PROXY       = '/newauth/api/dotappsproxy?url=';
     const isRecruiter = hint === 'recruiter';
 
-    // ── Phase 1 prompt ───────────────────────────────────────────────────────
-	const phase1Prompt = isRecruiter ? `
-	You are helping set up a job monitoring agent for: "${topic}"
+    const llmCall = (prompt, maxTokens = 1500) => callProvider(
+      { provider, model, apiKey: s.defaultApiKey, systemPrompt: '', include_reasoning: false, maxTokens },
+      [],
+      prompt
+    );
 
-	Step 1 — Analyze the request carefully:
-	- Intent: LOOKING FOR a job, or HIRING someone?
-	- Role title and seniority
-	- Location preference (remote / specific city / country / flexible)
-	- Industry or domain
-	- Tech stack or skills
-	- Any specific companies mentioned?
-	
-	Also extract:
-	- "jobTitle": the full role title as stated, just remove the word "jobs" if present and any location info
-	- "location": city or country if explicitly mentioned, otherwise always use "remote"
+    const parseJson = (raw) => {
+      if (!raw) return null;
+      const cleaned = raw.replace(/```json\n?/gi, '').replace(/```\n?/g, '').trim();
+      const obj = cleaned.match(/\{[\s\S]*\}/);
+      const arr = cleaned.match(/\[[\s\S]*\]/);
+      try { if (obj) return JSON.parse(obj[0]); } catch(e) {}
+      try { if (arr) return JSON.parse(arr[0]); } catch(e) {}
+      return null;
+    };
 
-	Step 2 — Build sources in two tiers:
+    // ── Known-dead blocklist ──────────────────────────────────────────────────
+    const KNOWN_DEAD = [
+      'stackoverflow.com/jobs',
+      'indeed.com/rss',
+      'linkedin.com/jobs',
+      'angel.co',
+      'glassdoor.com',
+      'ziprecruiter.com',
+      'monster.com',
+      'careerbuilder.com',
+      'dice.com/jobs/rss',
+      'remoteok.io/rss',
+      'remoteok.com/rss',
+      'jobicy.com/rss',
+      'jobicy.com/feed'
+    ];
 
-	TIER 1 — ALWAYS include these reliable job listing feeds (NOT news articles):
-	- RemoteOK: https://remoteok.com/remote-dev-jobs.rss (for tech roles)
-	- WeWorkRemotely: https://weworkremotely.com/categories/remote-programming-jobs.rss (for tech)
-	- Stack Overflow Jobs: https://stackoverflow.com/jobs/feed (for tech)
-	- HN Who is Hiring: https://hnrss.org/whoishiring/jobs (tech hiring threads)
-	- Relevant subreddits where jobs are posted (r/forhire, r/remotejs, etc.)
-
-	TIER 2 — Include ONLY if appropriate:
-	- Other WeWorkRemotely categories: /remote-design-jobs.rss, /remote-marketing-jobs.rss, etc.
-	- Remotive: https://remotive.io/api/remote-jobs?category=software-dev (if API, not RSS)
-	- Greenhouse boards: ONLY if user explicitly named a company OR role is 
-	  Staff/Principal/VP/C-level at a well-known tech company AND you are 
-	  highly confident that company uses Greenhouse. Max 3 companies.
-	- Lever boards: same rules as Greenhouse. Max 3 companies.
-	- Local job boards: ONLY if specific non-US/UK location mentioned.
-	- Industry-specific boards: ONLY if non-tech role 
-	  (e.g. Dribbble for designers, Kaggle for data scientists)
-
-	DO NOT USE Google News RSS for job searches — it returns news ABOUT jobs, not job listings.
-
-	Return ONLY valid JSON, no markdown:
-	{
-	  "googleNewsQueries": [],
-	  "feedspotSearches": [],
-	  "redditSubreddits": ["RELEVANT_JOB_SUBREDDIT"],
-	  "mastodonHashtags": [],
-	  "directRssHints": [
-	    {"name": "RemoteOK", "searchUrl": "https://remoteok.com/remote-dev-jobs.rss", "reason": "Remote tech job listings"},
-	    {"name": "WeWorkRemotely", "searchUrl": "https://weworkremotely.com/categories/remote-programming-jobs.rss", "reason": "Remote programming jobs"},
-	    {"name": "HN Jobs", "searchUrl": "https://hnrss.org/whoishiring/jobs", "reason": "Hacker News hiring threads"}
-	  ],
-	  "greenhouseBoards": [],
-	  "leverBoards": []
-	}
-
-	Rules:
-	- googleNewsQueries should be EMPTY [] for job searches
-	- directRssHints MUST include at least 3 actual job board RSS feeds
-	- Substitute REAL category names in WeWorkRemotely URLs (programming, design, marketing, customer-support, etc.)
-	- Never suggest: indeed.com, linkedin.com direct URLs (they don't have working RSS)
-	- Match job boards to role type (tech → RemoteOK/WWR/SO, design → Dribbble, etc.)
-
-	Example for "senior backend engineer Python remote":
-	{
-	  "googleNewsQueries": [],
-	  "redditSubreddits": ["forhire", "remotejs", "Python"],
-	  "directRssHints": [
-	    {"name": "RemoteOK", "searchUrl": "https://remoteok.com/remote-dev-jobs.rss", "reason": "Remote developer jobs"},
-	    {"name": "WeWorkRemotely", "searchUrl": "https://weworkremotely.com/categories/remote-programming-jobs.rss", "reason": "Remote programming positions"},
-	    {"name": "HN Jobs", "searchUrl": "https://hnrss.org/whoishiring/jobs", "reason": "Tech hiring threads"}
-	  ],
-	  "greenhouseBoards": [],
-	  "leverBoards": [],
-	  "jobTitle": "senior backend engineer",
-	  "location": "remote"
-	}
-	` : `
-  Find RSS news sources for topic: "${topic}"
-
-  Return ONLY valid JSON, no markdown:
-  {
-    "googleNewsQueries": [{"q":"KEYWORD","gl":"US","hl":"en","label":"LABEL"}],
-    "feedspotSearches": ["KEYWORD"],
-    "redditSubreddits": ["SUBREDDIT"],
-    "mastodonHashtags": ["HASHTAG"],
-    "directRssHints": [{"name":"PUBLICATION","searchUrl":"URL","reason":"REASON"}]
-  }
-
-  Rules:
-  - Replace ALL_CAPS with real values for: "${topic}"
-  - directRssHints: news publications or blogs with RSS, not search engines or social media
-  - Minimum 2 googleNewsQueries, 2 directRssHints
-  - gl=country code (US,GB,FR), hl=language (en,fr,de) — must match
-  - Never repeat placeholder text in your response`;
-
-    // ── Phase 1: call LLM ────────────────────────────────────────────────────
-    let strategy;
-    try {
-      const r1 = await callProvider(
-        { 
-          provider, model, apiKey: s.defaultApiKey, 
-          systemPrompt: '', 
-          include_reasoning: false,
-          maxTokens: isRecruiter ? 2500 : 2000
-        },
-        [],
-        phase1Prompt
-      );
-
-      console.log('[DISCOVER] Phase 1 raw response:', r1);
-
-      const cleaned = r1.replace(/```json\n?/gi, '').replace(/```\n?/g, '').trim();
-      const objMatch = cleaned.match(/\{[\s\S]*\}/);
-      const arrMatch = cleaned.match(/\[[\s\S]*\]/);
-
-      console.log('[DISCOVER] cleaned:', cleaned.substring(0, 100));
-      console.log('[DISCOVER] objMatch:', !!objMatch);
-
-      if (objMatch) {
+    // ── Feed validator ────────────────────────────────────────────────────────
+    async function validateFeed(feed) {
+      const tryFetch = async (url) => {
         try {
-          strategy = JSON.parse(objMatch[0]);
-        } catch(e) {
-          // Truncated JSON — extract each field individually
-          console.warn('[DISCOVER] Full JSON parse failed, extracting fields individually');
-          strategy = {
-            googleNewsQueries: [],
-            feedspotSearches: [],
-            redditSubreddits: [],
-            mastodonHashtags: [],
-            directRssHints: [],
-            greenhouseBoards: [],
-            leverBoards: []
-          };
-          const fields = ['googleNewsQueries', 'feedspotSearches', 'redditSubreddits',
-                          'mastodonHashtags', 'directRssHints', 'greenhouseBoards', 'leverBoards'];
-          for (const field of fields) {
-            try {
-              const fieldMatch = objMatch[0].match(
-                new RegExp(`"${field}"\\s*:\\s*(\\[[\\s\\S]*?\\])(?=\\s*,\\s*"|\\s*\\})`, '')
-              );
-              if (fieldMatch) {
-                strategy[field] = JSON.parse(fieldMatch[1]);
-                console.log(`[DISCOVER] rescued ${field}:`, strategy[field].length, 'items');
-              }
-            } catch(fe) {
-              console.warn(`[DISCOVER] Could not rescue ${field}`, fe);
-            }
-          }
-        }
-      } else if (arrMatch) {
-        strategy = { 
-          googleNewsQueries: JSON.parse(arrMatch[0]), 
-          feedspotSearches: [], redditSubreddits: [], 
-          mastodonHashtags: [], directRssHints: [],
-          greenhouseBoards: [], leverBoards: []
-        };
+          const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
+          if (!res.ok) return null;
+          return await res.text();
+        } catch { return null; }
+      };
+
+      let text = await tryFetch(feed.url);
+      if (!text) text = await tryFetch(PROXY + encodeURIComponent(feed.url));
+      if (!text) {
+        console.warn(`[DISCOVER] ❌ ${feed.name} — no response`);
+        return false;
       }
 
-      if (!strategy?.googleNewsQueries) {
-        throw new Error('Incomplete response from model — missing googleNewsQueries');
+      const lower = text.toLowerCase();
+
+      // ── Bot wall — language-agnostic signals only ───────────────────────────
+      const isBotWall =
+        lower.includes('captcha') ||
+        lower.includes('cf-browser-verification') ||
+        lower.includes('challenge-form') ||
+        lower.includes('robot or human') ||
+        lower.includes('ddos-guard') ||
+        lower.includes('checking your browser') ||
+        (lower.includes('<meta') && lower.includes('refresh') && lower.includes('login')) ||
+        (lower.includes('</html>') && text.length < 500 &&
+         !lower.includes('<item') && !lower.includes('<entry'));
+
+      if (isBotWall) {
+        console.warn(`[DISCOVER] ❌ ${feed.name} — bot wall detected`);
+        return false;
       }
 
-    } catch(e) {
-      console.warn('[DISCOVER] Phase 1 failed, falling back', e);
-      strategy = isRecruiter ? {
-        googleNewsQueries: [
-          { q: `${topic} jobs`, gl: 'US', hl: 'en', label: 'Job Search' },
-          { q: `${topic} hiring`, gl: 'US', hl: 'en', label: 'Hiring' }
-        ],
-        feedspotSearches: [],
-        redditSubreddits: ['jobs', 'remotework', 'cscareerquestions'],
-        mastodonHashtags: [],
-        directRssHints: [
-          {
-            name: 'Remotive',
-            searchUrl: `https://remotive.com/rss/jobs`,
-            reason: 'Remote job listings'
-          },
-          {
-            name: 'Jobicy',
-            searchUrl: `https://jobicy.com/?feed=job_feed`,
-            reason: 'Remote job listings'
-          },
-          {
-            name: 'HN Who is Hiring',
-            searchUrl: `https://hn.algolia.com/api/v1/search_by_date?query=${encodeURIComponent(topic)}+hiring&tags=story`,
-            reason: 'Hacker News hiring threads'
-          }
-        ],
-        greenhouseBoards: [],
-        leverBoards: [],
-		jobTitle: topic.replace(/\s*jobs?\s*(in\s+\S+)?$/i, '').trim(),
-		location: 'remote'
-      } : {
-        googleNewsQueries: [{ q: topic, gl: 'US', hl: 'en', label: 'Google News' }],
-        feedspotSearches: [topic],
-        redditSubreddits: [],
-        mastodonHashtags: [],
-        directRssHints: [],
-        greenhouseBoards: [],
-        leverBoards: []
+      // ── Format check ────────────────────────────────────────────────────────
+      const isRss      = text.includes('<rss') || text.includes('<feed')
+                      || text.includes('<channel') || text.includes('<?xml');
+      const isJson     = text.trim().startsWith('[') || text.trim().startsWith('{');
+      const isGoogleJobs = lower.includes('application/ld+json') && lower.includes('jobposting');
+      const isHtmlPage   = lower.includes('</html>') && text.length > 500;
+
+      if (!isRss && !isJson && !isGoogleJobs && !isHtmlPage) {
+        console.warn(`[DISCOVER] ❌ ${feed.name} — unrecognized format`);
+        return false;
+      }
+
+      // ── Content check for RSS ───────────────────────────────────────────────
+      const itemCount = (text.match(/<item|<entry|"@type"\s*:\s*"JobPosting"|"id"\s*:/g) || []).length;
+      if (isRss && itemCount === 0) {
+        console.warn(`[DISCOVER] ❌ ${feed.name} — empty feed`);
+        return false;
+      }
+
+      console.log(`[DISCOVER] ✅ ${feed.name} — valid (${itemCount} items detected)`);
+      return true;
+    }
+
+    async function validateAll(feeds) {
+      const results = await Promise.allSettled(
+        feeds.map(async feed => ({ feed, valid: await validateFeed(feed) }))
+      );
+      return results
+        .filter(r => r.status === 'fulfilled' && r.value.valid)
+        .map(r => r.value.feed);
+    }
+
+    // ── Deduper ───────────────────────────────────────────────────────────────
+    function dedupe(arr) {
+      const seen = new Set();
+      return arr.filter(c => {
+        const key = c.url.replace(/\/$/, '').toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    // ── Google Jobs URL builder ───────────────────────────────────────────────
+    function buildGoogleJobsUrl(jobTitle, location) {
+      const q = [jobTitle, 'jobs', location !== 'remote' ? 'in ' + location : 'remote']
+        .filter(Boolean).join(' ');
+      return {
+        name:        `Google Jobs: ${jobTitle} ${location !== 'remote' ? 'in ' + location : '(remote)'}`,
+        url:         `https://www.google.com/search?q=${encodeURIComponent(q)}&ibp=htl;jobs`,
+        reason:      'Google Jobs aggregates listings from all major job boards globally',
+        selected:    true,
+        type:        'google_jobs',
+        cssSelector: null
       };
     }
 
-    console.log('[DISCOVER] Phase 1 strategy:', strategy);
+    // ── Dice URL builder ──────────────────────────────────────────────────────
+    function buildDiceUrl(jobTitle, location, isRemote, keywords) {
+      const q = [jobTitle, ...(keywords || []).slice(0, 2)].join(' ');
+      return {
+        name:        `Dice: ${jobTitle}`,
+        url:         `https://www.dice.com/jobs?q=${encodeURIComponent(q)}`
+                     + (!isRemote && location !== 'remote'
+                       ? `&location=${encodeURIComponent(location)}` : '')
+                     + `&radius=30&radiusUnit=mi`,
+        reason:      'Tech-focused job board — HTML listing page',
+        selected:    true,
+        type:        'html',
+        cssSelector: '[data-testid="job-search-results-container"]'
+      };
+    }
 
-    // ── Phase 2: build feed list ─────────────────────────────────────────────
-    const fetchViaProxy = async (url) => {
+    // ── Universal fallback — works for any topic or market ───────────────────
+    function buildUniversalFallback(subject, googleFeed) {
+      const results = [];
+      if (googleFeed) results.push(googleFeed);
+      results.push({
+        name:        `Google News: ${subject}`,
+        url:         `https://news.google.com/rss/search?q=${encodeURIComponent(subject)}&hl=en&gl=US&ceid=US:en`,
+        reason:      'Google News — reliable for any topic or market',
+        selected:    true,
+        type:        'rss',
+        cssSelector: null
+      });
+      results.push({
+        name:        `Reddit: ${subject}`,
+        url:         `https://www.reddit.com/search.rss?q=${encodeURIComponent(subject)}&sort=new`,
+        reason:      'Reddit — global coverage for any topic',
+        selected:    true,
+        type:        'rss',
+        cssSelector: null
+      });
+      return results;
+    }
+
+    // ── Shared fallback logic — used by both news and recruiter paths ─────────
+    async function applyFallbackChain(validated, normalized, subject, googleFeed, localMarket) {
+      if (validated.length >= 3) return validated;
+
+      // Tier 2 — retry LLM asking for HTML pages
+      console.warn('[DISCOVER] Too few validated — retrying with HTML fallback prompt');
       try {
-        const res = await fetch(PROXY + encodeURIComponent(url));
-        if (!res.ok) return null;
-        return await res.text();
-      } catch { return null; }
-    };
+        const failedNames = normalized
+          .filter(n => !validated.some(v => v.url === n.url))
+          .map(n => `- ${n.name}: ${n.url}`)
+          .join('\n');
 
-    const BLOCKLIST = new Set([
-      'google.com', 'duckduckgo.com', 'bing.com', 'yahoo.com',
-      'facebook.com', 'twitter.com', 'youtube.com',
-      'indeed.com',           // unreliable RSS, frequent 404s
-      'weworkremotely.com',   // only allow specific category URLs
-      'linkedin.com',         // blocks server-side fetches
-    ]);
+        const fallbackPrompt = `
+  These feeds for "${subject}" were unreachable or returned no content:
+  ${failedNames}
 
-    const discoveredFeeds = [];
+  Suggest 4-6 alternative pages about "${subject}" that definitely exist and are
+  publicly accessible without login. Prefer RSS but HTML pages are acceptable.
+  Return ONLY valid JSON array:
+  [{"name":"...","url":"...","reason":"...","type":"rss|html","cssSelector":null}]`;
 
-    // Google News RSS
-    for (const gn of (strategy.googleNewsQueries || [])) {
-      const gnUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(gn.q)}&hl=${gn.hl}&gl=${gn.gl}&ceid=${gn.gl}:${gn.hl?.split('-')[0] || 'en'}`;
-      discoveredFeeds.push({
-        name: `Google News: ${gn.label || gn.q}`,
-        url: gnUrl,
-        reason: `Google News for "${gn.q}" in ${gn.gl}`,
-        selected: true,
-        type: 'google_news'
-      });
-    }
-
-    // Reddit
-    for (const sub of (strategy.redditSubreddits || [])) {
-      const cleanSub = sub
-        .replace(/^https?:\/\/(www\.)?reddit\.com/i, '')
-        .replace(/^\/r\//i, '')
-        .replace(/^r\//i, '')
-        .replace(/\//g, '')
-        .trim();
-      if (!cleanSub) continue;
-      discoveredFeeds.push({
-        name: `r/${cleanSub}`,
-        url: `https://www.reddit.com/r/${cleanSub}/.rss`,
-        reason: `Reddit community for ${topic}`,
-        selected: true,
-        type: 'reddit'
-      });
-    }
-
-    // Mastodon
-    for (const tag of (strategy.mastodonHashtags || [])) {
-      discoveredFeeds.push({
-        name: `#${tag} on Mastodon`,
-        url: `https://mastodon.social/tags/${tag}.rss`,
-        reason: `Mastodon social discussion`,
-        selected: false,
-        type: 'mastodon'
-      });
-    }
-
-    // Feedspot → Google News fallback
-    for (const fsTerm of (strategy.feedspotSearches || [])) {
-      const gnUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(fsTerm)}&hl=en&gl=US&ceid=US:en`;
-      discoveredFeeds.push({
-        name: `Google News: ${fsTerm}`,
-        url: gnUrl,
-        reason: `Google News search for "${fsTerm}"`,
-        selected: true,
-        type: 'google_news'
-      });
-    }
-
-    // Greenhouse boards
-    for (const slug of (strategy.greenhouseBoards || [])) {
-      discoveredFeeds.push({
-        name: `${slug} (Greenhouse)`,
-        url: `https://boards.greenhouse.io/${slug}/jobs.json`,
-        reason: `Direct job listings from ${slug}`,
-        selected: true,
-        type: 'greenhouse'
-      });
-    }
-
-    // Lever boards
-    for (const slug of (strategy.leverBoards || [])) {
-      discoveredFeeds.push({
-        name: `${slug} (Lever)`,
-        url: `https://api.lever.co/v0/postings/${slug}?mode=json`,
-        reason: `Direct job listings from ${slug}`,
-        selected: true,
-        type: 'lever'
-      });
-    }
-	
-	if (isRecruiter && strategy.jobTitle) {
-	  discoveredFeeds.push({
-	    name:     'Indeed: ' + strategy.jobTitle + ' in ' + (strategy.location || 'remote'),
-	    url:      'https://www.indeed.com/rss?q=' + encodeURIComponent(strategy.jobTitle) +
-	              '&l=' + encodeURIComponent(strategy.location || 'remote') +
-	              '&sort=date',
-	    reason:   'Indeed job listings for ' + strategy.jobTitle,
-	    selected: true,
-	    type:     'direct'
-	  });
-	}
-
-    // Direct RSS hints
-    const validHints = (strategy.directRssHints || []).filter(hint => {
-      try {
-        const domain = new URL(hint.searchUrl).hostname.replace('www.', '');
-        return !BLOCKLIST.has(domain) && 
-               !Array.from(BLOCKLIST).some(b => domain.includes(b));
-      } catch { return false; }
-    });
-
-    for (const hint of validHints) {
-      const isDirectRss = hint.searchUrl.match(/\.(rss|xml|atom)$|\/rss|\/feed|\/atom|\.json$/i);
-
-      if (isDirectRss) {
-        discoveredFeeds.push({
-          name:     hint.name,
-          url:      hint.searchUrl,
-          reason:   hint.reason,
-          selected: true,
-          type:     'direct'
-        });
-      } else {
-        const html = await fetchViaProxy(hint.searchUrl);
-        if (html) {
-          const rssMatch = html.match(/<link[^>]+type="application\/(?:rss|atom)\+xml"[^>]+href="([^"]+)"/i)
-                        || html.match(/href="([^"]+)"[^>]+type="application\/(?:rss|atom)\+xml"/i);
-          if (rssMatch) {
-            let rssUrl = rssMatch[1];
-            if (rssUrl.startsWith('/')) {
-              const base = new URL(hint.searchUrl);
-              rssUrl = base.origin + rssUrl;
-            }
-            discoveredFeeds.push({
-              name:     hint.name,
-              url:      rssUrl,
-              reason:   hint.reason,
-              selected: true,
-              type:     'direct'
-            });
-          }
-        }
-      }
-    }
-
-    // ── Phase 3: rank and dedupe ─────────────────────────────────────────────
-    const isFreeModel = model?.includes(':free') || provider === 'webllm';
-
-    const skipPhase3 =
-      isFreeModel ||
-      discoveredFeeds.length <= 5 ||
-      discoveredFeeds.every(f => f.type === 'direct' || f.type === 'reddit') ||
-      discoveredFeeds.filter(f => f.type !== 'google_news').length >= 3;
-
-    if (discoveredFeeds.length > 3 && !skipPhase3) {
-      const phase3Prompt = `You are ranking job feed sources for relevance.
-  Topic: "${topic}"
-
-  Candidate feeds:
-  ${JSON.stringify(discoveredFeeds, null, 2)}
-
-  Return the best 6-8 feeds ranked by relevance to "${topic}".
-  Prefer: specific/niche sources over generic ones, local sources for local topics.
-  Remove obvious mismatches.
-
-  Return ONLY a valid JSON array, no markdown:
-  [{"name":"...","url":"...","reason":"...","selected":true}]`;
-
-      try {
-        const r3 = await callProvider(
-          { provider, model, apiKey: s.defaultApiKey, systemPrompt: '', include_reasoning: false, maxTokens: 1500 },
-          [],
-          phase3Prompt
-        );
-        const m3 = r3.match(/\[[\s\S]*\]/);
-        if (m3) {
-          const ranked = JSON.parse(m3[0]);
-          return ranked.filter(s => s.url && s.name).map(s => ({ ...s, selected: s.selected ?? true }));
+        const fallbackRaw    = await llmCall(fallbackPrompt, 800);
+        const fallbackParsed = parseJson(fallbackRaw);
+        if (Array.isArray(fallbackParsed)) {
+          const fallbackNorm = fallbackParsed
+            .filter(c => c.url && c.name && !KNOWN_DEAD.some(d => c.url.includes(d)))
+            .map(c => ({ ...c, selected: true, cssSelector: c.cssSelector || null }));
+          const fallbackValid = await validateAll(fallbackNorm);
+          console.log(`[DISCOVER] HTML fallback: ${fallbackValid.length} additional sources`);
+          validated.push(...fallbackValid);
         }
       } catch(e) {
-        console.warn('[discoverSources] Phase 3 ranking failed, returning raw list', e);
+        console.warn('[DISCOVER] Fallback prompt failed:', e.message);
+      }
+
+      // Tier 3 — universal baseline guaranteed for any topic/market
+      if (validated.length < 3) {
+        console.warn('[DISCOVER] Using universal baseline');
+        const universal = buildUniversalFallback(subject, googleFeed);
+        for (const u of universal) {
+          if (!validated.some(v => v.url === u.url)) validated.push(u);
+        }
+      }
+
+      return dedupe(validated);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ── NON-RECRUITER path (news sources) ────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    if (!isRecruiter) {
+      const newsPrompt = `
+  Find RSS/Atom news sources for topic: "${topic}"
+
+  Return ONLY valid JSON array, no markdown:
+  [
+    {"name":"SOURCE NAME","url":"DIRECT_RSS_OR_FEED_URL","reason":"WHY RELEVANT","type":"rss","cssSelector":null}
+  ]
+
+  Rules:
+  - Return 6-10 sources
+  - ONLY include direct RSS/Atom feed URLs (ending in .rss, .xml, /feed, /atom, or known feed paths)
+  - Include a mix: major publications, niche blogs, reddit communities, regional sources if relevant
+  - Reddit format: https://www.reddit.com/r/SUBREDDIT/.rss
+  - Google News format: https://news.google.com/rss/search?q=KEYWORD&hl=en&gl=US&ceid=US:en
+  - Never include: social media pages, YouTube, paywalled sites without RSS
+  - Never invent URLs — only suggest feeds you are confident exist`;
+
+      let candidates = [];
+      try {
+        const raw    = await llmCall(newsPrompt, 1500);
+        const parsed = parseJson(raw);
+        if (Array.isArray(parsed)) candidates = parsed;
+        else if (parsed?.sources) candidates = parsed.sources;
+      } catch(e) {
+        console.warn('[DISCOVER] news phase 1 failed', e);
+      }
+
+      // Always add Google News
+      candidates.push({
+        name:        `Google News: ${topic}`,
+        url:         `https://news.google.com/rss/search?q=${encodeURIComponent(topic)}&hl=en&gl=US&ceid=US:en`,
+        reason:      'Google News aggregator — reliable for any topic',
+        selected:    true,
+        type:        'google_news',
+        cssSelector: null
+      });
+
+	  const normalized = dedupe(
+	    candidates
+	      .filter(c => c.url && c.name && !KNOWN_DEAD.some(d => c.url.includes(d)))
+	      .map(c => ({
+	        ...c,
+	        selected:    true,
+	        type:        c.type || 'rss',
+	        cssSelector: null,
+	        url: c.url.trim()
+	          .replace(/^(?!https?:\/\/)/, 'https://')
+	          .replace(/reddit\.com\/r\/(\w+)\.rss$/, 'reddit.com/r/$1/.rss')
+	      }))
+	  );
+
+      console.log(`[DISCOVER] News: validating ${normalized.length} candidates...`);
+      const valid = await validateAll(normalized);
+      console.log(`[DISCOVER] News: ${valid.length}/${normalized.length} passed`);
+
+      return applyFallbackChain(valid, normalized, topic, null, 'US');
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ── RECRUITER path ────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Phase 1 — Classify the request ───────────────────────────────────────
+    const phase1Prompt = `
+  Analyze this job search request: "${topic}"
+
+  Return ONLY valid JSON, no markdown:
+  {
+    "jobTitle":          "exact role title, clean (no location words)",
+    "location":          "City, Country — or just 'remote' if remote",
+    "isRemote":          true or false,
+    "seniority":         "intern|junior|mid|senior|lead|executive",
+    "roleCategory":      "tech|design|marketing|data|finance|support|legal|hr|sales|other",
+    "localMarket":       "US|UK|EU|IN|APAC|LATAM|MENA|other",
+    "specificCompanies": [],
+    "keywords":          ["2-4 key skill or domain keywords"]
+  }
+
+  Examples:
+  "graphic designer Sarajevo" →
+    {"jobTitle":"graphic designer","location":"Sarajevo, Bosnia","isRemote":false,"seniority":"mid","roleCategory":"design","localMarket":"EU","specificCompanies":[],"keywords":["graphic design","visual","branding"]}
+
+  "marketing intern Mumbai" →
+    {"jobTitle":"marketing intern","location":"Mumbai, India","isRemote":false,"seniority":"intern","roleCategory":"marketing","localMarket":"IN","specificCompanies":[],"keywords":["marketing","intern","digital"]}
+
+  "VP technology remote" →
+    {"jobTitle":"VP of Technology","location":"remote","isRemote":true,"seniority":"executive","roleCategory":"tech","localMarket":"US","specificCompanies":[],"keywords":["CTO","VP Engineering","technology leadership"]}
+
+  "frontend engineer at Stripe" →
+    {"jobTitle":"frontend engineer","location":"remote","isRemote":true,"seniority":"mid","roleCategory":"tech","localMarket":"US","specificCompanies":["stripe"],"keywords":["frontend","React","JavaScript"]}`;
+
+    let classification = null;
+    try {
+      const r1       = await llmCall(phase1Prompt, 800);
+      classification = parseJson(r1);
+      console.log('[DISCOVER] Phase 1 classification:', classification);
+    } catch(e) {
+      console.warn('[DISCOVER] Phase 1 failed', e);
+    }
+
+    if (!classification?.jobTitle) {
+      classification = {
+        jobTitle:          topic.replace(/\s*jobs?\s*(in\s+\S+)?$/i, '').trim(),
+        location:          'remote',
+        isRemote:          true,
+        seniority:         'mid',
+        roleCategory:      'other',
+        localMarket:       'US',
+        specificCompanies: [],
+        keywords:          [topic]
+      };
+    }
+
+    const { jobTitle, location, isRemote, seniority, roleCategory,
+            localMarket, specificCompanies, keywords } = classification;
+
+    // ── Phase 2 — LLM suggests sources with full context ─────────────────────
+    const phase2Prompt = `
+  You are helping find job listing sources for someone looking for work.
+
+  Job details:
+  - Role: "${jobTitle}"
+  - Location: "${location}"
+  - Remote: ${isRemote}
+  - Seniority: "${seniority}"
+  - Category: "${roleCategory}"
+  - Market: "${localMarket}"
+  - Keywords: ${JSON.stringify(keywords)}
+
+  Your task: suggest 8-12 job sources that a real job seeker in this situation would actually use.
+
+  CRITICAL LOCATION RULE:
+  "${location}" is the target location. You MUST prioritize job boards that are popular
+  and dominant in that specific country or region. Do not default to US-centric boards
+  unless the role is remote or the location is in the US.
+
+  Use your knowledge of local job markets:
+  - Bosnia/Balkans → Posao.ba, MojPosao, Rabota.rs, Oglasi.ba
+  - Germany/DACH → StepStone.de, XING, Jobware, Karriere.at, Jobscout24
+  - UK → Reed.co.uk, Totaljobs, CWJobs, Guardian Jobs, CV-Library
+  - India → Naukri.com, Shine.com, Freshersworld, TimesJobs, Foundit
+  - France → Pole Emploi, APEC, Cadremploi, Welcome to the Jungle, RegionsJob
+  - Spain/LATAM → InfoJobs, Computrabajo, Bumeran, OCC Mundial
+  - Middle East → Bayt.com, Naukrigulf, GulfTalent, Mihnati
+  - Australia/NZ → Seek.com.au, TradeMe Jobs, Jora Australia
+  - Canada → Workopolis, Jobbank.gc.ca, Eluta
+  - Netherlands → Nationale Vacaturebank, Monsterboard.nl, Intermediair
+  - Poland/CEE → Pracuj.pl, OLX Praca, Jobs.cz, Profesia.sk
+  - Remote/Global → RemoteOK (remoteok.com/remote-jobs.rss), WeWorkRemotely, Jobicy (jobicy.com/?feed=job_feed), Remotive, Working Nomads
+
+  IMPORTANT:
+  - Prefer RSS feeds where they exist
+  - For boards that only have HTML pages, include them anyway
+  - Only suggest URLs you are highly confident actually exist and are publicly accessible without login
+  - Local boards are more valuable than generic global boards for non-remote roles
+
+  Also include:
+  - 1-2 industry-specific boards for "${roleCategory}" roles
+  - Relevant subreddits as https://www.reddit.com/r/SUBREDDIT/.rss if applicable
+  - Company ATS boards if requested: ${JSON.stringify(specificCompanies)}
+
+  Return ONLY valid JSON array, no markdown:
+  [
+    {
+      "name":        "Source name",
+      "url":         "https://direct-url-to-feed-or-jobs-page",
+      "reason":      "Why this source fits this specific role and location",
+      "type":        "rss|html|greenhouse|lever",
+      "cssSelector": null
+    }
+  ]
+
+  Never suggest: indeed.com (RSS dead), linkedin.com (login wall),
+  stackoverflow.com/jobs (shut down), glassdoor.com (login wall),
+  remoteok.io (wrong domain), remoteok.com/rss (wrong path — use remoteok.com/remote-jobs.rss),
+  jobicy.com/rss or jobicy.com/feed (wrong path — use jobicy.com/?feed=job_feed).`;
+
+    let candidates = [];
+    try {
+      const r2     = await llmCall(phase2Prompt, 2000);
+      const parsed = parseJson(r2);
+      if (Array.isArray(parsed)) candidates = parsed;
+      console.log('[DISCOVER] Phase 2 raw candidates:', JSON.stringify(candidates, null, 2));
+    } catch(e) {
+      console.warn('[DISCOVER] Phase 2 failed', e);
+    }
+
+    // ── Always inject Google Jobs ─────────────────────────────────────────────
+    const googleJobsFeed = buildGoogleJobsUrl(jobTitle, location);
+    const hasGoogleJobs  = candidates.some(c =>
+      c.url?.includes('google.com/search') && c.url?.includes('ibp=htl;jobs')
+    );
+    if (!hasGoogleJobs) {
+      candidates.unshift(googleJobsFeed);
+      console.log('[DISCOVER] Injected Google Jobs');
+    }
+
+    // ── Inject RemoteOK for remote roles ──────────────────────────────────────
+    if (isRemote) {
+      const hasRemoteOK = candidates.some(c => c.url?.includes('remoteok.com/remote-jobs'));
+      if (!hasRemoteOK) {
+        candidates.push({
+          name:        'RemoteOK: Remote Jobs',
+          url:         'https://remoteok.com/remote-jobs.rss',
+          reason:      'Largest remote job board with RSS',
+          selected:    true,
+          type:        'rss',
+          cssSelector: null
+        });
+        console.log('[DISCOVER] Injected RemoteOK');
       }
     }
 
-    return discoveredFeeds.filter(s => s.url && s.name);
+    // ── Inject Jobicy for remote or EU roles ──────────────────────────────────
+    if (isRemote || localMarket === 'EU') {
+      const hasJobicy = candidates.some(c => c.url?.includes('jobicy.com/?feed'));
+      if (!hasJobicy) {
+        candidates.push({
+          name:        'Jobicy: Remote Jobs',
+          url:         'https://jobicy.com/?feed=job_feed',
+          reason:      'Remote-friendly job board with RSS, strong EU coverage',
+          selected:    true,
+          type:        'rss',
+          cssSelector: null
+        });
+        console.log('[DISCOVER] Injected Jobicy');
+      }
+    }
+
+    // ── Inject Dice for tech/data roles ──────────────────────────────────────
+    const DICE_CATEGORIES = ['tech', 'data'];
+    if (DICE_CATEGORIES.includes(roleCategory)) {
+      const hasDice = candidates.some(c => c.url?.includes('dice.com/jobs?'));
+      if (!hasDice) {
+        candidates.push(buildDiceUrl(jobTitle, location, isRemote, keywords));
+        console.log('[DISCOVER] Injected Dice');
+      }
+    }
+
+    // ── Greenhouse / Lever for specific companies ─────────────────────────────
+    for (const slug of (specificCompanies || [])) {
+      candidates.push({
+        name:        `${slug} (Greenhouse)`,
+        url:         `https://boards.greenhouse.io/${slug}/jobs.json`,
+        reason:      `Direct listings from ${slug}`,
+        type:        'greenhouse',
+        cssSelector: null
+      });
+      candidates.push({
+        name:        `${slug} (Lever)`,
+        url:         `https://api.lever.co/v0/postings/${slug}?mode=json`,
+        reason:      `Direct listings from ${slug}`,
+        type:        'lever',
+        cssSelector: null
+      });
+    }
+
+    // ── Normalize + dedupe ────────────────────────────────────────────────────
+    const normalized = dedupe(
+      candidates
+        .filter(c => c.url && c.name && !KNOWN_DEAD.some(d => c.url.includes(d)))
+        .map(c => ({
+          name:        c.name,
+          url:    c.url.trim()
+		          .replace(/^(?!https?:\/\/)/, 'https://')
+		          .replace(/reddit\.com\/r\/(\w+)\.rss$/, 'reddit.com/r/$1/.rss'),
+          reason:      c.reason || '',
+          selected:    true,
+          type:        c.type || 'direct',
+          cssSelector: c.cssSelector || null
+        }))
+    );
+
+    console.log(`[DISCOVER] Validating ${normalized.length} candidate sources...`);
+
+    // ── Phase 3 — Validate all in parallel ───────────────────────────────────
+    const validated = await validateAll(normalized);
+    console.log(`[DISCOVER] ${validated.length}/${normalized.length} sources passed validation`);
+
+    // ── Always keep Google Jobs ───────────────────────────────────────────────
+    const hasValidGoogleJobs = validated.some(f => f.type === 'google_jobs');
+    if (!hasValidGoogleJobs) {
+      validated.unshift(googleJobsFeed);
+      console.log('[DISCOVER] Re-injected Google Jobs (kept despite validation)');
+    }
+
+    // ── Fallback chain ────────────────────────────────────────────────────────
+    const subject = `${jobTitle} jobs ${location !== 'remote' ? 'in ' + location : 'remote'}`;
+    return applyFallbackChain(validated, normalized, subject, googleJobsFeed, localMarket);
   }
   
   
@@ -10763,10 +12378,12 @@
 
 			  // Show loading
 			  result.innerHTML = `<div style="text-align:center;padding:16px;color:#888;font-size:12px;">
-			    <div style="font-size:20px;margin-bottom:6px;">🔍</div>Discovering sources...
-				<div style="font-size:11px;color:#aaa;">This may take up to a minute — AI is finding the best feeds for your topic.</div>
-			  </div>`;
-
+			    <div style="display:inline-block;width:28px;height:28px;border:3px solid #ede9fe;border-top-color:#6c5ce7;border-radius:50%;animation:tgSpin 0.8s linear infinite;margin-bottom:8px;"></div>
+			    <div>Discovering sources...</div>
+			    <div style="font-size:11px;color:#aaa;margin-top:4px;">This may take up to a minute — AI is finding the best feeds for your topic.</div>
+			  </div>
+			  <style>@keyframes tgSpin{to{transform:rotate(360deg)}}</style>`;
+			  
 			  try {
 			    const sources = await discoverSources(topic, state.compositionType === 'recruiter' ? 'recruiter' : 'auto');
 			    state.discoveredSources = sources;
@@ -10827,7 +12444,11 @@
 	          const selected = (state.discoveredSources || []).filter(s => s.selected !== false);
 	          if (selected.length && state.workers?.[0]) {
 	            state.workers[0].targetUrl  = selected[0].url;
-	            state.workers[0].targetUrls = selected.map(s => s.url);
+				state.workers[0].targetUrls = selected.map(s => ({
+				  url:         s.url,
+				  cssSelector: s.cssSelector || null,
+				  type:        s.type || 'direct'
+				}));
 				state.workers[0].pollInterval = state.compositionType === 'recruiter' ? 3600 : 300;
 				console.log('[WIZ] pre-filled watcher:', state.workers[0].targetUrls?.length, 'feeds, interval:', state.workers[0].pollInterval);
 	          }
@@ -11991,9 +13612,9 @@
       }, {
         watcher: {
           targetUrls: [
-            'http://feeds.bbci.co.uk/news/rss.xml',
-            'https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en',
-            'https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en'
+            { url: 'http://feeds.bbci.co.uk/news/rss.xml', cssSelector: null, type: 'rss' },
+            { url: 'https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en', cssSelector: null, type: 'rss' },
+            { url: 'https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en', cssSelector: null, type: 'rss' }
           ],
           targetUrl:    'http://feeds.bbci.co.uk/news/rss.xml',
           pollInterval: 600,
@@ -12017,7 +13638,7 @@
         dotLabel:  'TCH'
       }, {
         watcher: {
-          targetUrls:   ['https://news.ycombinator.com/rss'],
+          targetUrls:   [{ url: 'https://news.ycombinator.com/rss', cssSelector: null, type: 'rss' }],
           targetUrl:    'https://news.ycombinator.com/rss',
           pollInterval: 480,
           watcherActive: true
@@ -12324,17 +13945,6 @@
 	        : 'No relevant items in the last 24h.';
 	    }
 
-	    // ── Natural language handler ──────────────────────────────────────
-		async function handleNaturalLanguage(text, token, chatId, compositions) {
-		  try {
-		    await reply(token, chatId, '_thinking..._');
-		    const answer = await orchestrateAgentQuery(text, compositions);
-		    return reply(token, chatId, answer);
-		  } catch(e) {
-		    console.error('[TelegramBot] NL handler error:', e.message);
-		    return reply(token, chatId, `❌ Error: ${e.message}`);
-		  }
-		}
 
 	    // ── Poll loop ────────────────────────────────────────────────────────
 	    async function poll() {
@@ -12354,25 +13964,88 @@
 	        const data = await res.json();
 	        if (!data.ok || !data.result?.length) return;
 
-	        for (const update of data.result) {
-	          _lastUpdateId = Math.max(_lastUpdateId, update.update_id);
+			for (const update of data.result) {
+			  _lastUpdateId = Math.max(_lastUpdateId, update.update_id);
 
-	          const msg      = update.message || update.edited_message;
-	          if (!msg) continue;
+			  const msg = update.message || update.edited_message;
+			  if (!msg) continue;
 
-	          // Security: only respond to configured chat
-	          const fromChat = String(msg.chat?.id || msg.from?.id || '');
-	          if (fromChat !== String(chatId)) {
-	            console.log('[TelegramBot] Ignoring message from unknown chat:', fromChat);
-	            continue;
-	          }
+			  // Security: only respond to configured chat
+			  const fromChat = String(msg.chat?.id || msg.from?.id || '');
+			  if (fromChat !== String(chatId)) {
+			    console.log('[TelegramBot] Ignoring message from unknown chat:', fromChat);
+			    continue;
+			  }
 
-	          const text = msg.text?.trim();
-	          if (!text) continue;
+			  // ── Inbound file from Telegram ────────────────────────────────────────
+			  const tgFile =
+			    (msg.photo   && msg.photo[msg.photo.length - 1]) || // highest res
+			    msg.document ||
+			    msg.video    ||
+			    msg.audio    ||
+			    msg.voice    ||
+			    null;
 
-	          console.log('[TelegramBot] Received:', text);
-	          await handleCommand(text, token, chatId);
-	        }
+			  if (tgFile) {
+			    const fileId = tgFile.file_id;
+			    try {
+			      // Step 1: get file path
+			      const infoResp = await fetch(
+			        `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`
+			      );
+			      const info     = await infoResp.json();
+			      const filePath = info?.result?.file_path;
+			      if (!filePath) throw new Error('No file_path returned');
+
+			      // Step 2: build proxied URL
+			      const PROXY   = '/newauth/api/dotappsproxy?url=';
+			      const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+			      const proxied = PROXY + encodeURIComponent(fileUrl);
+
+			      // Step 3: determine media type
+			      let mediaType = 'document';
+			      const mime    = tgFile.mime_type || '';
+			      if (msg.photo)              mediaType = 'image';
+			      if (msg.video)              mediaType = 'video';
+			      if (msg.audio || msg.voice) mediaType = 'audio';
+
+			      const fileName = tgFile.file_name || filePath.split('/').pop();
+
+			      // Step 4: render inline in browser chat
+			      const comp = getAssistantComposition(_orchestrator);
+			      if (comp) {
+			        const messagesEl = document.getElementById(`chat-messages-${comp.displayID}`);
+			        if (messagesEl) {
+			          renderMsg(messagesEl, 'user', {
+			            type:     mediaType,
+			            url:      proxied,
+			            name:     fileName,
+			            mimeType: mime,
+			            fileId,
+			            token
+			          });
+			          messagesEl.scrollTop = messagesEl.scrollHeight;
+			        }
+			      }
+
+			      // Step 5: if caption exists, also handle as assistant message
+			      if (msg.caption?.trim()) {
+			        await handleAssistantMessage(msg.caption.trim(), token, chatId, _orchestrator);
+			      }
+
+			    } catch(e) {
+			      console.error('[TelegramBot] File fetch error:', e.message);
+			    }
+			    continue; // don't fall through to text handler
+			  }
+
+			  // ── Text message ──────────────────────────────────────────────────────
+			  const text = msg.text?.trim();
+			  if (!text) continue;
+
+			  console.log('[TelegramBot] Received:', text);
+			  await handleAssistantMessage(text, token, chatId, orchestrator);
+			}
 	      } catch(e) {
 	        console.warn('[TelegramBot] Poll error:', e.message);
 	      }
@@ -12620,17 +14293,21 @@
 	      console.log('[agnts] Migrated agntuser — initialized compositions[]');
 	    }
 
-	       const compositions = agntuser?.compositions || [];
+	    const compositions = agntuser?.compositions || [];
 	    compositions.forEach(compositionItem => {
 	      const workers = compositionItem._composite?.worker || [];
 	      WatcherPanel.resumeActive(this, compositionItem, workers);
 		  WriterPanel.resumeScheduled(this, compositionItem, workers);
 	      setTimeout(() => applyDotDisabledState(compositionItem, orchestrator), 800);
 	      setTimeout(() => applyGoldenGlow(compositionItem, orchestrator), 150);
-
-
 	    });
-
+		
+		setTimeout(() => {
+	      compositions.forEach(compositionItem => {
+	        applyDotFloat(compositionItem, orchestrator);
+	      });
+	      applyBackgroundDotFloat();
+	    }, 900);
 		
 	    // Register global edit/delete handlers for dot card buttons
 
@@ -13061,9 +14738,9 @@
 		     window._agntFlakeTestDone = true;
 		     window._agntFlakeTestMode = true;  // ← flip to true to test
 		     window._agntFlakeImages   = [
-		       { id: 'img_001', src: 'https://picsum.photos/seed/alpha/400/200' },
-		       { id: 'img_002', src: 'https://picsum.photos/seed/beta/400/200'  },
-		       { id: 'img_003', src: 'https://picsum.photos/seed/gamma/400/200' },
+			   { id: 'img_002', src: 'https://cdn.jsdelivr.net/gh/newauth/site@main/img/62ed4256-de8b-480c-96f7-cd350d6114d8.jpg'  },
+		       { id: 'img_001', src: 'https://cdn.jsdelivr.net/gh/newauth/site@main/img/b0ce718f-56d5-4d4c-a281-cb8a4ee4bafa.jpg' },
+
 		     ];
 		     if (window._agntFlakeTestMode) {
 		       var testWatcher = compositions[0]?._composite?.worker
@@ -14411,6 +16088,60 @@
       shareToken: parts[agntsIdx + 2] || null,
     };
   }
+  
+  function getAgentBadge(compositionItem) {
+    const tier = getAgentTier(compositionItem);
+    
+    // Privacy signal — where is AI currently running
+    const classifier = compositionItem._composite?.worker
+      ?.find(w => w.workerType === 'classifier');
+    const isLocal = !classifier || 
+      classifier.provider === 'webllm' || 
+      classifier.provider === 'local' ||
+      classifier._smartProvider === 'webllm';
+    
+    const privacyHint = isLocal 
+      ? '🔒 running locally' 
+      : '☁️ using cloud AI';
+
+    const tiers = {
+      '-1': { 
+        badge: '🌐 No AI needed', 
+        hint:  'Watches for changes only — no AI required',
+        color: { bg: '#f0fdf4', text: '#166534', border: '#bbf7d0' }
+      },
+      '0': { 
+        badge: '⚡ Works with small AI', 
+        hint:  'Any 1B+ model works — free WebLLM or free cloud',
+        color: { bg: '#f0fdf4', text: '#166534', border: '#bbf7d0' }
+      },
+      '1': { 
+        badge: '🤖 Needs mid-size AI', 
+        hint:  '7B+ model recommended — free options available locally or via cloud',
+        color: { bg: '#fffbeb', text: '#92400e', border: '#fde68a' }
+      },
+      '2': { 
+        badge: '🧠 Needs capable AI', 
+        hint:  'Reasoning model recommended — run locally with Llama 70B or use cloud',
+        color: { bg: '#fff7ed', text: '#c2410c', border: '#fed7aa' }
+      },
+      '3': { 
+        badge: '💡 Needs advanced AI', 
+        hint:  'Strong model required — GPT-4 class locally or via cloud',
+        color: { bg: '#fdf4ff', text: '#7e22ce', border: '#e9d5ff' }
+      }
+    };
+
+    const t = tiers[String(tier)] || tiers['1'];
+
+    return {
+      badge:       t.badge,
+      hint:        t.hint,
+      privacyHint,
+      color:       t.color,
+      tier
+    };
+  }
 
 
   /* ─────────────────────────────────────────────────────────────────────────────
@@ -14470,11 +16201,22 @@
 	         : estTokensPerDay) + ' tokens/day'
 	     : 'Minimal token use';
 
-	   var webllmBadge = canRunOnWebLLM
-	     ? '<span style="font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;' +
-	         'background:#f0fdf4;color:#166534;border:1px solid #bbf7d0;">🧠 Runs free in browser</span>'
-	     : '<span style="font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;' +
-	         'background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;">☁️ Needs API key</span>';
+		 const agentBadge = getAgentBadge(comp);
+
+		 var webllmBadge = `
+		   <div style="display:flex;flex-direction:column;gap:4px;">
+		     <span style="font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;
+		       background:${agentBadge.color.bg};color:${agentBadge.color.text};
+		       border:1px solid ${agentBadge.color.border};">
+		       ${agentBadge.badge}
+		     </span>
+		     <span style="font-size:9px;color:rgba(26,26,46,0.45);padding:0 2px;">
+		       ${agentBadge.hint}
+		     </span>
+		     <span style="font-size:9px;color:rgba(26,26,46,0.35);padding:0 2px;">
+		       ${agentBadge.privacyHint}
+		     </span>
+		   </div>`;
 	  
 		 var templates = (typeof getCompositionTemplates === 'function')
 		   ? getCompositionTemplates(orchestrator) : {};

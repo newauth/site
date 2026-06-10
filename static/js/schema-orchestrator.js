@@ -552,7 +552,7 @@ class DatabaseService {
 	
 
 	async getAppData(appId, forcePath = null, options = {}) {
-		console.log('[CCC getAppData] called from:', new Error().stack.split('\n')[2]);
+		console.log('[ getAppData] called from:', new Error().stack.split('\n')[2]);
 	    if (this.useLocalStorage) {
 	        const res = await this.storage.get('app_data_' + appId);
 	        return res ? JSON.parse(res.value) : { items: [] };
@@ -772,6 +772,7 @@ class DatabaseService {
 	    this._invalidateAppDataCache();
 	    return true;
 	}
+	
 	
 
 
@@ -1143,6 +1144,16 @@ class SchemaOrchestrator {
 					    { bypassCache: true } );
 					
 					console.log('[TTT init] this.data after fetch:', JSON.stringify(this.data).substring(0, 300));
+					
+					// ✅ Poll: no creator entity yet — show onboarding
+					if (this.currentApp?.id === 'poll' && 
+					    !isowner &&
+					    (!this.data?.items?.length || !this.data?.items?.[0]?.ID)) {
+					    this.render();
+					    this.updateBreadcrumb();
+					    this.showCreateTenantOption();
+					    return;
+					}
 
 		            // ✅ items[0] is always the entity we requested
 		            const entityType = this.currentApp.hierarchy[0];
@@ -1162,21 +1173,35 @@ class SchemaOrchestrator {
 
 		            console.log('[init] currentPath set:', this.currentPath);
 		        }
-
 				// ✅ DEEP LINKS (depth >= 2)
 				else {
 				    await this.handleIncomingDeepLink();
-				    
-				    // ✅ Fetch data for the deepest entity in path
+
 				    if (this.currentPath.length > 0) {
-				        const pathContext = this.currentPath.map(p => p.displayID);
+				        let pathContext = this.currentPath.map(p => p.displayID);
+						
+						// ✅ Poll at depth 2: fetch from creator level to get assembled answers
+						if (this.currentApp.id === 'poll' && pathContext.length === 2) {
+						    pathContext = [pathContext[0]]; // fetch creator level — server assembles full tree
+						}
+						
 				        this.data = await this.db.getAppData(
-				            this.currentApp.id, 
+				            this.currentApp.id,
 				            pathContext,
 				            { bypassCache: true }
 				        );
 				        console.log('[init] deep link data fetched, items:', this.data?.items?.length);
 				    }
+
+				    // ✅ Poll app: ensure device identity exists silently on arrival
+				    if (this.currentApp.id === 'poll') {
+				        this._getPollUserId(); // generates and stores if not present, no UI
+				    }
+				}
+				
+				// ✅ Poll app: ensure poll_user_id exists before context save
+				if (this.currentApp?.id === 'poll') {
+				    this._getPollUserId();
 				}
 
 		        // ✅ Save context if applicable
@@ -1215,6 +1240,386 @@ class SchemaOrchestrator {
 		    }
 
 		    console.log('[init] COMPLETE - Final currentPath:', this.currentPath);
+		}
+		
+		// ─── POLL: get or create persistent user ID ───────────────────────────────────
+		_getPollUserId() {
+		    let id = localStorage.getItem('poll_user_id');
+		    if (!id) {
+		        id = this.db.generateUUID();
+		        localStorage.setItem('poll_user_id', id);
+		    }
+		    return id;
+		}
+		
+		_getCurrentPoll() {
+		    if (this.currentApp?.id !== 'poll' || this.currentPath.length < 2) return null;
+		    const pollDisplayID = this.currentPath[1]?.displayID;
+		    return this.data?.items?.find(i => i.entityType === 'poll')
+		        || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
+		        || this.data?.items?.[0]?.polls?.[0];
+		}
+		
+		// ─── POLL: cast a vote ────────────────────────────────────────────────────────
+		async castVote(answerId, answerDisplayId, answerText) {
+		    if (!this.currentApp || this.currentApp.id !== 'poll') return;
+
+		    const creatorDisplayID = this.currentPath[0]?.displayID;
+		    const pollDisplayID    = this.currentPath[1]?.displayID;
+		    if (!creatorDisplayID || !pollDisplayID) return;
+
+		    const voterId = this._getPollUserId();
+		    const voterDisplayId = this.db.hashUUID(voterId);
+
+		    // ✅ Read full tree BEFORE fresh poll fetch — needed for answer lookup
+		    const fullTreePoll = this.data?.items?.find(i => i.entityType === 'poll')
+		        || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
+		        || this.data?.items?.[0]?.polls?.[0];
+
+		    // Fresh poll fetch for close enforcement
+		    let poll = fullTreePoll;
+		    try {
+		        const fresh = await this.db.getAppData(
+		            'poll', [creatorDisplayID, pollDisplayID], { bypassCache: true }
+		        );
+		        poll = fresh?.items?.[0] || poll;
+		    } catch (e) {
+		        console.warn('[castVote] Could not fetch fresh poll, using cached', e);
+		    }
+
+		    // Close enforcement
+		    const isPollClosed =
+		        poll.status === 'closed' ||
+		        (poll.closeMode === 'scheduled' && poll.closeAt &&
+		            Date.now() > new Date(poll.closeAt).getTime()) ||
+		        (poll.closeMode === 'vote_limit' && poll.voteLimit &&
+		            (poll.voteCount || 0) >= parseInt(poll.voteLimit));
+
+		    if (isPollClosed) {
+		        if (poll.status !== 'closed') {
+		            try {
+		                const pollPath = ['apps', 'poll', creatorDisplayID, pollDisplayID].join('/');
+		                await this.db.saveEntityData(pollPath, { ...poll, status: 'closed' }, true);
+		            } catch (e) {}
+		        }
+		        this.showNotification('⚠️ This poll is closed — no more votes accepted.', 'error');
+		        this.render();
+		        return;
+		    }
+
+		    const voteMode = poll?.voteMode || 'single';
+
+		    // ✅ Check if voter already voted using localStorage
+		    const votedKey = `poll_voted_${pollDisplayID}`;
+		    let votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
+
+		    // ✅ Changeable mode: ensure only one entry — clean up stale entries
+		    if (voteMode === 'changeable' && Object.keys(votedAnswers).length > 1) {
+		        const entries = Object.entries(votedAnswers);
+		        const mostRecent = entries.sort((a, b) => 
+		            (b[1].timestamp || 0) - (a[1].timestamp || 0)
+		        )[0];
+		        votedAnswers = { [mostRecent[0]]: mostRecent[1] };
+		        localStorage.setItem(votedKey, JSON.stringify(votedAnswers));
+		    }
+
+		    // voteMode enforcement
+		    if (voteMode === 'single' && Object.keys(votedAnswers).length > 0) {
+		        this.showNotification('⚠️ You have already voted on this poll.', 'error');
+		        return;
+		    }
+		    if (voteMode === 'multi' && votedAnswers[answerId]?.voteId) {
+		        this.showNotification('⚠️ You have already voted for this option.', 'error');
+		        return;
+		    }
+		    if (voteMode === 'changeable' && votedAnswers[answerId]) {
+		        this.showNotification('⚠️ You already chose this option.', 'error');
+		        return;
+		    }
+
+		    // ✅ Changeable — get single previous entry
+		    const prevEntry = voteMode === 'changeable' && Object.keys(votedAnswers).length > 0
+		        ? Object.values(votedAnswers)[0]
+		        : null;
+		    const supersedesId = prevEntry?.voteId || null;
+
+		    // ✅ Changeable — decrement hit on previous answer using full tree data
+		    if (prevEntry?.answerDisplayId && prevEntry.answerDisplayId !== answerDisplayId) {
+		        try {
+		            const prevAnswerItem = fullTreePoll?.answers?.find(a =>
+		                a.displayID === prevEntry.answerDisplayId
+		            );
+		            if (prevAnswerItem) {
+		                const prevAnswerPath = [
+		                    'apps', 'poll',
+		                    creatorDisplayID, pollDisplayID,
+		                    prevEntry.answerDisplayId
+		                ].join('/');
+		                await this.db.saveEntityData(prevAnswerPath, {
+		                    ...prevAnswerItem,
+		                    hit: Math.max(0, (prevAnswerItem.hit || 0) - 1)
+		                }, true);
+		                console.log('[castVote] decremented hit on:', prevEntry.answerDisplayId);
+		            }
+		        } catch (e) {
+		            console.warn('[castVote] Could not decrement previous answer hit:', e);
+		        }
+		    }
+
+		    // Write new vote
+		    const rawVoteUUID   = this.db.generateUUID();
+		    const voteDisplayID = this.db.hashUUID(rawVoteUUID);
+
+		    const voteItem = {
+		        ID:         rawVoteUUID,
+		        displayID:  voteDisplayID,
+		        entityType: 'vote',
+		        voterId:    voterId,
+		        supersedes: supersedesId,
+		        dotLabel:   voterDisplayId.substring(0, 3).toUpperCase(),
+		        timestamp:  Date.now(),
+		        hashed:     false
+		    };
+
+		    const votePath = [
+		        'apps', 'poll',
+		        creatorDisplayID, pollDisplayID,
+		        answerDisplayId, voteDisplayID
+		    ].join('/');
+
+		    try {
+		        await this.db.saveEntityData(votePath, voteItem, false);
+
+		        // ✅ Store only current vote — replace entire entry for changeable
+		        localStorage.setItem(votedKey, JSON.stringify({
+		            ...(voteMode !== 'changeable' ? votedAnswers : {}),
+		            [answerId]: {
+		                voteId:          voteDisplayID,
+		                votePath:        votePath,
+		                answerDisplayId: answerDisplayId,
+		                timestamp:       Date.now()
+		            }
+		        }));
+
+		        // Re-fetch from creator level
+		        const pathContext = this.currentPath.map(p => p.displayID);
+		        const fetchContext = this.currentApp.id === 'poll' && pathContext.length === 2
+		            ? [pathContext[0]]
+		            : pathContext;
+		        this.data = await this.db.getAppData('poll', fetchContext, { bypassCache: true });
+		        this.render();
+
+		        // ✅ Vote feedback pulse
+		        requestAnimationFrame(() => {
+		            const dots = document.querySelectorAll('.dot');
+		            const votedDot = Array.from(dots).find(d =>
+		                d.itemData?.displayID === answerDisplayId ||
+		                d.itemData?.ID === answerId
+		            );
+		            if (!votedDot) return;
+		            let count = 0;
+		            const pulse = () => {
+		                if (count >= 3) {
+		                    votedDot.style.transform = '';
+		                    votedDot.style.transition = '';
+		                    return;
+		                }
+		                votedDot.style.transition = 'transform 0.15s ease-in-out';
+		                votedDot.style.transform = count % 2 === 0 ? 'scale(1.3)' : 'scale(0.9)';
+		                count++;
+		                setTimeout(pulse, 150);
+		            };
+		            pulse();
+		        });
+
+		        this.showNotification(supersedesId ? '✅ Vote changed!' : '✅ Vote added!', 'success');
+
+		    } catch (err) {
+		        console.error('[castVote] failed:', err);
+		        this.showNotification('❌ Failed to cast vote. Please try again.', 'error');
+		    }
+		}
+
+		// ─── POLL: add menu ───────────────────────────────────────────────────────────
+		_openPollAddMenu() {
+		    const depth = this.currentPath.length;
+
+		    // Depth 3 — answer view, votes cast from poll view
+		    if (depth === 3) {
+		        this.showNotification('💡 Votes are cast by clicking an answer dot on the poll view.', 'info');
+		        return;
+		    }
+
+		    // Depth 1 — creator view, adding polls
+		    if (depth === 1) {
+		        this.openAddDialog('poll');
+		        return;
+		    }
+
+		    // Depth 2 — poll view
+		    if (depth === 2) {
+				const pollDisplayID = this.currentPath[1]?.displayID;
+				const poll = this.data?.items?.find(i => i.entityType === 'poll')
+				    || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
+				    || this.data?.items?.[0]?.polls?.[0];
+				const answerMode = poll?.answerMode || 'owner_defined';
+		        const canAddAnswer = isowner || answerMode === 'voter_added' || answerMode === 'both';
+
+		        if (this.isDataOwner()) {
+		            this._showPollAddPicker([
+		                {
+		                    label: '💬 Add Answer',
+		                    desc: 'Add an option voters can choose',
+		                    action: () => this.openAddDialog('answer')
+		                },
+						{
+						    label: '📨 Invite Voters',
+						    desc: 'Share via WhatsApp, Telegram, email or link',
+						    action: () => {
+						        // Use existing share popup — anchor to center of canvas
+						        const canvas = document.getElementById('canvas-area');
+						        this.showSharePopup(canvas);
+						    }
+						}
+		            ]);
+		        } else if (canAddAnswer) {
+		            // Check if contributor has email stored
+		            const pollDisplayID = this.currentPath[1]?.displayID;
+		            const contributorKey = `poll_contributor_${pollDisplayID}`;
+		            const stored = (() => {
+		                try { return JSON.parse(localStorage.getItem(contributorKey)); }
+		                catch (e) { return null; }
+		            })();
+
+		            if (stored?.email) {
+		                this.openAddDialog('answer');
+		            } else {
+		                this._showPollContributorEmailModal(() => this.openAddDialog('answer'));
+		            }
+		        } else {
+		            this.showNotification('💡 The poll creator has disallowed new answer options.', 'info');
+		        }
+		    }
+		}
+
+		// ─── POLL: add picker menu ────────────────────────────────────────────────────
+		_showPollAddPicker(options) {
+		    document.getElementById('poll-add-picker')?.remove();
+
+		    const canvas = document.getElementById('canvas-area');
+		    const rect = canvas.getBoundingClientRect();
+
+		    const picker = document.createElement('div');
+		    picker.id = 'poll-add-picker';
+		    picker.style.cssText = `
+		        position: fixed;
+		        left: ${rect.left + rect.width / 2}px;
+		        top: ${rect.top + rect.height / 2 - 60}px;
+		        transform: translateX(-50%);
+		        background: white; border-radius: 12px;
+		        box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+		        border: 1px solid #eee; z-index: 5000;
+		        overflow: hidden; min-width: 240px;
+		    `;
+
+		    options.forEach(opt => {
+		        const row = document.createElement('div');
+		        row.style.cssText = `
+		            padding: 14px 18px; cursor: pointer;
+		            border-bottom: 1px solid #f0f0f0;
+		            transition: background 0.15s;
+		        `;
+		        row.innerHTML = `
+		            <div style="font-size:14px;font-weight:600;color:#2d3436;">${opt.label}</div>
+		            <div style="font-size:12px;color:#999;margin-top:2px;">${opt.desc}</div>
+		        `;
+		        row.onmouseenter = () => row.style.background = '#f8f8f8';
+		        row.onmouseleave = () => row.style.background = 'white';
+		        row.onclick = () => { picker.remove(); opt.action(); };
+		        picker.appendChild(row);
+		    });
+
+		    document.body.appendChild(picker);
+
+		    setTimeout(() => {
+		        document.addEventListener('click', function handler(e) {
+		            if (!picker.contains(e.target)) {
+		                picker.remove();
+		                document.removeEventListener('click', handler);
+		            }
+		        });
+		    }, 100);
+		}
+
+		// ─── POLL: contributor email modal (for voter-added answers) ──────────────────
+		_showPollContributorEmailModal(onSuccess) {
+		    document.getElementById('poll-contributor-modal')?.remove();
+
+		    const pollDisplayID = this.currentPath[1]?.displayID;
+		    const contributorKey = `poll_contributor_${pollDisplayID}`;
+
+		    const overlay = document.createElement('div');
+		    overlay.id = 'poll-contributor-modal';
+		    overlay.style.cssText = `
+		        position: fixed; inset: 0; z-index: 9999;
+		        background: rgba(0,0,0,0.45); backdrop-filter: blur(4px);
+		        display: flex; align-items: center; justify-content: center;
+		    `;
+
+		    overlay.innerHTML = `
+		        <div style="
+		            background: #1a1a2e; border: 1px solid #333;
+		            border-radius: 16px; padding: 32px 28px; width: 340px;
+		            box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+		            font-family: system-ui, sans-serif; color: #fff;
+		        ">
+		            <div style="font-size:18px;font-weight:700;margin-bottom:8px;">Add your answer</div>
+		            <div style="font-size:13px;color:#aaa;margin-bottom:24px;">
+		                We need your email so the poll creator can credit your suggestion.
+		            </div>
+		            <label style="font-size:13px;color:#aaa;display:block;margin-bottom:8px;">Your email</label>
+		            <input id="contributor-email-input" type="email" placeholder="you@example.com" style="
+		                width:100%;box-sizing:border-box;padding:11px 13px;
+		                border-radius:8px;border:1px solid #444;
+		                background:#0f0f1a;color:#fff;font-size:14px;
+		                outline:none;margin-bottom:8px;
+		            "/>
+		            <div id="contributor-email-error" style="color:#ff6b6b;font-size:12px;min-height:18px;margin-bottom:16px;"></div>
+		            <button id="contributor-email-submit" style="
+		                width:100%;padding:12px;border-radius:8px;
+		                background:linear-gradient(135deg,#667eea,#764ba2);
+		                border:none;color:#fff;font-size:14px;
+		                font-weight:600;cursor:pointer;
+		            ">Continue</button>
+		            <button id="contributor-email-cancel" style="
+		                width:100%;padding:10px;margin-top:8px;border-radius:8px;
+		                background:none;border:1px solid #444;color:#aaa;
+		                font-size:13px;cursor:pointer;
+		            ">Cancel</button>
+		        </div>
+		    `;
+
+		    document.body.appendChild(overlay);
+
+		    const emailInput = overlay.querySelector('#contributor-email-input');
+		    const submitBtn  = overlay.querySelector('#contributor-email-submit');
+		    const cancelBtn  = overlay.querySelector('#contributor-email-cancel');
+		    const errorDiv   = overlay.querySelector('#contributor-email-error');
+
+		    emailInput.focus();
+		    emailInput.addEventListener('keydown', e => { if (e.key === 'Enter') submitBtn.click(); });
+		    cancelBtn.addEventListener('click', () => overlay.remove());
+
+		    submitBtn.addEventListener('click', () => {
+		        const email = emailInput.value.trim().toLowerCase();
+		        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+		            errorDiv.textContent = 'Please enter a valid email address.';
+		            return;
+		        }
+		        localStorage.setItem(contributorKey, JSON.stringify({ email }));
+		        overlay.remove();
+		        onSuccess();
+		    });
 		}
 		
 		updateCurrentPathWithRealNames() { 
@@ -1378,13 +1783,23 @@ class SchemaOrchestrator {
 		    console.log('Final currentPath:', this.currentPath.map(p => ({ id: p.id?.substring(0,8) || 'N/A', name: p.shortName  })));
 		}
 		
+		_onCreateTenantClick() {
+		    
+		    this.currentPath = [];
+		    this.openAddDialog(this.currentApp?.hierarchy?.[0]);
+		}
+		
 		showCreateTenantOption() {
-		    console.log('showCreateTenantOption called!');
+		    console.log('showCreateTenantOption called!');			
 		    
 		    const container = document.getElementById('canvas-area');
 		    if (container) {
 		        const appName = this.currentApp?.name || 'the app';
 				const entity = this.currentApp?.hierarchy[0] || '';
+				
+				const btnLabel = this.currentApp?.id === 'poll' 
+				    ? 'Set up my poll space' 
+				    : 'Create guest account';
 		        
 		        container.innerHTML = `
 		            <div style="
@@ -1420,7 +1835,7 @@ class SchemaOrchestrator {
 		                </p>
 		                
 		                <button 
-		                    onclick="window.app.openAddDialog()" 
+		                    onclick="window.app._onCreateTenantClick()" 
 		                    class="btn btn-primary"
 		                    style="
 		                        background: #667eea;
@@ -1436,7 +1851,7 @@ class SchemaOrchestrator {
 		                    onmouseover="this.style.background='#5a6fd8'"
 		                    onmouseout="this.style.background='#667eea'"
 		                >
-		                    Create guest account
+		                    ${btnLabel}
 		                </button>
 		            </div>
 		        `;
@@ -1659,23 +2074,33 @@ class SchemaOrchestrator {
 	        return ctxNormalized === currentNormalized && ctx.isOwnerAccess;
 	    });
 	    
-	    // Save ONLY if: no existing owner context AND (non-owner OR real UUID detected)
-	    const shouldSave = !existingOwnerContext && (!isowner || hasRealUuidInUrl);
-	    
-	    if (shouldSave) {
-	        const newContext = {
-	            path: pathIds,
-	            timestamp: Date.now(),
-	            isOwnerAccess: hasRealUuidInUrl
-	        };
-	        
-	        const updated = [newContext, ...existingContexts.slice(0, 9)];
-	        localStorage.setItem(`savedContexts_${appId}`, JSON.stringify(updated));
-	        
-	        console.log('[Context] ✅ SAVED:', {appId, path: pathIds, isOwnerAccess: hasRealUuidInUrl, total: updated.length });
-	    } else if (existingOwnerContext) {
-	        console.log('[Context] ℹ️ SKIPPED - owner context exists');
-	    }
+		// Save ONLY if: no existing owner context AND (non-owner OR real UUID detected)
+		const shouldSave = !existingOwnerContext && (!isowner || hasRealUuidInUrl);
+
+		// ✅ Poll app: detect owner via poll_user_id match
+		let isPollOwnerMatch = false;
+		if (appId === 'poll' && !hasRealUuidInUrl) {
+		    const userId = localStorage.getItem('poll_user_id');
+		    if (userId) {
+		        isPollOwnerMatch = this.db.hashUUID(userId) === currentNormalized;
+		    }
+		}
+
+		if (shouldSave || isPollOwnerMatch) {
+		    const newContext = {
+		        path: pathIds,
+		        timestamp: Date.now(),
+		        isOwnerAccess: hasRealUuidInUrl || isPollOwnerMatch  // ← key change
+		    };
+
+		    const updated = [newContext, ...existingContexts.slice(0, 9)];
+		    localStorage.setItem(`savedContexts_${appId}`, JSON.stringify(updated));
+
+		    console.log('[Context] ✅ SAVED:', {appId, path: pathIds, isOwnerAccess: newContext.isOwnerAccess, total: updated.length });
+		} else if (existingOwnerContext) {
+		    console.log('[Context] ℹ️ SKIPPED - owner context exists');
+		}
+		
 	}
 	
 	async handleIncomingDeepLink() {
@@ -4187,8 +4612,17 @@ class SchemaOrchestrator {
 	}
 
 	getCurrentData() {
-		let current = this.data.items;
-		for (let i = 0; i < this.currentPath.length; i++) {
+	    let current = this.data.items;
+
+	    // ✅ Poll at depth 2: answers are under poll which may be items[0] directly
+	    if (this.currentApp?.id === 'poll' && this.currentPath.length === 2) {
+	        const pollItem = current?.find(item => item.entityType === 'poll') ||
+	                        (current?.[0]?.polls?.[0]) ||
+	                        current?.[0];
+	        return pollItem?.answers || [];
+	    }
+
+	    for (let i = 0; i < this.currentPath.length; i++) {
 			const pathItem = this.currentPath[i];
 			const entityType = this.currentApp.hierarchy[i];
 			const config = this.currentApp.entityConfigs[entityType];
@@ -4222,13 +4656,6 @@ class SchemaOrchestrator {
 	    return firstRootItem.entityType === expectedRootType;
 	}
 	
-	// ✅ CHECK IF WE HAVE FULL HIERARCHY (Browser 1 after initial load)
-	_hasFullDataStructure() {
-	    // Root level has multiple tenants OR deep level has parent with siblings
-	    return this.data?.items?.length > 1 || 
-	           (this.data?.items?.[0]?.entityType && 
-	            this.currentPath.length > 0);
-	}
 
 	// ✅ SURGICAL MERGE: Update ONLY the changed branch
 	_mergePartialIntoFullData(freshPartial, pathContext) {
@@ -4723,13 +5150,21 @@ class SchemaOrchestrator {
 	    const self = this;
 	    console.log('=== RENDER START ===');
 		
+		console.log('[render TOP] data items[0] keys:', Object.keys(this.data?.items?.[0] || {}));
+		console.log('[render TOP] data items[0] answers:', this.data?.items?.[0]?.answers?.length);
+		
 		document.getElementById('context-bar')?.remove();
 
-	    const canvas = document.getElementById('canvas-area');
-	    if (!canvas) { console.error('[Render] No canvas'); return; }
+		const canvas = document.getElementById('canvas-area');
+		if (!canvas) { console.error('[Render] No canvas'); return; }
+		
+		canvas.style.position = 'relative';
 
-	    const rect = canvas.getBoundingClientRect();
-	    if (rect.width === 0 || rect.height === 0) { console.error('[Render] Zero dimensions'); return; }
+		const rect = canvas.getBoundingClientRect();
+		if (rect.width === 0 || rect.height === 0) { console.error('[Render] Zero dimensions'); return; }
+		
+		// ✅ Account for context bar overlay in dot positioning
+		const contextBarHeight = this.currentPath.length > 0 ? 32 : 0;
 
 	    // ── Entity selector mode ──────────────────────────────────────
 	    const isEntitySelectorMode = (
@@ -4763,7 +5198,7 @@ class SchemaOrchestrator {
 		}
 		
 	    canvas.innerHTML = '';
-
+		
 	    // ── Center zone / add button (unchanged) ──────────────────────
 	    const nextEntityType = this.getNextEntityType();
 	    const centerZone = document.createElement('div');
@@ -4781,7 +5216,13 @@ class SchemaOrchestrator {
 	        } else {
 	            hoverText = 'Add new item';
 	        }
-	        const addBtn = self._createAddButton(() => self.openAddDialog());
+			const addBtn = self._createAddButton(() => {
+			    if (self.currentApp?.id === 'poll') {
+			        self._openPollAddMenu();
+			    } else {
+			        self.openAddDialog();
+			    }
+			});
 	        addBtn.style.left = `${rect.width / 2}px`;
 	        addBtn.style.top  = `${rect.height / 2}px`;
 	        addBtn.querySelector('.orb-add-btn').setAttribute('title', hoverText);
@@ -4811,23 +5252,34 @@ class SchemaOrchestrator {
 	            const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
 	            const config = this.currentApp.entityConfigs[currentEntityType];
 	            if (config?.childrenField) items = firstItem[config.childrenField] || [];
-	        } else {
-	            let currentItems = this.data.items;
-	            let currentEntity = null;
-	            for (let i = 0; i < pathDepth; i++) {
-	                const pathItem = this.currentPath[i];
-	                const entityType = this.currentApp.hierarchy[i];
-	                currentEntity = currentItems.find(item =>
-	                    item.ID === pathItem.id ||
-	                    item.displayID === pathItem.displayID ||
-	                    (!pathItem.id.includes('-') && item.ID.includes('-') && this.db.hashUUID(item.ID) === pathItem.id)
-	                );
-	                if (!currentEntity) break;
-	                if (i < pathDepth - 1) {
-	                    const config = this.currentApp.entityConfigs[entityType];
-	                    currentItems = currentEntity[config.childrenField] || [];
-	                }
-	            }
+			} else {
+			    let currentItems = this.data.items;
+			    let currentEntity = null;
+			    for (let i = 0; i < pathDepth; i++) {
+			        const pathItem = this.currentPath[i];
+			        const entityType = this.currentApp.hierarchy[i];
+					
+					if (i === 1) {
+					    console.log('[traversal depth1] polls:', currentItems.map(p => ({displayID: p.displayID, name: p.name})));
+					    console.log('[traversal depth1] looking for:', pathItem.displayID);
+					}
+			        currentEntity = currentItems.find(item =>
+			            item.ID === pathItem.id ||
+			            item.displayID === pathItem.displayID ||
+			            (!pathItem.id.includes('-') && item.ID.includes('-') && this.db.hashUUID(item.ID) === pathItem.id)
+			        );
+			        console.log('[traversal] depth:', i, 'entityType:', entityType, 'looking for:', pathItem.displayID, 'found:', currentEntity?.displayID, currentEntity?.entityType);
+			        if (!currentEntity) break;
+			        if (i < pathDepth - 1) {
+			            const config = this.currentApp.entityConfigs[entityType];
+			            currentItems = currentEntity[config.childrenField] || [];
+			            console.log('[traversal] next items:', currentItems.map(x => ({name: x.name, type: x.entityType})));
+			        }
+			    }
+				
+				console.log('[traversal] final currentEntity:', currentEntity?.displayID, currentEntity?.entityType);
+				console.log('[traversal] childrenField:', this.currentApp.entityConfigs[this.currentApp.hierarchy[pathDepth-1]]?.childrenField);
+				console.log('[traversal] children:', currentEntity?.[this.currentApp.entityConfigs[this.currentApp.hierarchy[pathDepth-1]]?.childrenField]?.map(x => ({name: x.name, type: x.entityType})));
 	            if (currentEntity) {
 	                const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
 	                const config = this.currentApp.entityConfigs[currentEntityType];
@@ -4835,6 +5287,37 @@ class SchemaOrchestrator {
 	            }
 	        }
 	    }
+		
+		// ── POLL app: depth-2 answer dots + voter UX ─────────────────────────────────
+		if (this.currentApp?.id === 'poll' && this.currentPath.length === 2) {
+			
+			console.log('[poll hook] isowner:', typeof isowner, isowner, 'path:', this.currentPath.length);
+			const pollDisplayID = this.currentPath[1]?.displayID;
+			const pollItem = this.data?.items?.find(i => i.entityType === 'poll')
+			    || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
+			    || this.data?.items?.[0]?.polls?.[0];
+
+		    const isPollClosed =
+		        pollItem?.status === 'closed' ||
+		        (pollItem?.closeMode === 'scheduled' && pollItem?.closeAt &&
+		            Date.now() > new Date(pollItem.closeAt).getTime()) ||
+		        (pollItem?.closeMode === 'vote_limit' && pollItem?.voteLimit &&
+		            (pollItem?.voteCount || 0) >= parseInt(pollItem.voteLimit));
+
+		    // Attach vote handlers after dots paint (voter view only)
+		    if (!this.isDataOwner()) {
+		        if (isPollClosed) {
+		            requestAnimationFrame(() => {
+		                const banner = document.createElement('div');
+		                banner.style.cssText = 'position:absolute;top:16px;left:50%;transform:translateX(-50%);background:#333;color:#aaa;padding:8px 20px;border-radius:20px;font-size:13px;z-index:200;pointer-events:none;';
+		                banner.textContent = '🔒 This poll is closed';
+		                canvas.appendChild(banner);
+		            });
+		        } 
+
+				
+		    }
+		}
 
 	    // ── Stress test (unchanged flag) ─────────────────────────────
 	    const STRESS_TEST = false;
@@ -4848,6 +5331,7 @@ class SchemaOrchestrator {
 	        ? items.filter(item => this.shouldShowItemInSearch(item) !== 'hide')
 	        : items;
 
+		console.log('[render] items resolved:', items.map(i => ({name: i.name, entityType: i.entityType})));
 	    const entityType = this.currentApp.hierarchy[this.currentPath.length] || this.currentApp.hierarchy[0];
 
 	    if (!Array.isArray(items) || items.length === 0) {
@@ -4862,12 +5346,16 @@ class SchemaOrchestrator {
 
 		// ── Visual scores ─────────────────────────────────────────────
 		// Full scores for ALL items — used for ranking only
+		console.log('[render] entityType for scoring:', entityType, 'items[0].entityType:', items[0]?.entityType);
+		
 		const visualScores = this.calculateVisualScores(items, entityType);
+		
 		this.renderContextBar(items, entityType, visualScores);
 
 		const { engagementScores, agesInMs, safeHits,
 		        rawValues, isIncomplete, alertThresholdField,
 		        alertDirection, scoreField } = visualScores;
+				
 
 		// ── Ranking — uses full-set engagement scores ─────────────────
 
@@ -4899,10 +5387,21 @@ class SchemaOrchestrator {
 		    pageScoreIndexOf.set(originalIdx, pageIdx);
 		});
 		
-		const margin = Math.min(70, rect.width * 0.08);
+		// ✅ Smart margin — more breathing room for fewer dots
+		const itemCountForMargin = items.length || 1;
+		const baseMarginScale = itemCountForMargin <= 5  ? 0.14
+		                      : itemCountForMargin <= 10 ? 0.11
+		                      : itemCountForMargin <= 20 ? 0.09
+		                      : 0.07;
+		  const margin = Math.min(100, rect.width * baseMarginScale);
+		  const topMargin = margin + contextBarHeight;
 
 		// ── Positions for ALL items ───────────────────────────────────
 		const positions = this.generateDotPositions(items, entityType,margin);
+		
+		if (contextBarHeight > 0) {
+		    positions.forEach(p => { if (p) p.y += contextBarHeight; });
+		}
 
 		// Repel using page dotSizes for foreground, small fixed size for background
 		const allDotSizes = items.map((_, i) => {
@@ -4912,7 +5411,7 @@ class SchemaOrchestrator {
 		});
 		const centerX = rect.width / 2;
 		const centerY = rect.height / 2;
-		const CENTER_CLEAR_RADIUS = 80; // px of breathing room around the + button
+		const CENTER_CLEAR_RADIUS = itemCountForMargin <= 5 ? 50 : 80; // px of breathing room around the + button
 
 		this._repelPositions(positions, allDotSizes, rect.width, rect.height, margin, { 
 		    x: centerX, 
@@ -4955,7 +5454,6 @@ class SchemaOrchestrator {
 		        (rank >= pageEnd && rank < pageEnd + SOFT_BAND)
 		    );
 		    const isBackground = !isForeground && !isSoftBand;
-
 		    try {
 		        const dot = document.createElement('div');
 		        const pos = positions[index];
@@ -4964,7 +5462,7 @@ class SchemaOrchestrator {
 
 		        // ── BACKGROUND ────────────────────────────────────────
 		        if (isBackground) {
-		            const BG_SIZE = 5;
+		            const BG_SIZE = 16;
 		            Object.assign(dot.style, {
 		                position:        'absolute',
 		                left:            `${pos.x - BG_SIZE / 2}px`,
@@ -4985,6 +5483,7 @@ class SchemaOrchestrator {
 		                this.render();
 		            });
 		            canvas.appendChild(dot);
+										
 		            return;
 		        }
 
@@ -4999,7 +5498,7 @@ class SchemaOrchestrator {
 				    : engagementScores[index];
 				const dotSize      = pageIdx !== undefined
 				    ? pageScores.dotSizes[pageIdx]
-				    : 12;
+				    : 16;
 				const itemAgeInMs  = pageIdx !== undefined
 				    ? pageScores.agesInMs[pageIdx]
 				    : agesInMs[index];
@@ -5177,6 +5676,36 @@ class SchemaOrchestrator {
 		        }
 
 		        canvas.appendChild(dot);
+				// ── External label for small poll answer dots ─────────────────────────────────
+				if (this.currentApp?.id === 'poll' && 
+				    this.currentPath.length === 2 &&
+				    entityType === 'answer' &&
+				    isForeground &&
+				    finalDotSize < pageScores.dotSizes[0]) {
+				    
+					console.log('[caption] RENDERING for:', item.name, 'pos:', pos.x, pos.y, 'dotSize:', finalDotSize);
+				    const caption = document.createElement('div');
+				    caption.style.cssText = `
+				        position: absolute;
+				        left: ${pos.x}px;
+				        top: ${pos.y + finalDotSize / 2 + 4}px;
+				        transform: translateX(-50%);
+				        font-size: 12px;
+				        color: #636e72;
+				        font-weight: 700;
+				        white-space: nowrap;
+				        pointer-events: none;
+				        z-index: 99;
+				        max-width: 80px;
+				        overflow: hidden;
+				        text-overflow: ellipsis;
+				        text-align: center;
+				    `;
+				    caption.textContent = (item.name || '').length > 10 
+				        ? (item.name || '').substring(0, 10) + '…' 
+				        : (item.name || '');
+				    canvas.appendChild(caption);
+				}
 
 		        // ── Badges (foreground only) ──────────────────────────
 		        if (isForeground) {
@@ -5346,14 +5875,14 @@ class SchemaOrchestrator {
 		    for (let i = 0; i < itemCount; i++) {
 		        const item = items[i];
 
-		        if (childrenField) {
-		            const children = item[childrenField];
-		            if (!Array.isArray(children) || children.length === 0) {
-		                rawValues[i] = null;
-		                isIncomplete[i] = true;
-		                continue;
-		            }
-		        }
+				if (childrenField && sortConfig?.type !== 'field') {
+				    const children = item[childrenField];
+				    if (!Array.isArray(children) || children.length === 0) {
+				        rawValues[i] = null;
+				        isIncomplete[i] = true;
+				        continue;
+				    }
+				}
 
 		        if (sortConfig?.type === 'aggregate') {
 		            const agg = this.calculateAggregate(item, entityType, sortConfig);
@@ -5447,7 +5976,10 @@ class SchemaOrchestrator {
 
 		    const sortedScores = [...engagementScores].sort((a, b) => a - b);
 		    const len = sortedScores.length;
-		    const topThreshold = sortedScores[Math.floor(len * 0.75)] ?? 0;
+		    const topThreshold = Math.max(
+			    sortedScores[Math.floor(len * 0.75)] ?? 0,
+			    0.01  // ✅ Ensure at least some differentiation
+			);
 		    const bottomThreshold = sortedScores[Math.floor(len * 0.25)] ?? 0;
 		    const midThreshold = (topThreshold + bottomThreshold) / 2;
 
@@ -5638,12 +6170,15 @@ class SchemaOrchestrator {
 
 		    const bar = document.createElement('div');
 		    bar.id = 'context-bar';
-		    bar.style.cssText = `
-		        display: flex; align-items: center; justify-content: space-between;
-		        padding: 0 16px; height: 32px; background: #f8f8f8;
-		        border-bottom: 1px solid #eee; font-size: 13px; color: #636e72;
-		        box-sizing: border-box;
-		    `;
+			bar.style.cssText = `
+			    display: flex; align-items: center; justify-content: space-between;
+			    padding: 0 16px; height: 32px; background: rgba(248,248,248,0.95);
+			    border-bottom: 1px solid #eee; font-size: 13px; color: #636e72;
+			    box-sizing: border-box;
+			    position: absolute;
+			    top: 0; left: 0; right: 0;
+			    z-index: 50;
+			`;
 			
 			// ✅ ALWAYS build countEl with datamap hover
 			var countEl = document.createElement('span');
@@ -5736,8 +6271,109 @@ class SchemaOrchestrator {
 			    reconcileBtn.onclick = () => this.openReconcileModal();
 			    bar.appendChild(reconcileBtn);
 			}
+			
+			// ── Poll owner controls ───────────────────────────────────────────────────────
+			if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && this.isDataOwner()) {
+				const pollItem = this.data?.items?.find(i => i.entityType === 'poll')
+				    || this.data?.items?.[0]?.polls?.find(p => p.displayID === this.currentPath[1]?.displayID)
+				    || this.data?.items?.[0]?.polls?.[0];
+			    const isPollClosed =
+			        pollItem?.status === 'closed' ||
+			        (pollItem?.closeMode === 'scheduled' && pollItem?.closeAt &&
+			            Date.now() > new Date(pollItem.closeAt).getTime()) ||
+			        (pollItem?.closeMode === 'vote_limit' && pollItem?.voteLimit &&
+			            (pollItem?.voteCount || 0) >= parseInt(pollItem.voteLimit));
 
-		    breadcrumb.insertAdjacentElement('afterend', bar);
+			    const pollCtrlBtn = document.createElement('button');
+			    pollCtrlBtn.textContent = isPollClosed ? '🔓 Reopen Poll' : '🔒 Close Poll';
+			    pollCtrlBtn.style.cssText = `
+			        background: none; border: 1px solid #b2bec3; border-radius: 12px;
+			        padding: 3px 10px; font-size: 12px; color: #636e72;
+			        cursor: pointer; font-weight: 600; margin-left: 8px;
+			    `;
+			    const hoverColor = isPollClosed ? '#00b894' : '#e17055';
+			    const hoverBg    = isPollClosed ? '#f0fff4' : '#fff0f0';
+			    pollCtrlBtn.onmouseenter = () => {
+			        pollCtrlBtn.style.background = hoverBg;
+			        pollCtrlBtn.style.borderColor = hoverColor;
+			        pollCtrlBtn.style.color = hoverColor;
+			    };
+			    pollCtrlBtn.onmouseleave = () => {
+			        pollCtrlBtn.style.background = 'none';
+			        pollCtrlBtn.style.borderColor = '#b2bec3';
+			        pollCtrlBtn.style.color = '#636e72';
+			    };
+			    pollCtrlBtn.onclick = async () => {
+			        const action = isPollClosed ? 'reopen' : 'close';
+			        if (!confirm(`${action === 'close' ? 'Close' : 'Reopen'} this poll?`)) return;
+			        try {
+			            const creatorDisplayID = this.currentPath[0]?.displayID;
+			            const pollDisplayID    = this.currentPath[1]?.displayID;
+			            const pollPath = ['apps', 'poll', creatorDisplayID, pollDisplayID].join('/');
+						
+						console.log('[close poll] pollItem:', pollItem?.entityType, pollItem?.name, pollItem?.status);
+						console.log('[close poll] pollPath:', pollPath);
+						console.log('[close poll] saving:', JSON.stringify({...pollItem, status: 'closed'}).substring(0, 200));
+			            await this.db.saveEntityData(pollPath, {
+			                ...pollItem,
+			                status: isPollClosed ? 'open' : 'closed'
+			            }, true);
+			            this.showNotification(
+			                isPollClosed ? '🔓 Poll reopened.' : '🔒 Poll closed.', 'success'
+			            );
+						// Re-fetch from creator level to get assembled answers
+						const pathContext = this.currentPath.map(p => p.displayID);
+						const fetchContext = this.currentApp.id === 'poll' && pathContext.length === 2
+						    ? [pathContext[0]]  // fetch creator level — server assembles full tree
+						    : pathContext;
+						this.data = await this.db.getAppData('poll', fetchContext, { bypassCache: true });
+			            this.render();
+			        } catch (e) {
+			            this.showNotification('❌ Failed to update poll status.', 'error');
+			        }
+			    };
+			    bar.appendChild(pollCtrlBtn);
+			}
+			
+			// ── Non-owner: Create your own poll ──────────────────────────────────────────
+			if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && !this.isDataOwner()) {
+			    const createBtn = document.createElement('button');
+			    createBtn.textContent = '✨ Create your own poll';
+			    createBtn.style.cssText = `
+			        background: none; border: 1px solid #b2bec3; border-radius: 12px;
+			        padding: 3px 10px; font-size: 12px; color: #6c5ce7;
+			        cursor: pointer; font-weight: 600; margin-left: 8px;
+			    `;
+			    createBtn.onmouseenter = () => {
+			        createBtn.style.background = '#f0f0ff';
+			        createBtn.style.borderColor = '#6c5ce7';
+			    };
+			    createBtn.onmouseleave = () => {
+			        createBtn.style.background = 'none';
+			        createBtn.style.borderColor = '#b2bec3';
+			    };
+				
+				createBtn.onclick = () => {
+				    const userId = this._getPollUserId();
+				    const displayId = this.db.hashUUID(userId);
+				    
+				    // ✅ Save owner context before navigating so access check passes
+				    const newContext = {
+				        path: [displayId],
+				        timestamp: Date.now(),
+				        isOwnerAccess: true
+				    };
+				    const existing = JSON.parse(localStorage.getItem('savedContexts_poll') || '[]');
+				    const updated = [newContext, ...existing.slice(0, 9)];
+				    localStorage.setItem('savedContexts_poll', JSON.stringify(updated));
+				    
+				    window.location.href = `${window.location.origin}/.apps/poll/${displayId}`;
+				};
+			    bar.appendChild(createBtn);
+			}
+
+			const canvas = document.getElementById('canvas-area');
+			canvas.insertBefore(bar, canvas.firstChild);
 		    updateCanvasHeight();
 		}
 		
@@ -6540,8 +7176,14 @@ class SchemaOrchestrator {
 			            return;
 			        }
 			        
-			        // Only navigate if entity has children
-			        this.navigateTo(item, entityType);
+					// ✅ Poll answer dots at depth 2 — vote instead of navigate
+					if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && entityType === 'answer') {
+					    await this.castVote(item.ID, item.displayID, item.name);
+					    return;
+					}
+
+					// Only navigate if entity has children
+					this.navigateTo(item, entityType);
 			    }
 			});
 	    }
@@ -6580,7 +7222,7 @@ class SchemaOrchestrator {
 	            }
 	        });
 	        
-	        dot.addEventListener('touchend', (e) => {
+	        dot.addEventListener('touchend', async (e) => {
 	            clearTimeout(pressTimer);
 				
 				// COMPOSITE GUARD — add these lines
@@ -6605,6 +7247,12 @@ class SchemaOrchestrator {
 				        // Only navigate if entity supports children
 				        const entityConfig = self.currentApp.entityConfigs[entityType];
 						// In the else block:
+						// ✅ Poll answer dots at depth 2 — vote instead of navigate
+						if (self.currentApp?.id === 'poll' && self.currentPath.length === 2 && entityType === 'answer') {
+						    await self.castVote(item.ID, item.displayID, item.name);
+						    return;
+						}
+
 						if (entityConfig && entityConfig.childrenField) {
 						    self.navigateTo(item, entityType);
 						} else {
@@ -7624,75 +8272,98 @@ class SchemaOrchestrator {
 	        };
 	    }
 	    
-	    // Determine card position based on dot location in viewport
-	    const viewportWidth = window.innerWidth;
-	    const viewportHeight = window.innerHeight;
-	    const dotCenterX = dot.originalPosition.centerX;
-	    const dotCenterY = dot.originalPosition.centerY;
-	    
-	    // Card dimensions
-	    const cardWidth = isMobile ? Math.min(300, viewportWidth - 40) : 280;
-	    const cardPadding = 20; // Safe padding from edges
-	    
-	    // Calculate card position
-	    let cardLeft, cardTop;
-	    let useSafePosition = false;
-		const estimatedCardHeight = 280;
+		// ✅ Render card off-screen first to measure actual dimensions
+		const viewportWidth  = window.innerWidth;
+		const viewportHeight = window.innerHeight;
+		const cardWidth = isMobile ? Math.min(300, viewportWidth - 40) : 280;
+		const cardPadding = 20;
+		
+		const dotCenterX = dot.originalPosition.centerX;
+		const dotCenterY = dot.originalPosition.centerY;
+		
+		const cardContent = isMobile 
+		    ? this.createMobileDotCardContent(item, entityType)
+		    : this.createDotCardContent(item, entityType);
+		dot.innerHTML = cardContent;
+		dot.classList.add('transformed-card');
 
-		const dotSize = parseFloat(dot.style.width) || 20;
+		Object.assign(dot.style, {
+		    position: 'absolute',
+		    left: '-9999px',
+		    top: '-9999px',
+		    width: `${cardWidth}px`,
+		    height: 'auto',
+		    padding: isMobile ? '14px' : '16px',
+		    backgroundColor: 'white',
+		    border: 'none',
+		    borderRadius: isMobile ? '10px' : '12px',
+		    boxShadow: isMobile 
+		        ? '0 4px 20px rgba(0,0,0,0.25)' 
+		        : '0 8px 24px rgba(0,0,0,0.2)',
+		    zIndex: '1001',
+		    cursor: 'default',
+		    fontSize: isMobile ? '13px' : '14px',
+		    color: '#333',
+		    fontWeight: 'normal',
+		    textAlign: 'left',
+		    overflow: 'visible',
+		    display: 'block',
+		    alignItems: 'unset',
+		    justifyContent: 'unset',
+		    whiteSpace: 'normal',
+		    opacity: '1',
+		    pointerEvents: 'auto'
+		});
+
+		// ✅ Measure actual dimensions
+		const actualCardHeight = dot.getBoundingClientRect().height || 180;
+		const actualCardWidth  = dot.getBoundingClientRect().width  || cardWidth;
+
+		// ✅ Now calculate position with real dimensions — all quadrants
+		const dotSize = parseFloat(dot.dataset.originalWidth) || 20;
+		const isRightSide  = dotCenterX > viewportWidth  / 2;
+		const isBottomSide = dotCenterY > viewportHeight / 2;
+
+		let cardLeft, cardTop;
 
 		if (isMobile) {
-		    const isRightSide = dotCenterX > viewportWidth / 2;
-		    const isBottomSide = dotCenterY > viewportHeight / 2;
-
 		    if (isRightSide && isBottomSide) {
-		        // Bottom-right: anchor right edge to dot right, expand left and up
-		        cardLeft = Math.max(cardPadding, dot.originalPosition.left - cardWidth + dotSize);
-		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		        cardLeft = Math.max(cardPadding, dot.originalPosition.left - actualCardWidth + dotSize);
+		        cardTop  = Math.max(cardPadding, dot.originalPosition.top - actualCardHeight + dotSize);
 		    } else if (isRightSide && !isBottomSide) {
-		        // Top-right: anchor right edge to dot right, expand left and down
-		        cardLeft = Math.max(cardPadding, dot.originalPosition.left - cardWidth + dotSize);
-		        cardTop = dot.originalPosition.top;
+		        cardLeft = Math.max(cardPadding, dot.originalPosition.left - actualCardWidth + dotSize);
+		        cardTop  = Math.min(viewportHeight - actualCardHeight - cardPadding, dot.originalPosition.top);
 		    } else if (!isRightSide && isBottomSide) {
-		        // Bottom-left: anchor left edge to dot left, expand right and up
-		        cardLeft = Math.min(viewportWidth - cardWidth - cardPadding, dot.originalPosition.left);
-		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		        cardLeft = Math.min(viewportWidth - actualCardWidth - cardPadding, dot.originalPosition.left);
+		        cardTop  = Math.max(cardPadding, dot.originalPosition.top - actualCardHeight + dotSize);
 		    } else {
-		        // Top-left: anchor left edge to dot left, expand right and down
-		        cardLeft = Math.min(viewportWidth - cardWidth - cardPadding, dot.originalPosition.left);
-		        cardTop = dot.originalPosition.top;
+		        cardLeft = Math.min(viewportWidth - actualCardWidth - cardPadding, dot.originalPosition.left);
+		        cardTop  = Math.min(viewportHeight - actualCardHeight - cardPadding, dot.originalPosition.top);
 		    }
 		} else {
-		    const isRightSide = dotCenterX > viewportWidth / 2;
-		    const isBottomSide = dotCenterY > viewportHeight / 2;
-
 		    if (isRightSide && isBottomSide) {
-		        // Bottom-right: anchor right edge to dot right, expand left and up
-		        cardLeft = dot.originalPosition.left - cardWidth + dotSize;
-		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		        cardLeft = dot.originalPosition.left - actualCardWidth + dotSize;
+		        cardTop  = dot.originalPosition.top  - actualCardHeight + dotSize;
 		    } else if (isRightSide && !isBottomSide) {
-		        // Top-right: anchor right edge to dot right, expand left and down
-		        cardLeft = dot.originalPosition.left - cardWidth + dotSize;
-		        cardTop = dot.originalPosition.top;
+		        cardLeft = dot.originalPosition.left - actualCardWidth + dotSize;
+		        cardTop  = dot.originalPosition.top;
 		    } else if (!isRightSide && isBottomSide) {
-		        // Bottom-left: anchor left edge to dot left, expand right and up
 		        cardLeft = dot.originalPosition.left;
-		        cardTop = dot.originalPosition.top - estimatedCardHeight + dotSize;
+		        cardTop  = dot.originalPosition.top - actualCardHeight + dotSize;
 		    } else {
-		        // Top-left: anchor left edge to dot left, expand right and down
 		        cardLeft = dot.originalPosition.left;
-		        cardTop = dot.originalPosition.top;
+		        cardTop  = dot.originalPosition.top;
 		    }
+
+		    // Edge clamp for desktop
+		    cardLeft = Math.max(cardPadding, Math.min(viewportWidth  - actualCardWidth  - cardPadding, cardLeft));
+		    cardTop  = Math.max(cardPadding, Math.min(viewportHeight - actualCardHeight - cardPadding, cardTop));
 		}
+
+		// ✅ Apply final position in one shot — no jitter
+		dot.style.left = `${cardLeft}px`;
+		dot.style.top  = `${cardTop}px`;
 	    
-	    // Create card content (mobile vs desktop)
-	    const cardContent = isMobile 
-	        ? this.createMobileDotCardContent(item, entityType)
-	        : this.createDotCardContent(item, entityType);
-	    
-	    // Transform dot into card
-	    dot.innerHTML = cardContent;
-	    dot.classList.add('transformed-card');
 		
 	
 		const expandBtn = dot.querySelector('.expand-image-btn');
@@ -7740,15 +8411,25 @@ class SchemaOrchestrator {
 		    }
 		}
 		
-	    if (useSafePosition) {
-	        dot.classList.add('safe-mobile-position');
-	    }
-		
 		// handle stepper buttons
 		dot.querySelectorAll('.stepper-btn').forEach(btn => {
 		    btn.addEventListener('click', async (e) => {
 		        e.stopPropagation();
 		        const fieldName = btn.dataset.field;
+
+		        // ✅ Poll answer voteCount — route through castVote for enforcement
+		        if (this.currentApp?.id === 'poll' && 
+		            fieldName === 'hit' && 
+		            this.currentPath.length === 2) {
+		            if (btn.classList.contains('plus')) {
+		                this.transformCardToDot(dot);
+		                await this.castVote(item.ID, item.displayID, item.name);
+		            } else {
+		                this.showNotification('💡 Votes cannot be removed.', 'info');
+		            }
+		            return;
+		        }
+
 		        const currentVal = parseFloat(item[fieldName]) || 0;
 		        const newVal = btn.classList.contains('plus') 
 		            ? currentVal + 1 
@@ -7784,39 +8465,7 @@ class SchemaOrchestrator {
 		    });
 		});
 	    
-		dot.style.left = `${cardLeft}px`;
-		dot.style.top = `${cardTop}px`;
-
-	    // Apply card styles with smooth transition
-	    Object.assign(dot.style, {
-	        position: 'absolute',
-	        width: isMobile ? `${cardWidth}px` : `${cardWidth}px`,
-	        maxWidth: isMobile ? 'calc(100vw - 40px)' : 'none',
-	        height: 'auto',
-	        maxHeight: isMobile ? 'none' : 'none',
-	        minWidth: 'unset',
-	        padding: isMobile ? '14px' : '16px',
-	        backgroundColor: 'white',
-	        border: 'none',
-	        borderRadius: isMobile ? '10px' : '12px',
-	        boxShadow: isMobile 
-	            ? '0 4px 20px rgba(0,0,0,0.25)' 
-	            : '0 8px 24px rgba(0,0,0,0.2)',
-	        zIndex: '1001',
-	        cursor: 'default',
-	        fontSize: isMobile ? '13px' : '14px',
-	        color: '#333',
-	        fontWeight: 'normal',
-	        textAlign: 'left',
-	        transition: 'width 0.25s ease-out, height 0.25s ease-out, opacity 0.2s ease-out',
-	        overflow: isMobile ? 'visible' : 'visible',
-	        display: 'block',
-	        alignItems: 'unset',
-	        justifyContent: 'unset',
-	        whiteSpace: 'normal',
-	        opacity: '1',
-	        pointerEvents: 'auto'
-	    });
+		
 	    
 	    // Release transformation lock after transition
 	    setTimeout(() => {
@@ -7899,7 +8548,9 @@ class SchemaOrchestrator {
 		        }, 350);
 		    };
 		    
-		    dot.addEventListener('pointerleave', mouseLeaveHandler);
+			setTimeout(() => {
+			    dot.addEventListener('pointerleave', mouseLeaveHandler);
+			}, 150);
 		    dot._mouseLeaveHandler = mouseLeaveHandler;
 		    console.log('[INIT] 💻 Desktop mouse handlers attached');
 		}
@@ -8062,15 +8713,37 @@ class SchemaOrchestrator {
 	            return;
 	        }
 	        
-	        const value = item[field.name];
-	        if (value === undefined || value === null || value === '') return;
+			let value = item[field.name];
+
+			const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+
+			// ✅ Default scoring fields to 0 if undefined — they're always numeric
+			const isScoringField = 
+			    field.name === sortConfig?.scoreField || 
+			    field.name === sortConfig?.aggregateField;
+
+			// Derive voteCount from actual vote children if available
+			if ((value === undefined || value === null) && isScoringField && field.type === 'number') {
+			    // For poll answers, count actual vote children
+			    if (this.currentApp?.id === 'poll' && entityType === 'answer') {
+			        const votes = item.votes || [];
+			        // Count non-superseded votes
+			        const supersededIds = new Set(votes.map(v => v.supersedes).filter(Boolean));
+			        value = votes.filter(v => !supersededIds.has(v.ID)).length;
+			    } else {
+			        value = 0;
+			    }
+			}
+
+			const isEmpty = value === undefined || value === null || value === '';
+			const isZeroNumber = value === 0 && field.type === 'number';
+			if (isEmpty && !isZeroNumber) return;
 	        
 	        // Determine field importance
 	        const isPrimary = field.name === 'name' || field.name === 'title';
 	        const isDescription = field.name === 'description';
 	        const cssClass = isPrimary ? 'primary' : (isDescription ? 'description' : '');
-			
-			const sortConfig = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+
 	        
 	        // Format value
 	        let displayValue = String(value);
@@ -8079,10 +8752,7 @@ class SchemaOrchestrator {
 	        } else if (field.type === 'number') {
 	            displayValue = Number(value).toLocaleString();
 	        }
-			
-			const isScoringField = 
-			    field.name === sortConfig?.scoreField || 
-			    field.name === sortConfig?.aggregateField;
+
 
 			if (field.type === 'number' && isScoringField) {
 			    fieldHTML += `
@@ -8105,6 +8775,62 @@ class SchemaOrchestrator {
 	        
 	    });
 	    
+		// ── Poll answer: vote count + close info ──────────────────────────────────────
+		let pollAnswerHTML = '';
+		if (this.currentApp?.id === 'poll' && entityType === 'answer') {
+		    const voteCount = item.hit || 0;
+			// Find poll from data — try multiple locations
+			const poll = this._currentPoll 
+			    || this.data?.items?.find(i => i.entityType === 'poll')
+			    || this.data?.items?.[0]?.polls?.find(p => 
+			        this.currentPath[1] && (p.ID === this.currentPath[1].id || p.displayID === this.currentPath[1].displayID)
+			    )
+			    || this.data?.items?.[0]?.polls?.[0];
+
+			console.log('[card] poll found:', poll?.name, 'voteCount on answer:', item.voteCount);
+
+		    // Vote count
+		    pollAnswerHTML += `
+		        <div style="margin-top:10px;padding-top:10px;border-top:1px solid #f0f0f0;">
+		            <div style="font-size:13px;color:#636e72;margin-bottom:6px;">
+		                👥 <strong>${voteCount}</strong> vote${voteCount !== 1 ? 's' : ''}
+		            </div>
+		    `;
+
+		    // Close info
+		    if (poll) {
+		        const closeMode = poll.closeMode || 'manual';
+		        if (closeMode === 'scheduled' && poll.closeAt) {
+		            const closeDate = new Date(poll.closeAt);
+		            const formatted = closeDate.toLocaleDateString(undefined, {
+		                month: 'short', day: 'numeric',
+		                hour: '2-digit', minute: '2-digit'
+		            });
+		            pollAnswerHTML += `
+		                <div style="font-size:12px;color:#b2bec3;">
+		                    ⏰ Closes ${formatted}
+		                </div>
+		            `;
+		        } else if (closeMode === 'vote_limit' && poll.voteLimit) {
+		            const remaining = Math.max(0, parseInt(poll.voteLimit) - (poll.voteCount || 0));
+		            pollAnswerHTML += `
+		                <div style="font-size:12px;color:#b2bec3;">
+		                    ⏰ Closes after ${remaining} more vote${remaining !== 1 ? 's' : ''}
+		                </div>
+		            `;
+		        } else if (closeMode === 'manual') {
+		            const status = poll.status || 'open';
+		            pollAnswerHTML += `
+		                <div style="font-size:12px;color:${status === 'closed' ? '#e17055' : '#00b894'};">
+		                    ${status === 'closed' ? '🔒 Poll closed' : '🟢 Poll open'}
+		                </div>
+		            `;
+		        }
+		    }
+
+		    pollAnswerHTML += `</div>`;
+		}
+		
 	    // Build child count
 	    let childCountHTML = '';
 	    const config = this.currentApp.entityConfigs[entityType];
@@ -8139,24 +8865,27 @@ class SchemaOrchestrator {
 	        </div>
 	    `;
 	    
+		const entityAppConfig = this.currentApp?.entityConfigs?.[entityType];
+		const showHeader = !entityAppConfig?.suppressCardHeader;
 	    // Build complete card HTML
-	    return `
-	        <div class="dot-info-card">
-	            <div class="dot-info-header">
-	                <span class="entity-type-badge" 
-	                      style="background: ${typeConfig.bg}; color: ${typeConfig.color};">
-	                    ${typeConfig.label}
-	                </span>
-	                ${actionsHTML}
-	            </div>
-				${imageHTML}
-	            <div class="dot-info-fields">
-	                ${fieldHTML}
-	            </div>
-	            
-	            ${childCountHTML}
-	        </div>
-	    `;
+		return `
+		    <div class="dot-info-card">
+		        ${showHeader ? `
+		        <div class="dot-info-header">
+		            <span class="entity-type-badge" 
+		                  style="background: ${typeConfig.bg}; color: ${typeConfig.color};">
+		                ${typeConfig.label}
+		            </span>
+		            ${actionsHTML}
+		        </div>` : ''}
+		        ${imageHTML}
+		        <div class="dot-info-fields">
+		            ${fieldHTML}
+		        </div>
+		        ${pollAnswerHTML}
+		        ${childCountHTML}
+		    </div>
+		`;
 	}
 	
 	createMobileDotCardContent(item, entityType) {
@@ -9119,9 +9848,9 @@ class SchemaOrchestrator {
 	    this.openAddDialog();
 	}
 	
-	async openAddDialog() {
+	async openAddDialog(overrideEntityType) {
 	    var self = this;
-	    const nextEntityType = this.getNextEntityType();
+	    const nextEntityType = overrideEntityType || this.getNextEntityType();
 	    if (!nextEntityType) {
 	        alert('Maximum nesting level reached');
 	        return;
@@ -9403,7 +10132,7 @@ class SchemaOrchestrator {
 		    const label = document.createElement('label');
 		    label.textContent = field.label + (field.mandatory ? ' *' : '');
 
-		    if (field.writePermission !== 'any') {
+		    if (field.writePermission === 'system') {
 		        const permIndicator = document.createElement('span');
 		        permIndicator.textContent = ' 🔒';
 		        permIndicator.title = `Write permission: ${field.writePermission}`;
@@ -9436,14 +10165,14 @@ class SchemaOrchestrator {
 		            emptyOption.textContent = '-- Select --';
 		            input.appendChild(emptyOption);
 		        }
-		        if (field.options && Array.isArray(field.options)) {
-		            field.options.forEach(option => {
-		                const opt = document.createElement('option');
-		                opt.value = option;
-		                opt.textContent = option;
-		                input.appendChild(opt);
-		            });
-		        }
+				if (field.options && Array.isArray(field.options)) {
+				    field.options.forEach(option => {
+				        const opt = document.createElement('option');
+				        opt.value = option;
+				        opt.textContent = field.optionLabels?.[option] || option;
+				        input.appendChild(opt);
+				    });
+				}
 		        if (!canEdit) {
 		            input.disabled = true;
 		            input.style.backgroundColor = '#f5f5f5';
@@ -9593,16 +10322,23 @@ class SchemaOrchestrator {
 	_injectImportButton(entityType) {
 	    const modal = document.getElementById('add-modal');
 	    if (!modal) return;
-	    if (!this.isDataOwner()) return; // data owners only
+	    if (!this.isDataOwner()) return;
 
-	    // Don't add twice
 	    if (modal.querySelector('.import-csv-btn')) return;
 
 	    const modalTitle = document.getElementById('modal-title');
 	    if (!modalTitle) return;
 
-	    // Wrap title in flex container if not already
-	    modalTitle.style.cssText = 'display:flex; justify-content:space-between; align-items:center;';
+	    // ✅ Wrap existing text in a span so flex space-between works
+	    if (!modalTitle.querySelector('.modal-title-text')) {
+	        const textSpan = document.createElement('span');
+	        textSpan.className = 'modal-title-text';
+	        textSpan.textContent = modalTitle.textContent;
+	        modalTitle.textContent = '';
+	        modalTitle.appendChild(textSpan);
+	    }
+
+	    modalTitle.style.cssText = 'display:flex; justify-content:space-between; align-items:center; width:100%;';
 
 	    const btn = document.createElement('button');
 	    btn.className = 'import-csv-btn';
@@ -9611,9 +10347,10 @@ class SchemaOrchestrator {
 	        background: none; border: 1px solid #6c5ce7; border-radius: 6px;
 	        padding: 4px 10px; font-size: 12px; color: #6c5ce7; cursor: pointer;
 	        display: flex; align-items: center; gap: 4px; font-weight: 600;
+	        margin-left: auto;
 	    `;
 	    btn.innerHTML = `
-	        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" 
+	        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
 	             stroke="currentColor" stroke-width="2">
 	            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
 	            <polyline points="17 8 12 3 7 8"/>
@@ -10477,6 +11214,7 @@ class SchemaOrchestrator {
 
 	    // ✅ Ensure base entity fields
 	    this.ensureBaseEntityFields(newItem, entityType, entityConfig);
+		
 	    const shortName = this.getShortName(newItem, entityType);
 	    this.processItemID(newItem, entityType);
 	    const entityDisplayName = entityConfig.name || entityType;
@@ -10607,29 +11345,45 @@ class SchemaOrchestrator {
 	        ].join('/');
 
 	        console.log('[TTT addItem] newItem before save:', JSON.stringify(newItem).substring(0, 300));
-	        await this.db.saveEntityData(entityPath, newItem, false);
+			await this.db.saveEntityData(entityPath, newItem, false);
 
+			// ✅ Post-save: localStorage persistence (config-driven)
+			const lsConfig = entityConfig.postSaveLocalStorage;
+			if (lsConfig) {
+			    try {
+			        const parent = this.currentPath[this.currentPath.length - 1];
+			        const key = lsConfig.key.replace('${parentDisplayID}', parent?.displayID || '');
+			        const value = {};
+			        lsConfig.fields.forEach(f => {
+			            const [alias, source] = f.includes(':') ? f.split(':') : [f, f];
+			            value[alias] = newItem[source];
+			        });
+			        localStorage.setItem(key, JSON.stringify(value));
+			        console.log('[addItem] localStorage saved:', key);
+			    } catch (e) {
+			        console.warn('[addItem] localStorage save failed:', e);
+			    }
+			}
 
-	        // ✅ Post-save: root level nav/animation
-	        if (isRootLevel) {
+			// ✅ Post-save navigation override (config-driven)
+			const skipNavigation = entityConfig.postSaveNavigation === 'none';
+
+			// ✅ Post-save: root level nav/animation
+			if (isRootLevel) {
 				
 				if (!isowner) {
 				    this.saveLastViewedContext(this.currentApp.id, [newItem.ID]); // hashed for non-owner
 				} 
 
-	            this.confirmDot(newItem.ID);
-	            const dot = document.querySelector(`.dot[data-id="${newItem.ID}"]`);
-	            if (dot) {
-	                await new Promise(resolve => setTimeout(resolve, 700));
-	                dot.style.transform = 'scale(1.5)';
-	                dot.style.boxShadow = '0 12px 35px rgba(102, 126, 234, 0.6)';
-	                dot.style.transition = 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
-	                await new Promise(resolve => setTimeout(resolve, 500));
-	                dot.style.boxShadow = '0 12px 35px rgba(102, 126, 234, 0.3)';
-	                await new Promise(resolve => setTimeout(resolve, 250));
-	                dot.style.boxShadow = '0 12px 35px rgba(102, 126, 234, 0.6)';
-	                await new Promise(resolve => setTimeout(resolve, 350));
-	            }
+				if (!skipNavigation) {
+			        this.confirmDot(newItem.ID);
+			        const dot = document.querySelector(`.dot[data-id="${newItem.ID}"]`);
+			        if (dot) {
+			            await new Promise(resolve => setTimeout(resolve, 700));
+			            dot.style.transform = 'scale(1.5)';
+			            // ... rest of animation
+			        }
+			    }
 
 	            this.currentPath = [{
 	                id: newItem.ID,
@@ -10680,21 +11434,41 @@ class SchemaOrchestrator {
 	            }
 	        }
 
-	        // ✅ Success notification
-	        if (!skipEndNotification) {
-	            const isDirectChild = (this.currentPath.length === 1);
-	            let successMessage;
-	            if (isDirectChild && newItem.contactemail) {
-	                successMessage = `✅ ${entityDisplayName} added successfully! Notification email sent to ${newItem.contactemail}`;
-	            } else {
-	                const parentName = parentItem
-	                    ? (parentItem.name || parentItem.shortName || 'Parent')
-	                    : 'Parent';
-	                successMessage = `✅ ${entityDisplayName} added to ${parentName}!`;
-	            }
-	            this.showNotification(successMessage);
-	            setTimeout(() => this.confirmDot(newItem.ID), 100);
-	        }
+			// ✅ Success notification + post-save navigation
+			if (!skipEndNotification) {
+			    const isDirectChild = (this.currentPath.length === 1);
+			    let successMessage;
+			    if (isDirectChild && newItem.contactemail) {
+			        successMessage = `✅ ${entityDisplayName} added successfully! Notification email sent to ${newItem.contactemail}`;
+			    } else {
+			        const parentName = parentItem
+			            ? (parentItem.name || parentItem.shortName || 'Parent')
+			            : 'Parent';
+			        successMessage = `✅ ${entityDisplayName} added to ${parentName}!`;
+			    }
+			    this.showNotification(successMessage);
+			    setTimeout(() => this.confirmDot(newItem.ID), 100);
+			}
+
+			// ✅ Post-save: re-fetch and re-render in place if navigation suppressed
+			if (skipNavigation) {
+			    let pathContext = this.currentPath.map(p => p.displayID);
+			    // Poll at depth 2: fetch from creator level to get assembled answers
+			    if (this.currentApp.id === 'poll' && pathContext.length === 2) {
+			        pathContext = [pathContext[0]];
+			    }
+			    try {
+			        this.data = await this.db.getAppData(
+			            this.currentApp.id,
+			            pathContext,
+			            { bypassCache: true }
+			        );
+			    } catch (e) {
+			        console.warn('[addItem] skipNavigation re-fetch failed:', e);
+			    }
+			    this.render();
+			    this.updateBreadcrumb();
+			}
 
 	    } catch (error) {
 	        console.error('Error during add:', error);
@@ -10827,9 +11601,9 @@ class SchemaOrchestrator {
 	            input.value = item[field.name] || '';
 	        } else if (field.type === 'select' && Array.isArray(field.options)) {
 	            input = document.createElement('select');
-	            input.innerHTML = field.options.map(o =>
-	                `<option value="${o}" ${item[field.name] === o ? 'selected' : ''}>${o}</option>`
-	            ).join('');
+				input.innerHTML = field.options.map(o =>
+				    `<option value="${o}" ${item[field.name] === o ? 'selected' : ''}>${field.optionLabels?.[o] || o}</option>`
+				).join('');
 	        } else if (field.type === 'checkbox') {
 	            input = document.createElement('input');
 	            input.type = 'checkbox';
@@ -11076,29 +11850,38 @@ class SchemaOrchestrator {
 	    if (depth === 0) {
 	        return this.data.items || [];
 	    }
-	    
-	    // Navigate to the correct depth
+
 	    let currentItems = this.data.items;
 	    for (let i = 0; i < depth; i++) {
-	        if (!currentItems || currentItems.length === 0) {
-	            return [];
-	        }
-	        
+	        if (!currentItems || currentItems.length === 0) return [];
+
 	        const entityType = this.currentApp.hierarchy[i];
 	        const config = this.currentApp.entityConfigs[entityType];
 	        const childrenField = config.childrenField;
-	        
-	        // Flatten all children at this level
+
+	        // ✅ If we have a currentPath entry for this depth, use only that item's children
+	        // instead of flattening ALL items at this level
+	        const pathItem = this.currentPath[i];
+	        if (pathItem) {
+	            const parent = currentItems.find(item =>
+	                item.displayID === pathItem.displayID || item.ID === pathItem.id
+	            );
+	            if (parent) {
+	                currentItems = parent[childrenField] || [];
+	                continue;
+	            }
+	        }
+
+	        // Fallback — flatten all children (original behavior for depth 0 case)
 	        const nextItems = [];
 	        currentItems.forEach(item => {
 	            if (item[childrenField] && Array.isArray(item[childrenField])) {
 	                nextItems.push(...item[childrenField]);
 	            }
 	        });
-	        
 	        currentItems = nextItems;
 	    }
-	    
+
 	    return currentItems;
 	}
 	
@@ -11349,8 +12132,13 @@ class SchemaOrchestrator {
 	    console.log('[Refresh] STARTED - _isRefreshing set to true');
 	    
 	    try {
-	        const pathContext = this.currentPath.map(item => item.displayID);
+	        let pathContext = this.currentPath.map(item => item.displayID);
 	       
+			// ✅ Poll at depth 2: fetch from creator level to get assembled answers
+			if (this.currentApp.id === 'poll' && pathContext.length === 2) {
+			    pathContext = [pathContext[0]];
+			}
+			
 			const freshPartial = await this.db.getAppData(
 			    this.currentApp.id, 
 			    pathContext,

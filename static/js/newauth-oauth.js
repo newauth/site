@@ -481,6 +481,636 @@ async function checkVaultAccess(vaultEntryId) {
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
+   VAULT WORKER — Flake-chained encrypted credential storage
+   Section XX of newauth-oauth.js
+
+   Design:
+   - One global vault for ALL services (github, gmail, etsy, ...)
+   - One packet per flake session — contains all credentials as JSON
+   - Encrypted with AES-GCM, key derived from nonce + forwardCommitment
+   - Key is non-exportable CryptoKey — lives in memory only
+   - Packet stored in IndexedDB — useless without the key
+   - Server stores encrypted packet — zero knowledge, can't decrypt
+   - TTL enforced client-side — key nulled, packet deleted on expiry
+   - Two-phase commit — crash-safe chain rotation
+
+   IndexedDB keys:
+     vault:nonce      — 32 random bytes, base64, stable forever
+     vault:fullflake  — current active fullflake
+     vault:packet     — AES-GCM encrypted creds blob, base64
+     vault:expiresAt  — epoch ms TTL
+
+   Memory only (never persisted):
+     _vaultEncryptKey — CryptoKey (non-exportable), null when locked
+
+   Public API (added to window.newauthOAuth exports):
+     vaultWorker.onFlake(flakeResponse, clicksJson)
+     vaultWorker.getToken(service)
+     vaultWorker.connect(service, tokenData)
+     vaultWorker.disconnect(service)
+     vaultWorker.isLocked()
+     vaultWorker.status()
+     vaultWorker.init()
+   ───────────────────────────────────────────────────────────────────────────── */
+
+var vaultWorker = (function() {
+
+  /* ── In-memory state ──────────────────────────────────────────────────── */
+  var _encryptKey  = null;   // CryptoKey — non-exportable, null when locked
+  var _ttlTimer    = null;   // setInterval handle for TTL enforcer
+
+  /* ── IndexedDB helpers ───────────────────────────────────────────────── */
+  var IDB_NAME    = 'agnts-vault';
+  var IDB_STORE   = 'vault';
+  var IDB_VERSION = 1;
+  var _idb        = null;
+
+  function _openIDB() {
+    if (_idb) return Promise.resolve(_idb);
+    return new Promise(function(resolve, reject) {
+      var req = indexedDB.open(IDB_NAME, IDB_VERSION);
+      req.onupgradeneeded = function(e) {
+        e.target.result.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = function(e) {
+        _idb = e.target.result;
+        resolve(_idb);
+      };
+      req.onerror = function(e) {
+        reject(e.target.error);
+      };
+    });
+  }
+
+  async function _idbGet(key) {
+    var db = await _openIDB();
+    return new Promise(function(resolve, reject) {
+      var tx  = db.transaction(IDB_STORE, 'readonly');
+      var req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = function() { resolve(req.result || null); };
+      req.onerror   = function() { reject(req.error); };
+    });
+  }
+
+  async function _idbSet(key, value) {
+    var db = await _openIDB();
+    return new Promise(function(resolve, reject) {
+      var tx  = db.transaction(IDB_STORE, 'readwrite');
+      var req = tx.objectStore(IDB_STORE).put(value, key);
+      req.onsuccess = function() { resolve(); };
+      req.onerror   = function() { reject(req.error); };
+    });
+  }
+
+  async function _idbDelete(key) {
+    var db = await _openIDB();
+    return new Promise(function(resolve, reject) {
+      var tx  = db.transaction(IDB_STORE, 'readwrite');
+      var req = tx.objectStore(IDB_STORE).delete(key);
+      req.onsuccess = function() { resolve(); };
+      req.onerror   = function() { reject(req.error); };
+    });
+  }
+
+  /* ── Crypto helpers — all WebCrypto, matches JDK SHA-256 exactly ──────── */
+
+  // SHA-256 — UTF-8 encoding matches JDK StandardCharsets.UTF_8
+  async function _sha256(str) {
+    var buf = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(str)
+    );
+    return Array.from(new Uint8Array(buf))
+      .map(function(b) { return b.toString(16).padStart(2, '0'); })
+      .join('');
+  }
+
+  // PBKDF2 — derives AES-GCM key from nonce + commitment
+  // Returns non-exportable CryptoKey
+  async function _deriveKey(nonce, commitment) {
+    var keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(nonce + commitment),
+      { name: 'PBKDF2' },
+      false,
+      ['deriveKey']
+    );
+    return crypto.subtle.deriveKey(
+      {
+        name:       'PBKDF2',
+        salt:       new TextEncoder().encode('agnts-vault-v1'),
+        iterations: 100000,
+        hash:       'SHA-256'
+      },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,               // non-exportable — key bytes never accessible to JS
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  // AES-GCM encrypt — returns base64(iv + ciphertext)
+  async function _encrypt(plaintext, key) {
+    var iv         = crypto.getRandomValues(new Uint8Array(12));
+    var ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv },
+      key,
+      new TextEncoder().encode(plaintext)
+    );
+    var combined = new Uint8Array(iv.length + ciphertext.byteLength);
+    combined.set(iv, 0);
+    combined.set(new Uint8Array(ciphertext), iv.length);
+    return btoa(String.fromCharCode.apply(null, combined));
+  }
+
+  // AES-GCM decrypt — takes base64(iv + ciphertext), returns plaintext string
+  async function _decrypt(base64blob, key) {
+    var combined   = Uint8Array.from(atob(base64blob), function(c) {
+      return c.charCodeAt(0);
+    });
+    var iv         = combined.slice(0, 12);
+    var ciphertext = combined.slice(12);
+    var plaintext  = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv },
+      key,
+      ciphertext
+    );
+    return new TextDecoder().decode(plaintext);
+  }
+
+  /* ── Nonce management ────────────────────────────────────────────────── */
+
+  // Get or create the stable nonce — generated once, stored in IndexedDB
+  async function _getNonce() {
+    var existing = await _idbGet('vault:nonce');
+    if (existing) return existing;
+
+    // First time — generate 32 random bytes
+    var nonce  = crypto.getRandomValues(new Uint8Array(32));
+    var b64    = btoa(String.fromCharCode.apply(null, nonce));
+    await _idbSet('vault:nonce', b64);
+    console.log('[VaultWorker] nonce generated and stored');
+    return b64;
+  }
+
+  /* ── Flake verification ──────────────────────────────────────────────── */
+
+  // Verify server-returned fullflake by recomputing hash client-side
+  // clicksJson is the exact string client sent to server — no re-serialization
+  async function _verifyFlake(flakeResponse, clicksJson) {
+    var hashInput = clicksJson
+      + '|' + (flakeResponse.backwardCommitment || '')
+      + '|' + (flakeResponse.forwardCommitment  || '');
+
+    var computed = await _sha256(hashInput);
+
+    if (computed !== flakeResponse.fullflake) {
+      console.error('[VaultWorker] Flake integrity check FAILED',
+                    'computed:', computed,
+                    'received:', flakeResponse.fullflake);
+      throw new Error('Flake integrity check failed — possible tampering');
+    }
+
+    console.log('[VaultWorker] Flake integrity verified ✅');
+    return true;
+  }
+
+  /* ── Core packet operations ──────────────────────────────────────────── */
+
+  // Read and decrypt the current packet from IndexedDB
+  // Returns parsed creds object or null if vault locked/empty
+  async function _readCreds() {
+    if (!_encryptKey) return null;
+
+    var packet = await _idbGet('vault:packet');
+    if (!packet) return {};  // vault open but no creds yet
+
+    try {
+      var plaintext = await _decrypt(packet, _encryptKey);
+      return JSON.parse(plaintext);
+    } catch(e) {
+      console.error('[VaultWorker] Decrypt failed:', e.message);
+      return null;
+    }
+  }
+
+  // Encrypt and save creds object to IndexedDB
+  async function _writeCreds(creds) {
+    if (!_encryptKey) throw new Error('Vault is locked');
+    var plaintext = JSON.stringify(creds);
+    var encrypted = await _encrypt(plaintext, _encryptKey);
+    await _idbSet('vault:packet', encrypted);
+    return encrypted;
+  }
+
+  /* ── Server sync ─────────────────────────────────────────────────────── */
+
+  // Push current encrypted packet to server — two-phase commit
+  async function _syncToServer(encryptedPacket, fullflake,
+                                backwardCommitment, forwardCommitment,
+                                previousFullflake, ttlDays) {
+    // Phase 1 — store as pending
+    var saveRes = await fetch('/secure/api/vault/save', {
+      method:      'POST',
+      headers:     { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        fullflake:           fullflake,
+        packet:              encryptedPacket,
+        backwardCommitment:  backwardCommitment || '',
+        forwardCommitment:   forwardCommitment,
+        ttlDays:             ttlDays || 30
+      })
+    });
+
+    if (!saveRes.ok) {
+      var err = await saveRes.json().catch(function() { return {}; });
+      throw new Error('Vault save failed: ' + (err.error || saveRes.status));
+    }
+
+    // Phase 2 — commit
+    var commitRes = await fetch('/secure/api/vault/commit', {
+      method:      'POST',
+      headers:     { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        fullflake:         fullflake,
+        previousFullflake: previousFullflake || null
+      })
+    });
+
+    if (!commitRes.ok) {
+      var err2 = await commitRes.json().catch(function() { return {}; });
+      throw new Error('Vault commit failed: ' + (err2.error || commitRes.status));
+    }
+
+    console.log('[VaultWorker] Synced to server fullflake=', fullflake.substring(0, 8));
+  }
+
+  /* ── TTL enforcer ────────────────────────────────────────────────────── */
+
+  function _startTTLEnforcer() {
+    if (_ttlTimer) clearInterval(_ttlTimer);
+
+    _ttlTimer = setInterval(async function() {
+      try {
+        var expiresAt = await _idbGet('vault:expiresAt');
+        if (!expiresAt) return;
+
+        if (Date.now() > parseInt(expiresAt)) {
+          console.log('[VaultWorker] TTL expired — locking vault');
+          await _lockVault();
+        }
+      } catch(e) {
+        console.warn('[VaultWorker] TTL check error:', e.message);
+      }
+    }, 60 * 1000); // check every minute
+  }
+
+  // Lock vault — clear key from memory, delete packet from IndexedDB
+  // Keeps vault:nonce — needed for next flake key derivation
+  async function _lockVault() {
+    _encryptKey = null;
+
+    await _idbDelete('vault:packet');
+    await _idbDelete('vault:expiresAt');
+    // Keep vault:nonce and vault:fullflake —
+    // nonce needed for re-derivation, fullflake needed for chain
+
+    // Notify all vault-dependent watchers
+    _notifyWatchersLocked();
+
+    console.log('[VaultWorker] Vault locked');
+  }
+
+  // Notify watchers that vault is locked — they should pause
+  function _notifyWatchersLocked() {
+    try {
+      var comps = window.app && window.app.data &&
+                  window.app.data.items && window.app.data.items[0] &&
+                  window.app.data.items[0].compositions;
+      if (!comps) return;
+
+      comps.forEach(function(comp) {
+        var workers = comp._composite && comp._composite.worker;
+        if (!workers) return;
+        workers.forEach(function(w) {
+          if (w.workerType === 'watcher' && w.vaultService) {
+            w._requiresFlake  = true;
+            w._pendingFlake   = true;
+            w.watcherActive   = false;
+            console.log('[VaultWorker] Paused vault-dependent watcher:', comp.name);
+          }
+        });
+      });
+    } catch(e) {
+      console.warn('[VaultWorker] Could not notify watchers:', e.message);
+    }
+  }
+
+  /* ── Public API ──────────────────────────────────────────────────────── */
+
+  // init — call on app startup
+  // Checks if vault was previously unlocked (nonce exists)
+  // Does NOT unlock — requires a flake for that
+  async function init() {
+    try {
+      var nonce = await _idbGet('vault:nonce');
+      if (nonce) {
+        console.log('[VaultWorker] Initialized — vault exists, locked until flake');
+      } else {
+        console.log('[VaultWorker] Initialized — no vault yet, will create on first flake');
+      }
+      _startTTLEnforcer();
+    } catch(e) {
+      console.error('[VaultWorker] Init error:', e.message);
+    }
+  }
+
+  // onFlake — called whenever user generates a flake
+  // flakeResponse: { flake, fullflake, backwardCommitment, forwardCommitment, timestamp }
+  // clicksJson: exact string client sent to server for hashing
+  async function onFlake(flakeResponse, clicksJson) {
+    try {
+      console.log('[VaultWorker] onFlake received flake=', flakeResponse.flake);
+
+      // 1. Verify integrity
+      if (clicksJson) {
+        await _verifyFlake(flakeResponse, clicksJson);
+      }
+
+      // 2. Get or create nonce
+      var nonce = await _getNonce();
+
+      // 3. Derive new encrypt key from nonce + forwardCommitment
+      var newEncryptKey = await _deriveKey(nonce, flakeResponse.forwardCommitment);
+
+      // 4. If vault was previously open — re-encrypt existing creds with new key
+      var creds = {};
+      if (_encryptKey) {
+        // Vault was open — read creds with old key
+        creds = await _readCreds() || {};
+        console.log('[VaultWorker] Re-encrypting existing creds with new key');
+      } else if (flakeResponse.backwardCommitment) {
+        // Vault was locked but packet exists on server — fetch and decrypt
+        var currentFullflake = await _idbGet('vault:fullflake');
+        if (currentFullflake) {
+          try {
+            var fetchRes = await fetch(
+              '/secure/api/vault/fetch/' + encodeURIComponent(currentFullflake),
+              { credentials: 'include' }
+            );
+            if (fetchRes.ok) {
+              var serverData = await fetchRes.json();
+              // Derive old decrypt key from nonce + backwardCommitment
+              var oldDecryptKey = await _deriveKey(
+                nonce,
+                flakeResponse.backwardCommitment
+              );
+              var plaintext = await _decrypt(serverData.packet, oldDecryptKey);
+              creds = JSON.parse(plaintext);
+              console.log('[VaultWorker] Recovered creds from server packet');
+            }
+          } catch(e) {
+            console.warn('[VaultWorker] Could not recover server packet:', e.message);
+            creds = {};
+          }
+        }
+      }
+
+      // 5. Set new encrypt key in memory
+      _encryptKey = newEncryptKey;
+
+      // 6. Encrypt creds with new key and store in IndexedDB
+      var encryptedPacket = await _writeCreds(creds);
+
+      // 7. Store TTL
+      var expiresAt = flakeResponse.timestamp
+        ? flakeResponse.timestamp + (30 * 24 * 60 * 60 * 1000)
+        : Date.now()              + (30 * 24 * 60 * 60 * 1000);
+      await _idbSet('vault:expiresAt', String(expiresAt));
+
+      // 8. Sync to server — two-phase commit
+      var previousFullflake = await _idbGet('vault:fullflake');
+      await _syncToServer(
+        encryptedPacket,
+        flakeResponse.fullflake,
+        flakeResponse.backwardCommitment,
+        flakeResponse.forwardCommitment,
+        previousFullflake,
+        30
+      );
+
+      // 9. Store new fullflake
+      await _idbSet('vault:fullflake', flakeResponse.fullflake);
+
+      console.log('[VaultWorker] Vault unlocked ✅ flake=', flakeResponse.flake);
+
+      // 10. Resume vault-dependent watchers
+      _resumeWatchers();
+	  
+	  // Store any credentials that were connected while vault was locked
+	  if (typeof _storePendingVaultCredentials === 'function') {
+	    await _storePendingVaultCredentials().catch(function(e) {
+	      console.warn('[VaultWorker] _storePendingVaultCredentials failed:', e.message);
+	    });
+	  }
+	  
+	  // In vaultWorker.onFlake, after _resumeWatchers():
+	  if (typeof _storePendingVaultCredentials === 'function') {
+	    await _storePendingVaultCredentials();
+	  }
+
+      return true;
+
+    } catch(e) {
+      console.error('[VaultWorker] onFlake error:', e.message);
+      throw e;
+    }
+  }
+
+  // Resume vault-dependent watchers after unlock
+  function _resumeWatchers() {
+    try {
+      var comps = window.app && window.app.data &&
+                  window.app.data.items && window.app.data.items[0] &&
+                  window.app.data.items[0].compositions;
+      if (!comps) return;
+
+      comps.forEach(function(comp) {
+        var workers = comp._composite && comp._composite.worker;
+        if (!workers) return;
+        workers.forEach(function(w) {
+          if (w.workerType === 'watcher' && w.vaultService) {
+            w._requiresFlake = false;
+            w._pendingFlake  = false;
+            console.log('[VaultWorker] Resumed vault-dependent watcher:', comp.name);
+          }
+        });
+      });
+    } catch(e) {
+      console.warn('[VaultWorker] Could not resume watchers:', e.message);
+    }
+  }
+
+  // getToken — returns refresh token for a service, or null if locked
+  // This is the main entry point for watchers
+  async function getToken(service) {
+    if (!_encryptKey) {
+      console.log('[VaultWorker] getToken called but vault is locked');
+      return null;
+    }
+
+    try {
+      var creds = await _readCreds();
+      if (!creds || !creds[service]) {
+        console.log('[VaultWorker] No token for service:', service);
+        return null;
+      }
+      // Return token — creds object goes out of scope after this
+      return creds[service].refreshToken || creds[service].accessToken || null;
+    } catch(e) {
+      console.error('[VaultWorker] getToken error:', e.message);
+      return null;
+    }
+  }
+
+  // connect — add a service credential to the vault
+  // tokenData: { refreshToken?, accessToken?, connectedAt?, ...extra }
+  async function connect(service, tokenData) {
+    if (!_encryptKey) throw new Error('Vault is locked — generate a flake first');
+    if (!service)     throw new Error('Service name required');
+    if (!tokenData)   throw new Error('Token data required');
+
+    try {
+      // Read current creds
+      var creds = await _readCreds() || {};
+
+      // Add/update service
+      creds[service] = Object.assign({}, tokenData, {
+        connectedAt: tokenData.connectedAt || Date.now()
+      });
+
+      // Re-encrypt and save locally
+      var encryptedPacket = await _writeCreds(creds);
+
+      // Sync to server — update path (active packet)
+      var fullflake = await _idbGet('vault:fullflake');
+      if (fullflake) {
+        var res = await fetch('/secure/api/vault/save', {
+          method:      'POST',
+          headers:     { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            fullflake: fullflake,
+            packet:    encryptedPacket
+            // No forwardCommitment — triggers update path on server
+          })
+        });
+        if (!res.ok) {
+          var err = await res.json().catch(function() { return {}; });
+          throw new Error('Server sync failed: ' + (err.error || res.status));
+        }
+      }
+
+      console.log('[VaultWorker] Connected service:', service);
+      return true;
+
+    } catch(e) {
+      console.error('[VaultWorker] connect error:', e.message);
+      throw e;
+    }
+  }
+
+  // disconnect — remove a service credential from the vault
+  async function disconnect(service) {
+    if (!_encryptKey) throw new Error('Vault is locked');
+    if (!service)     throw new Error('Service name required');
+
+    try {
+      var creds = await _readCreds() || {};
+
+      if (!creds[service]) {
+        console.warn('[VaultWorker] Service not found in vault:', service);
+        return false;
+      }
+
+      delete creds[service];
+
+      // Re-encrypt and save locally
+      var encryptedPacket = await _writeCreds(creds);
+
+      // Sync to server — update path
+      var fullflake = await _idbGet('vault:fullflake');
+      if (fullflake) {
+        await fetch('/secure/api/vault/save', {
+          method:      'POST',
+          headers:     { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            fullflake: fullflake,
+            packet:    encryptedPacket
+          })
+        });
+      }
+
+      console.log('[VaultWorker] Disconnected service:', service);
+      return true;
+
+    } catch(e) {
+      console.error('[VaultWorker] disconnect error:', e.message);
+      throw e;
+    }
+  }
+
+  // isLocked — returns true if vault key is not in memory
+  function isLocked() {
+    return _encryptKey === null;
+  }
+
+  // status — returns current vault state for UI display
+  async function status() {
+    try {
+      var fullflake  = await _idbGet('vault:fullflake');
+      var expiresAt  = await _idbGet('vault:expiresAt');
+      var nonce      = await _idbGet('vault:nonce');
+
+      var services = [];
+      if (_encryptKey) {
+        var creds = await _readCreds() || {};
+        services  = Object.keys(creds);
+      }
+
+      return {
+        locked:      !_encryptKey,
+        initialized: !!nonce,
+        services:    services,
+        flake:       fullflake ? fullflake.substring(0, 8) : null,
+        expiresAt:   expiresAt ? parseInt(expiresAt) : null,
+        expiresIn:   expiresAt
+          ? Math.max(0, Math.round((parseInt(expiresAt) - Date.now()) / 1000 / 60 / 60))
+          : null  // hours remaining
+      };
+    } catch(e) {
+      console.error('[VaultWorker] status error:', e.message);
+      return { locked: true, initialized: false, services: [], flake: null };
+    }
+  }
+
+  /* ── Expose public API ───────────────────────────────────────────────── */
+  return {
+    init:         init,
+    onFlake:      onFlake,
+    getToken:     getToken,
+    connect:      connect,
+    disconnect:   disconnect,
+    isLocked:     isLocked,
+    status:       status
+  };
+
+})();
+
+/* ─────────────────────────────────────────────────────────────────────────────
    3. DETECT AUTH REQUIREMENT — heuristic + nano LLM fallback
    ───────────────────────────────────────────────────────────────────────────── */
 
@@ -590,7 +1220,7 @@ function vaultConnect(service, opts) {
     if (opts.byokClientId) params.set('client_id', opts.byokClientId);
     if (opts.scope)        params.set('scope',     opts.scope);
 
-    fetch('/api/connect/' + service + '/init?' + params.toString(),
+    fetch('/newauth/api/connect/' + service + '/init?' + params.toString(),
           { method: 'GET', credentials: 'include' })
       .then(function(res) {
         if (!res.ok) throw new Error('OAuth init failed: ' + res.status);
@@ -645,7 +1275,7 @@ async function _getAccessToken(vaultWorker) {
   if (service === 'github') {
     var creds = await localVault.retrieve(entryId, entry.tier, null);
     if (!creds) throw new Error('[vault] No credentials for ' + entryId);
-    return creds.refreshToken;
+    return creds.accessToken || creds.refreshToken;
   }
 
   /* Retrieve from local vault (throws VAULT_LOCKED if locked and flake cold) */
@@ -657,7 +1287,7 @@ async function _getAccessToken(vaultWorker) {
   if (byokClientId || credentials.clientId)
     body.clientId = byokClientId || credentials.clientId;
 
-  var res = await fetch('/api/connect/' + service + '/refresh', {
+  var res = await fetch('/newauth/api/connect/' + service + '/refresh', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
@@ -682,7 +1312,7 @@ async function _getAccessToken(vaultWorker) {
 async function _getAccessTokenFromServer(entryId, service, byokClientId) {
   /* locked-vault tier — server holds credentials encrypted by flake.
      Browser sends flake proof; server decrypts and returns access token. */
-  var res = await fetch('/api/connect/' + service + '/token', {
+  var res = await fetch('/newauth/api/connect/' + service + '/token', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ entryId: entryId, clientId: byokClientId }),
@@ -981,71 +1611,207 @@ async function _handleEtsyCallback(orchestrator, payload, ctx) {
    Stores tokens in localVault and clears _pendingVault on the watcher.
    ───────────────────────────────────────────────────────────────────────────── */
 
-async function _handleVaultCallback(service, payload, ctx) {
-  try {
-    /* Determine tier from context (default open) */
-    var tier    = ctx.tier || 'open';
-    var entryId = ctx.entryId || null;
+   /* ─────────────────────────────────────────────────────────────────────────────
+      10. _handleVaultCallback — agnts vault post-auth handler
+      Stores tokens in localVault (open/local tier) OR vaultWorker (flake tier).
+      Clears _pendingVault on the watcher either way.
 
-    /* Create or reuse registry entry */
-    var entry = entryId
-      ? vaultRegistry.getById(entryId)
-      : vaultRegistry.getByService(service, payload.email || payload.username || null);
+      Tiers:
+        open   → stored in IndexedDB via localVault (no flake, existing behaviour)
+        local  → stored in IndexedDB via localVault (existing behaviour)
+        flake  → stored in vaultWorker (flake-chained encrypted vault, new)
+      ───────────────────────────────────────────────────────────────────────────── */
 
-    if (!entry) {
-      entry = createVaultRegistryEntry(
-        service,
-        payload.email || payload.username || payload.identifier || null,
-        'oauth2',
-        tier
-      );
-    }
+   async function _handleVaultCallback(service, payload, ctx) {
+     try {
+       var tier    = ctx.tier    || 'open';
+       var entryId = ctx.entryId || null;
 
-    /* Store credentials in IndexedDB (tier-aware, no flake for open tier) */
-    await localVault.store(entry.ID, {
-      refreshToken: payload.refreshToken,
-      accessToken:  payload.accessToken,
-      expiresAt:    Date.now() + (parseInt(payload.expiresIn || 3600) * 1000),
-      scope:        payload.scope    || '',
-      email:        payload.email    || payload.identifier || null,
-      username:     payload.username || payload.identifier || null,
-      clientId:     payload.clientId || null,
-    }, tier, null /* flakeObj — null for open tier */);
+       /* ── Create or reuse registry entry ─────────────────────────────────── */
+       var entry = entryId
+         ? vaultRegistry.getById(entryId)
+         : vaultRegistry.getByService(service, payload.email || payload.username || null);
 
-    /* Update registry */
-    entry.vaultStatus  = 'connected';
-    entry.connectedAt  = Date.now();
-    entry.lastRefresh  = Date.now();
-    entry.lastUpdated  = Date.now();
-    vaultRegistry.upsert(entry);
+       if (!entry) {
+         entry = createVaultRegistryEntry(
+           service,
+           payload.email || payload.username || payload.identifier || null,
+           'oauth2',
+           tier
+         );
+       }
 
-    /* Update watcher _vaultRef to point to registry entry ID */
-    if (ctx.compositionId && window.app) {
-      var compositions = ((window.app.data && window.app.data.items && window.app.data.items[0])
-                          && window.app.data.items[0].compositions) || [];
-      for (var i = 0; i < compositions.length; i++) {
-        if (compositions[i].ID !== ctx.compositionId) continue;
-        var comp    = compositions[i];
-        var workers = (comp._composite && comp._composite.worker) || [];
-        for (var j = 0; j < workers.length; j++) {
-          if (workers[j].workerType === 'watcher' && workers[j]._pendingVault) {
-            workers[j]._vaultRef = entry.ID;
-            clearWatcherPendingVault(workers[j]);
-          }
-        }
-        if (typeof agntUpsertAndSave === 'function') {
-          await agntUpsertAndSave(window.app, comp);
-        }
-        break;
-      }
-    }
+       /* ── Token data shape — shared across both paths ─────────────────────── */
+       var tokenData = {
+         refreshToken: payload.refreshToken  || null,
+         accessToken:  payload.accessToken   || null,
+         expiresAt:    Date.now() + (parseInt(payload.expiresIn || 3600) * 1000),
+         scope:        payload.scope         || '',
+         email:        payload.email         || payload.identifier || null,
+         username:     payload.username      || payload.identifier || null,
+         clientId:     payload.clientId      || null,
+         connectedAt:  Date.now()
+       };
 
-    console.info('[newauthOAuth] Vault connected:', service, entry.identifier, 'tier:', tier);
+       /* ── Store credentials — tier-aware ──────────────────────────────────── */
+       if (tier === 'flake' || tier === 'locked-local') {
+         /* ── FLAKE tier — vaultWorker (flake-chained encrypted vault) ──────── */
+         if (vaultWorker.isLocked()) {
+           /* Vault is locked — store as pending, will be picked up after flake  */
+           /* Mark watcher as needing flake so UX can prompt the user            */
+           console.warn('[newauthOAuth] Vault locked — credential will be stored after flake.',
+                        'service:', service);
 
-  } catch (err) {
-    console.error('[newauthOAuth] Vault callback handling failed:', err);
-  }
-}
+           /* Store token data temporarily in registry entry for post-flake pickup */
+           entry.pendingTokenData = tokenData;
+           entry.vaultStatus      = 'pending_flake';
+           entry.lastUpdated      = Date.now();
+           vaultRegistry.upsert(entry);
+
+           /* Mark watcher as needing flake */
+           _markWatcherNeedsFlake(ctx, entry);
+
+           console.info('[newauthOAuth] Credential queued for post-flake storage:',
+                        service, 'tier:', tier);
+
+         } else {
+           /* Vault is open — store immediately via vaultWorker */
+           await vaultWorker.connect(service, tokenData);
+
+		   entry.identifier  = payload.username || payload.identifier || payload.email || null;
+           entry.vaultStatus = 'connected';
+           entry.connectedAt = Date.now();
+           entry.lastUpdated = Date.now();
+           vaultRegistry.upsert(entry);
+
+           console.info('[newauthOAuth] Vault connected (flake tier):',
+                        service, entry.identifier);
+         }
+
+       } else {
+         /* ── OPEN / LOCAL tier — localVault (existing behaviour, unchanged) ── */
+         await localVault.store(
+           entry.ID,
+           tokenData,
+           tier,
+           null /* flakeObj — null for open/local tier */
+         );
+
+         entry.vaultStatus = 'connected';
+         entry.connectedAt = Date.now();
+         entry.lastRefresh = Date.now();
+         entry.lastUpdated = Date.now();
+         vaultRegistry.upsert(entry);
+
+         console.info('[newauthOAuth] Vault connected (', tier, 'tier):',
+                      service, entry.identifier);
+       }
+
+       /* ── Update watcher _vaultRef → registry entry ID ───────────────────── */
+       _updateWatcherVaultRef(ctx, entry);
+
+     } catch (err) {
+       console.error('[newauthOAuth] Vault callback handling failed:', err);
+     }
+   }
+
+   /* ── Helper — update watcher _vaultRef and clear _pendingVault ──────────── */
+   function _updateWatcherVaultRef(ctx, entry) {
+     if (!ctx.compositionId || !window.app) return;
+
+     var compositions = (window.app.data &&
+                         window.app.data.items &&
+                         window.app.data.items[0] &&
+                         window.app.data.items[0].compositions) || [];
+
+     for (var i = 0; i < compositions.length; i++) {
+       if (compositions[i].ID !== ctx.compositionId) continue;
+
+       var comp    = compositions[i];
+       var workers = (comp._composite && comp._composite.worker) || [];
+
+       for (var j = 0; j < workers.length; j++) {
+         if (workers[j].workerType === 'watcher' && workers[j]._pendingVault) {
+           workers[j]._vaultRef = entry.ID;
+           clearWatcherPendingVault(workers[j]);
+         }
+       }
+
+       if (typeof agntUpsertAndSave === 'function') {
+         agntUpsertAndSave(window.app, comp).catch(function(e) {
+           console.warn('[newauthOAuth] agntUpsertAndSave failed:', e.message);
+         });
+       }
+       break;
+     }
+   }
+
+   /* ── Helper — mark watcher as needing flake ─────────────────────────────── */
+   function _markWatcherNeedsFlake(ctx, entry) {
+     if (!ctx.compositionId || !window.app) return;
+
+     var compositions = (window.app.data &&
+                         window.app.data.items &&
+                         window.app.data.items[0] &&
+                         window.app.data.items[0].compositions) || [];
+
+     for (var i = 0; i < compositions.length; i++) {
+       if (compositions[i].ID !== ctx.compositionId) continue;
+
+       var comp    = compositions[i];
+       var workers = (comp._composite && comp._composite.worker) || [];
+
+       for (var j = 0; j < workers.length; j++) {
+         if (workers[j].workerType === 'watcher' && workers[j]._pendingVault) {
+           workers[j]._vaultRef      = entry.ID;
+           workers[j]._requiresFlake = true;
+           workers[j]._pendingFlake  = true;
+           clearWatcherPendingVault(workers[j]);
+         }
+       }
+
+       if (typeof agntUpsertAndSave === 'function') {
+         agntUpsertAndSave(window.app, comp).catch(function(e) {
+           console.warn('[newauthOAuth] agntUpsertAndSave failed:', e.message);
+         });
+       }
+       break;
+     }
+   }
+
+   /* ── Post-flake pickup — call from onFlake after vault unlocks ───────────── */
+   /* Checks registry for any pending_flake credentials and stores them         */
+   async function _storePendingVaultCredentials() {
+     try {
+       var entries = vaultRegistry.getAll();
+       var pending = entries.filter(function(e) {
+         return e.vaultStatus === 'pending_flake' && e.pendingTokenData;
+       });
+
+       if (!pending.length) return;
+
+       console.log('[newauthOAuth] Storing', pending.length,
+                   'pending flake credential(s)');
+
+       for (var i = 0; i < pending.length; i++) {
+         var entry = pending[i];
+         try {
+           await vaultWorker.connect(entry.service, entry.pendingTokenData);
+           entry.vaultStatus      = 'connected';
+           entry.connectedAt      = Date.now();
+           entry.lastUpdated      = Date.now();
+           delete entry.pendingTokenData;
+           vaultRegistry.upsert(entry);
+           console.log('[newauthOAuth] Stored pending credential for:', entry.service);
+         } catch(e) {
+           console.warn('[newauthOAuth] Failed to store pending credential for:',
+                        entry.service, e.message);
+         }
+       }
+     } catch(e) {
+       console.warn('[newauthOAuth] _storePendingVaultCredentials error:', e.message);
+     }
+   }
 
 
 
@@ -1432,8 +2198,8 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
     '<div class="vault-service-row">' +
       '<div class="vault-service-icon" style="background:' + (meta.color || '#6c5ce7') + '18;border:1.5px solid ' + (meta.color || '#6c5ce7') + '33;">' + meta.icon + '</div>' +
       '<div>' +
-        '<div class="vault-service-name">' + meta.label + ' needs authorization</div>' +
-        '<div class="vault-service-sub">' + (authInfo.reason || 'This URL requires login to access') + '</div>' +
+		  '<div class="vault-service-name">' + meta.label + ' needs authorization</div>' +
+		  '<div class="vault-service-sub">Where should we store your credentials?</div>' +
       '</div>' +
     '</div>' +
 
@@ -1442,22 +2208,22 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
       '<label class="vault-tier-opt selected" data-tier="open">' +
         '<input type="radio" name="vault-tier" value="open" checked>' +
         '<div>' +
-          '<div class="vault-tier-opt-label">🔓 This browser</div>' +
-          '<div class="vault-tier-opt-desc">Fastest. Agents run 24/7 without interruption. Credentials stay on this device.</div>' +
+		'<div class="vault-tier-opt-label">🔓 This device only</div>' +
+		'<div class="vault-tier-opt-desc">Fastest option. Agents run 24/7 without interruption. Nothing leaves your device.</div>' +
         '</div>' +
       '</label>' +
       '<label class="vault-tier-opt" data-tier="locked-local">' +
         '<input type="radio" name="vault-tier" value="locked-local">' +
         '<div>' +
-          '<div class="vault-tier-opt-label">🔒 This browser, flake-locked</div>' +
-          '<div class="vault-tier-opt-desc">Agents pause when your session expires. You unlock with your image pattern.</div>' +
+		'<div class="vault-tier-opt-label">🔒 This device, extra secure</div>' +
+		'<div class="vault-tier-opt-desc">Stored locally but locked with your newauth flake. Unlock periodically.</div>' +
         '</div>' +
       '</label>' +
       '<label class="vault-tier-opt" data-tier="locked-vault">' +
         '<input type="radio" name="vault-tier" value="locked-vault">' +
         '<div>' +
-          '<div class="vault-tier-opt-label">🏛 newauth vault</div>' +
-          '<div class="vault-tier-opt-desc">Credentials sync across all your devices. Flake-protected.</div>' +
+		'<div class="vault-tier-opt-label">🏛 Sync across devices</div>' +
+		'<div class="vault-tier-opt-desc">Stored in your newauth vault. Access your agents from any browser or device.</div>' +
         '</div>' +
       '</label>' +
     '</div>' +
@@ -1466,7 +2232,7 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
     '<div style="margin-bottom:10px;">' +
       '<button id="vault-advanced-toggle" style="background:none;border:none;' +
         'font-size:10px;color:#aaa;cursor:pointer;padding:0;display:flex;align-items:center;gap:4px;">' +
-        '<span id="vault-advanced-arrow" style="font-size:8px;">▶</span> Advanced' +
+        '<span id="vault-advanced-arrow" style="font-size:8px;">▶</span> Advanced options' +
       '</button>' +
       '<div id="vault-byok-fields" style="display:none;margin-top:8px;">' +
         '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:6px;">' +
@@ -1481,7 +2247,7 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
 
     /* Connect button */
     '<button class="vault-connect-btn">' +
-      'Connect ' + meta.label + ' →' +
+      'Connect & authorize ' + meta.label + ' →' +
     '</button>';
 
   container.appendChild(card);
@@ -1560,7 +2326,8 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
       tier:     selectedTier,
     });
 
-    fetch('/api/connect/' + service + '/init?context=' + encodeURIComponent(ctx)
+	fetch('/newauth/api/connect/' + service + '/init?tier=' + encodeURIComponent(selectedTier)
+	    + '&context=' + encodeURIComponent(ctx)
         + (byokClientId ? '&client_id=' + encodeURIComponent(byokClientId) : ''),
       { method: 'GET', credentials: 'include' })
       .then(function(res) {
@@ -1576,9 +2343,16 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
         window.addEventListener('message', function _waitForVault(event) {
           if (event.origin !== window.location.origin) return;
           var msg = event.data || {};
+		  
+		  if (window._vaultCallbackHandled === entry.ID) return;
+		  
+		  console.log('[debug] postMessage received:', JSON.stringify(msg));
           if (msg.type !== 'agnts_oauth_callback' || msg.service !== service) return;
           if (done) return;
           done = true;
+		  
+		  window._vaultCallbackHandled = entry.ID;
+		  setTimeout(function() { window._vaultCallbackHandled = null; }, 2000);
           window.removeEventListener('message', _waitForVault);
 
           if (msg.error) {
@@ -1589,13 +2363,26 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
           }
 
           /* Update entry with identifier */
-          entry.identifier  = msg.payload.email || msg.payload.username || msg.payload.identifier || null;
-          entry.vaultStatus = 'connected';
-          entry.connectedAt = Date.now();
-          vaultRegistry.upsert(entry);
+		  // Call _handleVaultCallback — this handles vaultWorker.connect() for flake tier
+		  var callbackCtx = {
+		    tier:          selectedTier,
+		    entryId:       entry.ID,
+		    compositionId: watcherItem.compositionDisplayId || null,
+		  };
+		  
+		  entry.tier = selectedTier;
+		  vaultRegistry.upsert(entry);
 
-          card.remove();
-          if (typeof onConnected === 'function') onConnected(entry.ID);
+		  _handleVaultCallback(service, msg.payload, callbackCtx)
+		    .then(function() {
+		      card.remove();
+		      if (typeof onConnected === 'function') onConnected(entry.ID);
+		    })
+		    .catch(function(err) {
+		      console.error('[vaultUX] handleVaultCallback failed:', err);
+		      card.remove();
+		      if (typeof onConnected === 'function') onConnected(entry.ID);
+		    });
         });
       })
       .catch(function(err) {
@@ -1756,7 +2543,6 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
     
      var agentNames = paused.map(function(p) { return p.composition.name || 'Agent'; });
     
-     /* Agent pill label — first name + count */
      var pillLabel = agentNames[0] || 'Agent';
      if (agentNames.length > 1) pillLabel += ' +' + (agentNames.length - 1);
     
@@ -1771,48 +2557,41 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
      overlay.id  = 'agnts-flake-overlay';
     
      overlay.innerHTML =
-       /* Full-screen image */
        '<div class="flake-image-wrap" id="flake-img-wrap">' +
          '<img id="flake-img" src="' + (images[0] ? images[0].src : '') + '" draggable="false">' +
        '</div>' +
     
-       /* Minimal top bar — lock icon + agent pill + close */
-	   '<div style="position:absolute;top:0;left:0;right:0;z-index:2;' +
-	     'padding:14px 16px;' +
-	     'background:linear-gradient(to bottom,rgba(10,8,24,0.65) 0%,transparent 100%);' +
-	     'display:flex;align-items:center;justify-content:space-between;">' +
-	     '<div style="display:flex;align-items:center;gap:8px;">' +
-	       '<span style="font-size:15px;">🔒</span>' +
-	       '<span style="font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;' +
-	         'background:rgba(108,92,231,0.55);color:#fff;border:1px solid rgba(108,92,231,0.4);">' +
-	         pillLabel +
-	       '</span>' +
-	     '</div>' +
-	     '<button class="flake-skip" style="width:24px;height:24px;border-radius:50%;' +
-	       'background:rgba(0,0,0,0.4);border:none;color:#fff;font-size:12px;cursor:pointer;' +
-	       'display:flex;align-items:center;justify-content:center;line-height:1;flex-shrink:0;">✕</button>' +
-	   '</div>';
+       '<div style="position:absolute;top:0;left:0;right:0;z-index:2;' +
+         'padding:14px 16px;' +
+         'background:linear-gradient(to bottom,rgba(10,8,24,0.65) 0%,transparent 100%);' +
+         'display:flex;align-items:center;justify-content:space-between;">' +
+         '<div style="display:flex;align-items:center;gap:8px;">' +
+           '<span style="font-size:15px;">🔒</span>' +
+           '<span style="font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;' +
+             'background:rgba(108,92,231,0.55);color:#fff;border:1px solid rgba(108,92,231,0.4);">' +
+             pillLabel +
+           '</span>' +
+         '</div>' +
+         '<button id="flake-overlay-close" style="width:24px;height:24px;min-width:24px;min-height:24px;' +
+           'padding:0;box-sizing:border-box;border-radius:50%;' +
+           'background:rgba(0,0,0,0.4);border:none;color:#fff;font-size:12px;cursor:pointer;' +
+           'display:flex;align-items:center;justify-content:center;line-height:1;flex-shrink:0;">✕</button>' +
+       '</div>';
     
-     /* Backdrop */
      var backdrop = document.createElement('div');
      backdrop.id  = 'agnts-flake-backdrop';
      document.body.appendChild(backdrop);
      document.body.appendChild(overlay);
     
-     /* ── Wire interactions ── */
      var imgWrap = overlay.querySelector('#flake-img-wrap');
      var imgEl   = overlay.querySelector('#flake-img');
     
      function _advanceImage() {
        currentImg++;
-    
        if (currentImg >= totalImgs) {
-         /* Last image clicked — auto-submit */
          _submitFlake();
          return;
        }
-    
-       /* Load next image silently */
        imgEl.style.opacity = '0';
        imgEl.src = images[currentImg].src;
        imgEl.onload = function() { imgEl.style.opacity = '1'; };
@@ -1823,24 +2602,19 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
      imgWrap.addEventListener('click', function(e) {
        if (hasClicked) return;
     
-       /* Determine actual rendered image bounds (letterbox aware) */
        var imgRect  = imgEl.getBoundingClientRect();
-       var wrapRect = imgWrap.getBoundingClientRect();
-    
-       /* object-fit:contain — compute rendered image area */
-       var natW   = imgEl.naturalWidth  || 1;
-       var natH   = imgEl.naturalHeight || 1;
-       var scaleX = imgRect.width  / natW;
-       var scaleY = imgRect.height / natH;
-       var scale  = Math.min(scaleX, scaleY);
-       var rendW  = natW * scale;
-       var rendH  = natH * scale;
-       var imgLeft = imgRect.left + (imgRect.width  - rendW) / 2;
-       var imgTop  = imgRect.top  + (imgRect.height - rendH) / 2;
+       var natW     = imgEl.naturalWidth  || 1;
+       var natH     = imgEl.naturalHeight || 1;
+       var scaleX   = imgRect.width  / natW;
+       var scaleY   = imgRect.height / natH;
+       var scale    = Math.min(scaleX, scaleY);
+       var rendW    = natW * scale;
+       var rendH    = natH * scale;
+       var imgLeft  = imgRect.left + (imgRect.width  - rendW) / 2;
+       var imgTop   = imgRect.top  + (imgRect.height - rendH) / 2;
        var imgRight  = imgLeft + rendW;
        var imgBottom = imgTop  + rendH;
     
-       /* Ignore clicks outside the actual image area */
        if (e.clientX < imgLeft || e.clientX > imgRight ||
            e.clientY < imgTop  || e.clientY > imgBottom) {
          return;
@@ -1848,28 +2622,38 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
     
        hasClicked = true;
     
-       /* Record coordinates relative to image (0-1) */
        var x_pct  = (e.clientX - imgLeft) / rendW;
        var y_pct  = (e.clientY - imgTop)  / rendH;
        var timing = Date.now() - imgStartMs;
     
-       /* Record silently — no dot shown */
        clickData.push({
          imageId:  images[currentImg].id,
-         x_pct:    Math.round(x_pct * 1000) / 1000,
-         y_pct:    Math.round(y_pct * 1000) / 1000,
+         x_pct:    Math.round(x_pct  * 1000) / 1000,
+         y_pct:    Math.round(y_pct  * 1000) / 1000,
          timingMs: timing,
        });
     
-       /* Advance after short pause */
        setTimeout(_advanceImage, 320);
      });
     
-     /* Auto-submit after last image click */
      async function _submitFlake() {
        try {
-         /* Test mode — mock server response */
+         /* ── Build clicksJson — exact string used in server hash ──────────
+            Field order MUST match server's LinkedHashMap order:
+            delay, clickX, clickY, imgWidth, imgHeight                      */
+         var clicksJsonString = JSON.stringify(clickData.map(function(c) {
+           return {
+             delay:     c.timingMs,
+             clickX:    c.x_pct,
+             clickY:    c.y_pct,
+             imgWidth:  1,   // normalized coords — 1 = full image dimension
+             imgHeight: 1
+           };
+         }));
+    
          var res;
+    
+         /* Test mode */
          if (window._agntFlakeTestMode) {
            res = {
              ok:   true,
@@ -1878,23 +2662,31 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
                  flakeObj:      { sessionId: 'test_' + Date.now(), clicks: clickData },
                  nextSessionId: 'test_session_' + Date.now(),
                  prevFlakeObj:  null,
+                 flake:         'testflak',
+                 fullflake:     'testflake_fullflake_' + Date.now(),
+                 backwardCommitment: '',
+                 forwardCommitment:  'test_forward_commitment',
+                 timestamp:          Date.now()
                };
              }
            };
          } else {
            res = await fetch('/api/flake/validate', {
-             method:  'POST',
-             headers: { 'Content-Type': 'application/json' },
+             method:      'POST',
+             headers:     { 'Content-Type': 'application/json' },
              credentials: 'include',
              body: JSON.stringify({
-               clicks:    clickData,
-               sessionId: localStorage.getItem('agnts_flake_session_id') || '',
+               clicks:       clickData,
+               clicksJson:   clicksJsonString,        // raw string for server hash
+               sessionId:    localStorage.getItem('agnts_flake_session_id') || '',
+               currentFullflake: null,                // vault worker will fill this
+               includeFullflake: true
              }),
            });
          }
     
          if (!res.ok) {
-           /* Wrong pattern — shake and reset silently */
+           /* Wrong pattern — shake and reset */
            overlay.style.animation = 'flakeShake 0.35s ease';
            setTimeout(function() { overlay.style.animation = ''; }, 400);
            currentImg = 0;
@@ -1910,27 +2702,35 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
          }
     
          var flakeData = await res.json();
-         /* flakeData: { flakeObj, nextSessionId, prevFlakeObj } */
     
-         /* Store session ID for next images fetch */
+         /* Store session ID for next fetch */
          if (flakeData.nextSessionId) {
            localStorage.setItem('agnts_flake_session_id', flakeData.nextSessionId);
          }
-         /* Clear cached images — next session gets a fresh set */
+    
+         /* Clear cached images */
          window._agntFlakeImages = null;
     
-         /* Unlock all locked-local entries using the flake */
+         /* ── NEW: Wire vault worker ──────────────────────────────────────── */
+         if (window.newauthOAuth &&
+             window.newauthOAuth.vaultWorker &&
+             !window._agntFlakeTestMode) {
+           try {
+             await window.newauthOAuth.vaultWorker.onFlake(flakeData, clicksJsonString);
+             console.log('[vaultUX] Vault worker unlocked via flake');
+           } catch(vaultErr) {
+             console.warn('[vaultUX] vaultWorker.onFlake failed:', vaultErr.message);
+             /* Non-fatal — existing localVault unlock still proceeds below */
+           }
+         }
+    
+         /* ── EXISTING: Unlock locked-local entries (unchanged) ───────────── */
          var allEntries = vaultRegistry.getAll();
          for (var i = 0; i < allEntries.length; i++) {
            var entry = allEntries[i];
            if (entry.tier !== 'locked-local') continue;
-    
-           /* Re-derive and cache the key — this is the unlock */
            try {
              await localVault.retrieve(entry.ID, 'locked-local', flakeData.flakeObj);
-             /* retrieve() caches the key as a side-effect */
-    
-             /* Rekey with new flake (rotates encryption) */
              if (flakeData.prevFlakeObj) {
                await localVault.rekey(
                  entry.ID, 'locked-local', 'locked-local',
@@ -1948,7 +2748,7 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
          }
     
          /* Close overlay */
-         overlay.style.animation = 'flakeOverlayIn 0.15s ease reverse';
+         overlay.style.animation  = 'flakeOverlayIn 0.15s ease reverse';
          backdrop.style.animation = 'flakeOverlayIn 0.15s ease reverse';
          setTimeout(function() {
            overlay.remove();
@@ -1958,7 +2758,7 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
     
        } catch(err) {
          console.error('[vaultUX] Flake validation error:', err);
-         /* Reset silently so user can retry */
+         /* Reset silently */
          currentImg = 0;
          clickData  = [];
          hasClicked = false;
@@ -1971,15 +2771,14 @@ async function renderVaultAuthCard(container, watcherItem, onConnected) {
        }
      }
     
-     /* Skip */
-     overlay.querySelector('.flake-skip').addEventListener('click', function() {
+     /* Skip / close */
+     overlay.querySelector('#flake-overlay-close').addEventListener('click', function() {
        overlay.remove();
        backdrop.remove();
        if (typeof onSkip === 'function') onSkip();
      });
-    
-     /* No click-outside dismiss — image fills whole overlay, clicking IS the interaction */
    }
+
 
 
 
@@ -2181,52 +2980,224 @@ function onWatcherUrlChange(container, watcherItem, onConnected) {
    agntVaultUX.checkAndShowFlakePrompt(compositions);
    ───────────────────────────────────────────────────────────────────────────── */
 
-async function checkAndShowFlakePrompt(compositions, onUnlocked) {
-  var paused = getWatchersNeedingFlake(compositions || []);
-  if (!paused.length) return;
+   async function checkAndShowFlakePrompt(compositions, onUnlocked) {
+     var paused = getWatchersNeedingFlake(compositions || []);
+     if (!paused.length) return;
+    
+     var _onUnlocked = onUnlocked || function() {
+       if (window.WatcherPanel && typeof WatcherPanel.resumeAll === 'function') {
+         WatcherPanel.resumeAll();
+       }
+     };
+    
+     function _launchFull() {
+       showFlakePrompt(compositions, _onUnlocked, function() { /* skipped */ });
+     }
+    
+     /* Test mode — skip image fetch, go straight to prompt */
+     if (window._agntFlakeTestMode) {
+       console.warn('[newauthOAuth] ⚠️ FLAKE TEST MODE IS ON');
+       setTimeout(function() {
+         showFlakeIntroCard(compositions, _launchFull, function() {});
+       }, 1800);
+       return;
+     }
+    
+     /* Images already loaded — show intro card */
+     if (window._agntFlakeImages && window._agntFlakeImages.length) {
+       setTimeout(function() {
+         showFlakeIntroCard(compositions, _launchFull, function() {});
+       }, 1800);
+       return;
+     }
+    
+     /* Check for existing session ID */
+     var sessionId = localStorage.getItem('agnts_flake_session_id') || '';
+    
+     if (sessionId) {
+       /* ── Case 3: existing session — fetch images directly ─────────────── */
+       try {
+         var res = await fetch('/api/flake/images', {
+           headers:     { 'X-Flake-Session': sessionId },
+           credentials: 'include',
+         });
+         if (!res.ok) throw new Error('Could not load flake images: ' + res.status);
+         var data = await res.json();
+         window._agntFlakeImages = data.images;
+         setTimeout(function() {
+           showFlakeIntroCard(compositions, _launchFull, function() {});
+         }, 1800);
+       } catch(err) {
+         console.warn('[newauthOAuth] Could not load flake images:', err);
+         /* Session may have expired — clear it and show username entry */
+         localStorage.removeItem('agnts_flake_session_id');
+         _showUsernameEntry(compositions, _launchFull);
+       }
+    
+     } else {
+       /* ── Case 2: no session — show username entry screen ──────────────── */
+       _showUsernameEntry(compositions, _launchFull);
+     }
+   }
 
-  var _onUnlocked = onUnlocked || function() {
-    if (window.WatcherPanel && typeof WatcherPanel.resumeAll === 'function') {
-      WatcherPanel.resumeAll();
-    }
-  };
+   function _showUsernameEntry(compositions, onImagesLoaded) {
+     /* Prevent duplicates */
+     if (document.getElementById('agnts-username-entry')) return;
+    
+     var overlay  = document.createElement('div');
+     overlay.id   = 'agnts-username-entry';
+     overlay.style.cssText = [
+       'position:fixed;inset:0;z-index:99999;',
+       'background:rgba(10,8,24,0.92);',
+       'display:flex;align-items:center;justify-content:center;',
+       'backdrop-filter:blur(8px);',
+       'animation:flakeOverlayIn 0.2s ease;',
+       'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
+     ].join('');
+    
+     overlay.innerHTML =
+       '<div style="' +
+         'background:#fff;border-radius:20px;' +
+         'width:320px;max-width:calc(100vw - 32px);' +
+         'box-shadow:0 24px 64px rgba(0,0,0,0.4);' +
+         'overflow:hidden;' +
+         'animation:flakeCardIn 0.22s cubic-bezier(0.34,1.56,0.64,1);' +
+       '">' +
+    
+         /* Header */
+         '<div style="padding:28px 24px 0;text-align:center;">' +
+           '<div style="font-size:32px;margin-bottom:12px;">🔐</div>' +
+           '<div style="font-size:15px;font-weight:700;color:#1a1a2e;margin-bottom:6px;">' +
+             'Vault authentication' +
+           '</div>' +
+           '<div style="font-size:12px;color:#888;line-height:1.5;">' +
+             'Enter your newauth username to unlock your agents' +
+           '</div>' +
+         '</div>' +
+    
+         /* Input */
+         '<div style="padding:20px 24px;">' +
+           '<input id="agnts-username-input" type="password" ' +
+             'placeholder="newauth username" ' +
+             'autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ' +
+             'style="' +
+               'width:100%;box-sizing:border-box;' +
+               'padding:12px 14px;' +
+               'border:1.5px solid #e0e0e0;border-radius:10px;' +
+               'font-size:14px;color:#1a1a2e;' +
+               'outline:none;' +
+               'transition:border-color 0.15s;' +
+             '">' +
+           '<div id="agnts-username-error" style="' +
+             'font-size:11px;color:#e55;margin-top:6px;min-height:16px;' +
+           '"></div>' +
+         '</div>' +
+    
+         /* Actions */
+         '<div style="padding:0 24px 24px;display:flex;flex-direction:column;gap:10px;">' +
+           '<button id="agnts-username-submit" style="' +
+             'width:100%;padding:13px;border:none;border-radius:10px;' +
+             'background:linear-gradient(135deg,#6c5ce7,#a29bfe);' +
+             'color:#fff;font-size:13px;font-weight:700;cursor:pointer;' +
+             'opacity:0.45;transition:opacity 0.15s;' +
+           '" disabled>Continue →</button>' +
+    
+           '<div style="text-align:center;">' +
+             '<a id="agnts-username-register" href="#" style="' +
+               'font-size:11px;color:#6c5ce7;text-decoration:none;' +
+             '">Don\'t have an account? Register at newauth →</a>' +
+           '</div>' +
+         '</div>' +
+    
+       '</div>';
+    
+     document.body.appendChild(overlay);
+    
+     var input     = overlay.querySelector('#agnts-username-input');
+     var submitBtn = overlay.querySelector('#agnts-username-submit');
+     var errorEl   = overlay.querySelector('#agnts-username-error');
+     var registerA = overlay.querySelector('#agnts-username-register');
+    
+     /* Enable submit when input has value */
+     input.addEventListener('input', function() {
+       var hasValue = input.value.trim().length > 0;
+       submitBtn.disabled = !hasValue;
+       submitBtn.style.opacity = hasValue ? '1' : '0.45';
+       errorEl.textContent = '';
+     });
+    
+     /* Focus input field */
+     input.focus();
+    
+     /* Enter key submits */
+     input.addEventListener('keydown', function(e) {
+       if (e.key === 'Enter' && !submitBtn.disabled) submitBtn.click();
+     });
+    
+     /* Register link — point to newauth registration URL */
+     registerA.addEventListener('click', function(e) {
+       e.preventDefault();
+       /* Adjust URL to your newauth registration page */
+       window.open('/newauth/register', '_blank');
+     });
+    
+     /* Submit — hash username and fetch images */
+     submitBtn.addEventListener('click', async function() {
+       var username = input.value.trim();
+       if (!username) return;
+    
+       submitBtn.disabled     = true;
+       submitBtn.textContent  = 'Loading...';
+       submitBtn.style.opacity = '0.7';
+       errorEl.textContent    = '';
+    
+       try {
+         /* Hash username client-side before sending — username is secret */
+         var usernameHash = hashUserForAuthentication(username);
+    
+         /* Fetch images via auththroughusername endpoint */
+         var res = await fetch('/vn/auththroughusername', {
+           method:      'POST',
+           headers:     { 'Content-Type': 'application/json' },
+           credentials: 'include',
+           body: JSON.stringify({
+             username:     usernameHash,
+             screenwidth:  window.screen.availWidth,
+             screenheight: window.screen.availHeight
+           })
+         });
+    
+         if (!res.ok) throw new Error('Server error: ' + res.status);
+    
+         var data = await res.json();
+    
+         /* Store session ID if returned */
+         if (data.sessionId || data.nextSessionId) {
+           localStorage.setItem('agnts_flake_session_id',
+                                data.sessionId || data.nextSessionId);
+         }
+    
+         /* Store images */
+         if (data.images && data.images.length) {
+           window._agntFlakeImages = data.images;
+         } else {
+           throw new Error('No images returned');
+         }
+    
+         /* Close username entry — proceed to flake prompt */
+         overlay.remove();
+         onImagesLoaded();
+    
+       } catch(err) {
+         console.error('[newauthOAuth] Username auth failed:', err);
+         errorEl.textContent    = 'Could not load — please try again';
+         submitBtn.disabled     = false;
+         submitBtn.textContent  = 'Continue →';
+         submitBtn.style.opacity = '1';
+       }
+     });
+   }
 
-  function _launchFull() {
-    showFlakePrompt(compositions, _onUnlocked, function() { /* skipped */ });
-  }
-
-  /* Test mode or images already loaded — show intro card first */
-  if (window._agntFlakeTestMode) {
-    console.warn('[newauthOAuth] ⚠️ FLAKE TEST MODE IS ON — set window._agntFlakeTestMode=false for production');
-    setTimeout(function() {
-      showFlakeIntroCard(compositions, _launchFull, function() {});
-    }, 1800);
-    return;
-  }
-  if (window._agntFlakeImages && window._agntFlakeImages.length) {
-    setTimeout(function() {
-      showFlakeIntroCard(compositions, _launchFull, function() {});
-    }, 1800);
-    return;
-  }
-
-  /* Real mode — fetch images from server first */
-  try {
-    var sessionId = localStorage.getItem('agnts_flake_session_id') || '';
-    var res = await fetch('/api/flake/images', {
-      headers: { 'X-Flake-Session': sessionId },
-      credentials: 'include',
-    });
-    if (!res.ok) throw new Error('Could not load flake images: ' + res.status);
-    var data = await res.json();
-    window._agntFlakeImages = data.images;
-    setTimeout(function() {
-      showFlakeIntroCard(compositions, _launchFull, function() {});
-    }, 1800);
-  } catch(err) {
-    console.warn('[newauthOAuth] Could not load flake images — agents stay paused:', err);
-  }
-}
 
 /* ─────────────────────────────────────────────────────────────────────────────
    EXPORTS — single global namespace
@@ -2274,14 +3245,24 @@ window.newauthOAuth = {
 
   /* ── UX flows ── */
   renderVaultAuthCard:        renderVaultAuthCard,
-  showFlakePrompt:            showFlakePrompt,
   renderGmailConfig:          renderGmailConfig,
   onWatcherUrlChange:         onWatcherUrlChange,
   checkAndShowFlakePrompt:    checkAndShowFlakePrompt,
   showFlakeIntroCard:         showFlakeIntroCard,
   showFlakePrompt:            showFlakePrompt,
+  vaultWorker:                vaultWorker,
+  storePendingVaultCredentials:   _storePendingVaultCredentials,
 };
 
 /* Backward-compat aliases */
 window.agntVault    = window.newauthOAuth;
 window.agntVaultUX  = window.newauthOAuth;
+
+/* Auto-init vault worker — runs on script load, before agnts-app-ext */
+(function() {
+  if (window.newauthOAuth && window.newauthOAuth.vaultWorker) {
+    window.newauthOAuth.vaultWorker.init().catch(function(e) {
+      console.warn('[newauthOAuth] vaultWorker init failed:', e.message);
+    });
+  }
+})();
