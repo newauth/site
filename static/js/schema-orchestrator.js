@@ -10326,13 +10326,13 @@ class SchemaOrchestrator {
 	            submitBtn.disabled = false;
 	            submitBtn.style.opacity = '1';
 	            submitBtn.textContent = 'Add ' + entitySchema.name;
-	        } catch (error) {
-	            console.error('Error during add:', error);
-	            alert('Failed to add item: ' + (error.message || 'Unknown error'));
-	            submitBtn.disabled = false;
-	            submitBtn.style.opacity = '1';
-	            submitBtn.textContent = 'Add ' + entitySchema.name;
-	        }
+			} catch (error) {
+			    console.error('Error during add:', error);
+			    self.showNotification('❌ ' + (error.message || 'Unknown error'), 'error');
+			    submitBtn.disabled = false;
+			    submitBtn.style.opacity = '1';
+			    submitBtn.textContent = 'Add ' + entitySchema.name;
+			}
 	    };
 
 		this._injectImportButton(nextEntityType);
@@ -11234,6 +11234,19 @@ class SchemaOrchestrator {
 
 	    // ✅ Ensure base entity fields
 	    this.ensureBaseEntityFields(newItem, entityType, entityConfig);
+		
+		// ✅ Poll answer: prevent duplicate names
+		if (this.currentApp?.id === 'poll' && entityType === 'answer') {
+		    const currentPoll = this._getCurrentPoll();
+		    const existingNames = (currentPoll?.answers || [])
+		        .map(a => a.name?.trim().toLowerCase())
+		        .filter(Boolean);
+		    
+		    if (existingNames.includes(newItem.name?.trim().toLowerCase())) {
+		        //this.showNotification(`⚠️ "${newItem.name}" already exists as an option.`, 'error');
+		        throw new Error(`"${newItem.name}" already exists as an option.`);
+		    }
+		}
 		
 	    const shortName = this.getShortName(newItem, entityType);
 	    this.processItemID(newItem, entityType);
