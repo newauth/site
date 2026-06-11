@@ -1252,6 +1252,147 @@ class SchemaOrchestrator {
 		    return id;
 		}
 		
+		_renderMyVoteArrow() {
+		    if (!this.currentApp || this.currentApp.id !== 'poll' || this.currentPath.length !== 2) return;
+		    
+		    const pollDisplayID = this.currentPath[1]?.displayID;
+		    const votedKey = `poll_voted_${pollDisplayID}`;
+		    const votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
+		    if (Object.keys(votedAnswers).length === 0) return;
+
+		    const votedEntry = Object.values(votedAnswers)[0];
+		    const votedAnswerDisplayId = votedEntry?.answerDisplayId;
+		    if (!votedAnswerDisplayId) return;
+
+		    const canvas = document.getElementById('canvas-area');
+		    if (!canvas) return;
+
+		    const votedDot = Array.from(canvas.querySelectorAll('.dot')).find(d =>
+		        d.itemData?.displayID === votedAnswerDisplayId
+		    );
+		    if (!votedDot) return;
+
+		    const canvasRect = canvas.getBoundingClientRect();
+		    const dotRect = votedDot.getBoundingClientRect();
+		    const dotCenterX = dotRect.left - canvasRect.left + dotRect.width / 2;
+		    const dotCenterY = dotRect.top - canvasRect.top + dotRect.height / 2;
+		    const dotR = dotRect.width / 2;
+
+		    const canvasW = canvasRect.width;
+		    const canvasH = canvasRect.height;
+		    const isRight = dotCenterX > canvasW / 2;
+		    const isBottom = dotCenterY > canvasH / 2;
+
+		    const offset = Math.max(70, dotR * 2.8);
+		    let startX, startY, controlX, controlY;
+
+		    if (!isRight && !isBottom) {
+		        startX = dotCenterX + offset;
+		        startY = dotCenterY + offset;
+		        controlX = dotCenterX + offset * 0.3;
+		        controlY = dotCenterY + offset * 0.8;
+		    } else if (isRight && !isBottom) {
+		        startX = dotCenterX - offset;
+		        startY = dotCenterY + offset;
+		        controlX = dotCenterX - offset * 0.3;
+		        controlY = dotCenterY + offset * 0.8;
+		    } else if (!isRight && isBottom) {
+		        startX = dotCenterX + offset;
+		        startY = dotCenterY - offset;
+		        controlX = dotCenterX + offset * 0.3;
+		        controlY = dotCenterY - offset * 0.8;
+		    } else {
+		        startX = dotCenterX - offset;
+		        startY = dotCenterY - offset;
+		        controlX = dotCenterX - offset * 0.3;
+		        controlY = dotCenterY - offset * 0.8;
+		    }
+
+		    // Arrow tip stops at dot edge
+		    const angle = Math.atan2(dotCenterY - startY, dotCenterX - startX);
+		    const tipX = dotCenterX - Math.cos(angle) * (dotR + 4);
+		    const tipY = dotCenterY - Math.sin(angle) * (dotR + 4);
+
+		    // Remove existing arrow
+		    document.getElementById('my-vote-arrow')?.remove();
+
+		    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+		    svg.id = 'my-vote-arrow';
+		    svg.style.cssText = `
+		        position: absolute;
+		        top: 0; left: 0;
+		        width: 100%; height: 100%;
+		        pointer-events: none;
+		        z-index: 98;
+		        overflow: visible;
+		    `;
+
+		    // ✅ Tapered arrow — segments with decreasing stroke width
+		    const steps = 14;
+		    for (let i = 0; i < steps - 1; i++) {
+		        const t = i / (steps - 1);
+		        const nextT = (i + 1) / (steps - 1);
+
+		        const x1 = (1-t)*(1-t)*startX + 2*(1-t)*t*controlX + t*t*tipX;
+		        const y1 = (1-t)*(1-t)*startY + 2*(1-t)*t*controlY + t*t*tipY;
+		        const x2 = (1-nextT)*(1-nextT)*startX + 2*(1-nextT)*nextT*controlX + nextT*nextT*tipX;
+		        const y2 = (1-nextT)*(1-nextT)*startY + 2*(1-nextT)*nextT*controlY + nextT*nextT*tipY;
+
+		        const strokeWidth = 5 - (t * 4.2);
+		        const opacity = 0.85 - (t * 0.15);
+
+		        const seg = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+		        seg.setAttribute('x1', x1);
+		        seg.setAttribute('y1', y1);
+		        seg.setAttribute('x2', x2);
+		        seg.setAttribute('y2', y2);
+		        seg.setAttribute('stroke', `rgba(108,92,231,${opacity.toFixed(2)})`);
+		        seg.setAttribute('stroke-width', Math.max(0.5, strokeWidth).toFixed(2));
+		        seg.setAttribute('stroke-linecap', 'round');
+		        svg.appendChild(seg);
+		    }
+
+		    // ✅ Manual arrowhead triangle
+		    const anchorT = (steps - 4) / (steps - 1);
+		    const prevTipX = (1-anchorT)*(1-anchorT)*startX + 2*(1-anchorT)*anchorT*controlX + anchorT*anchorT*tipX;
+		    const prevTipY = (1-anchorT)*(1-anchorT)*startY + 2*(1-anchorT)*anchorT*controlY + anchorT*anchorT*tipY;
+
+			const headSize = 12;
+			const arrowAngle = Math.atan2(tipY - prevTipY, tipX - prevTipX);
+
+			// ✅ Shift triangle 10px AWAY from dot (along opposite direction)
+			const shiftX = Math.cos(arrowAngle) * -10;
+			const shiftY = Math.sin(arrowAngle) * -10;
+			const apexX = tipX + shiftX;
+			const apexY = tipY + shiftY;
+
+			const hx1 = apexX - headSize * Math.cos(arrowAngle - 0.4);
+			const hy1 = apexY - headSize * Math.sin(arrowAngle - 0.4);
+			const hx2 = apexX - headSize * Math.cos(arrowAngle + 0.4);
+			const hy2 = apexY - headSize * Math.sin(arrowAngle + 0.4);
+
+			
+
+		    const arrowTriangle = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+		    arrowTriangle.setAttribute('points', `${apexX},${apexY} ${hx1},${hy1} ${hx2},${hy2}`);
+		    arrowTriangle.setAttribute('fill', 'rgba(108,92,231,0.85)');
+		    svg.appendChild(arrowTriangle);
+
+		    // ✅ "Your vote" label near arrow tail
+		    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+		    text.setAttribute('x', startX + (isRight ? -10 : 10));
+		    text.setAttribute('y', startY + (isBottom ? -10 : 10));
+		    text.setAttribute('text-anchor', isRight ? 'end' : 'start');
+		    text.setAttribute('font-size', '12');
+		    text.setAttribute('font-weight', '600');
+		    text.setAttribute('fill', 'rgba(108,92,231,0.85)');
+		    text.setAttribute('font-family', 'system-ui, sans-serif');
+		    text.textContent = 'Your vote';
+		    svg.appendChild(text);
+
+		    canvas.appendChild(svg);
+		}
+		
 		_getCurrentPoll() {
 		    if (this.currentApp?.id !== 'poll' || this.currentPath.length < 2) return null;
 		    const pollDisplayID = this.currentPath[1]?.displayID;
@@ -5700,6 +5841,7 @@ class SchemaOrchestrator {
 				        ? (item.name || '').substring(0, 10) + '…' 
 				        : (item.name || '');
 				    canvas.appendChild(caption);
+					
 				}
 
 		        // ── Badges (foreground only) ──────────────────────────
@@ -5740,6 +5882,10 @@ class SchemaOrchestrator {
 
 		this._isFirstRender = false;
 		this.updateWatermark();
+		
+		if (this.currentApp?.id === 'poll' && this.currentPath.length === 2) {
+		    requestAnimationFrame(() => this._renderMyVoteArrow());
+		}
 
 	    // ── Polling (unchanged) ───────────────────────────────────────
 	    if (this._isRefreshing) { console.log('=== RENDER COMPLETE ==='); return; }
