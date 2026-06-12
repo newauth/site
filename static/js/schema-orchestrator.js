@@ -6456,10 +6456,12 @@ class SchemaOrchestrator {
 						console.log('[close poll] pollItem:', pollItem?.entityType, pollItem?.name, pollItem?.status);
 						console.log('[close poll] pollPath:', pollPath);
 						console.log('[close poll] saving:', JSON.stringify({...pollItem, status: 'closed'}).substring(0, 200));
-			            await this.db.saveEntityData(pollPath, {
-			                ...pollItem,
-			                status: isPollClosed ? 'open' : 'closed'
-			            }, true);
+						// ✅ Don't save embedded answers — strip before saving poll metadata
+						const { answers, votes, ...pollMetaOnly } = pollItem;
+						await this.db.saveEntityData(pollPath, {
+						    ...pollMetaOnly,
+						    status: isPollClosed ? 'open' : 'closed'
+						}, true);
 			            this.showNotification(
 			                isPollClosed ? '🔓 Poll reopened.' : '🔒 Poll closed.', 'success'
 			            );
