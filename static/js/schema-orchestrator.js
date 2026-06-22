@@ -559,7 +559,9 @@ class DatabaseService {
 	    }
 
 	    // Create cache key that includes forcePath
-	    const cacheKey = forcePath ? `${appId}_${forcePath.join('/')}` : appId;
+
+		const cacheKey = forcePath ? `${appId}_${forcePath.join('/')}` : appId;
+		console.log('[getAppData] cacheKey:', cacheKey, 'has existing promise:', this._appDataPromises.has(cacheKey));
 		
 		if (options.bypassCache) {
 	        console.log(`[getAppData] Bypassing cache for key: ${cacheKey}`);
@@ -1088,7 +1090,7 @@ class SchemaOrchestrator {
 		                const savedContexts = this.getLastViewedContext(urlInfo.appId);
 		                const savedContext = savedContexts?.[0];
 
-		                if (savedContext?.path?.length > 0) {
+						if (savedContext?.path?.length > 0) {
 		                    this.currentPath = savedContext.path.map((id, i) => ({
 		                        id: id,
 		                        displayID: id.includes('-') ? this.db.hashUUID(id) : id,
@@ -1099,7 +1101,15 @@ class SchemaOrchestrator {
 		                    const newUrl = this.getAppUrl(this.currentPath);
 		                    window.history.replaceState({ path: this.currentPath }, '', newUrl);
 
-		                    const pathContext = this.currentPath.map(p => p.displayID);
+		                    // Tenant segment uses .id (the raw UUID, when available)
+		                    // rather than .displayID — getAppData's existing
+		                    // tenantId rehash needs the raw form to prove ownership
+		                    // via writeAccess/readAccess's tenantOwnerProven check;
+		                    // sending the hash here would hash-of-a-hash on the
+		                    // server and fail to find anything at all. Every other
+		                    // segment stays .displayID, matching the URL itself
+		                    // (built above via getAppUrl, unaffected by this fix).
+		                    const pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
 		                    this.data = await this.db.getAppData(this.currentApp.id, pathContext,
 							    { bypassCache: true } );
 		                } else {
@@ -1137,11 +1147,25 @@ class SchemaOrchestrator {
 		                }
 		            }
 
-		            await this.loadAppSelector();
+					await this.loadAppSelector();
+					 
+					// Recover raw UUID from savedContext if this user is the owner —
+					// the URL always shows the hash (by design), but the server's
+					// readAccess:'owner' check needs the raw UUID to prove ownership.
+					const _savedContextsDepth1 = this.getLastViewedContext(urlInfo.appId);
+					const _ownerContextDepth1 = _savedContextsDepth1?.find(ctx => {
+					    if (!ctx?.path?.[0] || !ctx.isOwnerAccess) return false;
+					    const ctxNormalized = this.isRealUuid(ctx.path[0])
+					        ? this.db.hashUUID(ctx.path[0])
+					        : ctx.path[0];
+					    return ctxNormalized === targetId;
+					});
+					const _tenantIdForFetch = _ownerContextDepth1?.path?.[0] || targetId;
+					 
+					console.log('[depth1 fix] targetId:', targetId, 'tenantIdForFetch:', _tenantIdForFetch);
+					this.data = await this.db.getAppData(this.currentApp.id, [_tenantIdForFetch],
+					                { bypassCache: true } );
 
-		            // ✅ Fetch specific entity - distributed storage always returns exactly this entity
-		            this.data = await this.db.getAppData(this.currentApp.id, [targetId]	,
-					    { bypassCache: true } );
 					
 					console.log('[TTT init] this.data after fetch:', JSON.stringify(this.data).substring(0, 300));
 					
@@ -1159,6 +1183,9 @@ class SchemaOrchestrator {
 		            const entityType = this.currentApp.hierarchy[0];
 		            const foundItem = this.data.items?.[0];
 
+					console.log('[init shortName] foundItem.name:', foundItem?.name, 'foundItem.displayID:', foundItem?.displayID);
+					console.log('[line1186] shortName will be:', this.getShortName(foundItem, entityType), 'foundItem.name:', foundItem?.name);
+					
 		            this.currentPath = foundItem ? [{
 		                id: foundItem.ID,
 		                displayID: foundItem.displayID,
@@ -1176,15 +1203,15 @@ class SchemaOrchestrator {
 				// ✅ DEEP LINKS (depth >= 2)
 				else {
 				    await this.handleIncomingDeepLink();
-
+				 
 				    if (this.currentPath.length > 0) {
-				        let pathContext = this.currentPath.map(p => p.displayID);
-						
-						// ✅ Poll at depth 2: fetch from creator level to get assembled answers
-						if (this.currentApp.id === 'poll' && pathContext.length === 2) {
-						    pathContext = [pathContext[0]]; // fetch creator level — server assembles full tree
+				        let pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
+				 
+						if (this.currentApp.id === 'poll' && pathContext.length === 2 && this.isDataOwner()) {
+						    pathContext = [pathContext[0]];
 						}
-						
+
+				 
 				        this.data = await this.db.getAppData(
 				            this.currentApp.id,
 				            pathContext,
@@ -1192,12 +1219,12 @@ class SchemaOrchestrator {
 				        );
 				        console.log('[init] deep link data fetched, items:', this.data?.items?.length);
 				    }
-
-				    // ✅ Poll app: ensure device identity exists silently on arrival
+				 
 				    if (this.currentApp.id === 'poll') {
-				        this._getPollUserId(); // generates and stores if not present, no UI
+				        this._getPollUserId();
 				    }
 				}
+
 				
 				// ✅ Poll app: ensure poll_user_id exists before context save
 				if (this.currentApp?.id === 'poll') {
@@ -1254,12 +1281,25 @@ class SchemaOrchestrator {
 		
 		_renderMyVoteArrow() {
 		    if (!this.currentApp || this.currentApp.id !== 'poll' || this.currentPath.length !== 2) return;
-		    
-		    const pollDisplayID = this.currentPath[1]?.displayID;
-		    const votedKey = `poll_voted_${pollDisplayID}`;
-		    const votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
-		    if (Object.keys(votedAnswers).length === 0) return;
+			
+			// ✅ Check if vote is stale after reset
+			const pollDisplayID = this.currentPath[1]?.displayID;
+			const votedKey = `poll_voted_${pollDisplayID}`;
+			const votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
 
+			// ✅ Check if vote is stale after reset
+			const currentPoll = this._getCurrentPoll();
+			const resetTimestamp = currentPoll?.resetTimestamp || 0;
+			if (resetTimestamp > 0 && Object.keys(votedAnswers).length > 0) {
+			    const votedEntry = Object.values(votedAnswers)[0];
+			    if (votedEntry?.timestamp && votedEntry.timestamp < resetTimestamp) {
+			        localStorage.removeItem(votedKey);
+			        return;
+			    }
+			}
+
+			if (Object.keys(votedAnswers).length === 0) return;
+		    
 		    const votedEntry = Object.values(votedAnswers)[0];
 		    const votedAnswerDisplayId = votedEntry?.answerDisplayId;
 		    if (!votedAnswerDisplayId) return;
@@ -1410,12 +1450,23 @@ class SchemaOrchestrator {
 		    if (!creatorDisplayID || !pollDisplayID) return;
 
 		    // ✅ Check localStorage FIRST — instant feedback, no network call
-		    const votedKey = `poll_voted_${pollDisplayID}`;
-		    let votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
+			const votedKey = `poll_voted_${pollDisplayID}`;
+			let votedAnswers = JSON.parse(localStorage.getItem(votedKey) || '{}');
 
-		    // ✅ Quick voteMode check from cached poll — no network needed
-		    const cachedPoll = this._getCurrentPoll();
-		    const quickVoteMode = cachedPoll?.voteMode || 'single';
+			// ✅ Get cached poll first
+			const cachedPoll = this._getCurrentPoll();
+			const quickVoteMode = cachedPoll?.voteMode || 'single';
+
+			// ✅ Now check reset — cachedPoll is in scope
+			const resetTimestamp = cachedPoll?.resetTimestamp || 0;
+			if (resetTimestamp > 0 && Object.keys(votedAnswers).length > 0) {
+			    const votedEntry = Object.values(votedAnswers)[0];
+			    if (votedEntry?.timestamp && votedEntry.timestamp < resetTimestamp) {
+			        console.log('[Poll] Stale vote cleared after reset');
+			        localStorage.removeItem(votedKey);
+			        votedAnswers = {};
+			    }
+			}
 
 		    // ✅ Changeable mode: ensure only one entry — clean up stale entries
 		    if (quickVoteMode === 'changeable' && Object.keys(votedAnswers).length > 1) {
@@ -2012,10 +2063,13 @@ class SchemaOrchestrator {
 		    const isDataOwner = this.isDataOwner(); // Browser 1 user
 		    
 		    // Data owners (Browser 1) can always edit everything
-		    if (isDataOwner) {
-		        return true;
-		    }
-		    
+			if (fieldConfig.writePermission === 'system') {
+			    return false;  // system fields are NEVER editable, even by the data owner
+			}
+			if (isDataOwner) {
+			    return true;
+			}
+			
 		    // Browser 2 users - check permissions based on their access level
 		    switch (fieldConfig.writePermission) {
 		        case 'any':
@@ -2068,6 +2122,36 @@ class SchemaOrchestrator {
 		    // For editing existing items, check if user has ancestor relationship
 		    return this.checkAncestorRelationship();
 		}
+		
+		setActiveSortConfig(entityType, index) {
+		    if (!this._activeSortIndex) this._activeSortIndex = {};
+		    this._activeSortIndex[entityType] = index;
+		    this.render();
+		}
+		 
+		// ── 3. _resolveSortConfig — helper, replaces direct sortConfig reads ───────
+		// Returns { sortConfig, sortConfigs } where:
+		//   sortConfig  = the currently active single config object
+		//   sortConfigs = the full array (null if sortConfig was an object)
+		_resolveSortConfig(entityType) {
+		    const raw = this.currentApp?.entityConfigs?.[entityType]?.sortConfig;
+		    if (!raw) return { sortConfig: null, sortConfigs: null };
+		 
+		    if (Array.isArray(raw)) {
+		        const idx = this._activeSortIndex?.[entityType] ?? 0;
+		        const activeIdx = Math.min(idx, raw.length - 1);
+		        return { sortConfig: raw[activeIdx], sortConfigs: raw, activeSortIndex: activeIdx };
+		    }
+		 
+		    return { sortConfig: raw, sortConfigs: null, activeSortIndex: 0 };
+		}
+		 
+		// ── 4. preComputeScore hook (default no-op) ───────────────────────────────
+		// Apps override this in ext.js to compute derived fields at render time.
+		preComputeScore(item, entityType, scoreField) {
+		    return null;
+		}
+
 
 		// Get maximum depth Browser 2 user can access
 		getMaxAllowedDepth() {
@@ -2238,8 +2322,21 @@ class SchemaOrchestrator {
 	    if (shouldLoadFullData) {
 	        console.log('[DeepLink] Loading FULL data (owner or real UUID detected)');
 	        try {
-	            const tenantId = urlInfo.pathIds[0]; // Use first path ID (real UUID or hashed)
-	            const fullData = await this.db.getAppData(this.currentApp.id, [tenantId]);
+				const urlTenantId = urlInfo.pathIds[0];
+				const savedContexts = this.getLastViewedContext(this.currentApp.id);
+				const ownerContext = savedContexts?.find(ctx => {
+				    if (!ctx?.path?.[0] || !ctx.isOwnerAccess) return false;
+				    const ctxNormalized = this.isRealUuid(ctx.path[0])
+				        ? this.db.hashUUID(ctx.path[0])
+				        : ctx.path[0];
+				    const urlNormalized = this.isRealUuid(urlTenantId)
+				        ? this.db.hashUUID(urlTenantId)
+				        : urlTenantId;
+				    return ctxNormalized === urlNormalized;
+				});
+				const tenantId = (ownerContext?.path?.[0]) || urlTenantId;
+				const fullData = await this.db.getAppData(this.currentApp.id, [tenantId]);
+
 	            
 	            if (fullData?.items?.length > 0) {
 	                finalData = fullData;
@@ -2949,15 +3046,11 @@ class SchemaOrchestrator {
 
 	// ===== FIXED SHARE POPUP METHODS =====
 
-	showSharePopup(buttonElement) {
-	    // Close any existing popup
+	async showSharePopup(buttonElement) {
 	    this.closeSharePopup();
-
-	    // Get current URL
 	    const currentUrl = window.location.href;
+	    const guidanceText = await this.getShareGuidanceText();
 
-	    // Get contextual guidance text
-	    const guidanceText = this.getShareGuidanceText();
 
 	    // Create popup
 	    const popup = document.createElement('div');
@@ -3131,30 +3224,114 @@ class SchemaOrchestrator {
 	}
 	
 
-
-
-	getShareGuidanceText() {
-	    const currentDepth = this.currentPath.length;
-		
-		console.log('[getShareGuidanceText] currentpath: ' + JSON.stringify(this.currentPath));
-	    
-	    if (currentDepth === 0) {
-	        return "This is your organization's main dashboard. Share this link with team members who need full access to manage all customers and concerns.";
-	    } else if (currentDepth === 1) {
-	        // Tenant level - sharing customer support function
-	        const tenantName = this.currentPath[0]?.shortName || 'your organization';
-	        return `Share this link with people in ${tenantName} who would be handling customer support functions. They'll be able to manage all customers and concerns for this organization.`;
-	    } else if (currentDepth === 2) {
-	        // Customer level - sharing with actual customers
-	        const customerName = this.currentPath[1]?.shortName || 'your customer';
-	        return `Share this link with ${customerName} or their team members who need to report and track support concerns. They'll only see their own concerns and won't have access to other customers.`;
-	    } else if (currentDepth >= 3) {
-	        // Concern level or deeper
-	        return "Share this link with specific stakeholders who need to collaborate on this particular concern. They'll have focused access to this issue only.";
+	// ============================================================================
+	// NEW SHARED HELPER — _resolveCurrentEntityData()
+	//
+	// Finds the actual stored data (including readAccess/writeAccess) for
+	// whatever entity currentPath currently points at, within this.data.
+	// Reuses the SAME two-strategy logic addItem already has for parent
+	// resolution (direct match vs. tree traversal) — not duplicated ad hoc,
+	// because this.data's shape relative to currentPath is genuinely
+	// ambiguous (could be a direct subtenant-level fetch, or a broader
+	// owner's full-tree load), and addItem's existing logic already handles
+	// both correctly. Returns null if the entity can't be found (e.g.
+	// currentPath is empty, or this.data doesn't actually contain it).
+	// ============================================================================
+	 
+	_resolveCurrentEntityData() {
+	    const depth = this.currentPath.length;
+	    if (depth === 0) {
+	        return this.data?.items?.[0] || null;
 	    }
-	    
-	    return "Share this secure link with authorized collaborators.";
+	 
+	    const lastPathEntity = this.currentPath[depth - 1];
+	    const firstItem = this.data?.items?.[0];
+	 
+	    const isCurrentEntity = firstItem && (
+	        firstItem.ID === lastPathEntity.id ||
+	        firstItem.displayID === lastPathEntity.displayID ||
+	        firstItem.displayID === lastPathEntity.id
+	    );
+	 
+	    if (isCurrentEntity) {
+	        return firstItem;
+	    }
+	 
+	    // Traverse from root — mirrors addItem's parent-lookup EXACTLY: walk
+	    // down to (but not including) the target depth via the loop, then a
+	    // separate final find at the target depth itself. Not collapsed into
+	    // a single loop with an early-return, since that's a different
+	    // structure than what addItem actually does and wasn't verified to
+	    // produce the same result.
+	    let currentItems = this.data?.items;
+	    let currentDepth = 0;
+	 
+	    while (currentDepth < depth - 1 && currentItems) {
+	        const currentEntityType = this.currentApp.hierarchy[currentDepth];
+	        const currentConfig = this.currentApp.entityConfigs[currentEntityType];
+	        const currentChildrenField = currentConfig?.childrenField;
+	        const pathItem = this.currentPath[currentDepth];
+	        const foundItem = currentItems.find(item =>
+	            item.ID === pathItem.id || item.displayID === pathItem.id
+	        );
+	        if (!foundItem) {
+	            return null;
+	        }
+	        currentItems = foundItem[currentChildrenField] || [];
+	        currentDepth++;
+	    }
+	 
+	    const targetPathItem = this.currentPath[depth - 1];
+	    return currentItems?.find(item =>
+	        item.ID === targetPathItem.id || item.displayID === targetPathItem.id
+	    ) || null;
 	}
+
+
+	async getShareGuidanceText() {
+	    const depth = this.currentPath.length;
+	 
+	    if (depth === 0) {
+	        return "This is your app's main view. Only you can access it.";
+	    }
+	 
+	    const currentEntityType = this.currentApp.hierarchy[depth - 1];
+	    const currentEntityNatent = await this.getEntityConfig(currentEntityType);
+	    const currentEntityName = currentEntityNatent?.name || 'item';
+	 
+	    const entityData = this._resolveCurrentEntityData();
+	    const readAccess = entityData?.readAccess || 'owner'; // fail-closed default, matches server
+	 
+	    if (readAccess !== 'any') {
+	        return `This ${currentEntityName.toLowerCase()} is currently Private — only you can access it. ` +
+	               `Change its access setting to "Read only" or "Open" before sharing this link, ` +
+	               `or recipients won't be able to view it.`;
+	    }
+	 
+	    const appEntityConfig = this.currentApp?.entityConfigs?.[currentEntityType];
+	    const childEntityType = appEntityConfig?.childEntity || null;
+	    const writeAccess = entityData?.writeAccess || 'owner';
+	 
+	    if (childEntityType) {
+	        const childNatent = await this.getEntityConfig(childEntityType);
+	        const childNoun = childNatent?.name
+	            ? (childNatent.name.toLowerCase() + 's')
+	            : (childEntityType + 's');
+	 
+	        if (writeAccess === 'any') {
+	            return `Anyone with this link can view this ${currentEntityName.toLowerCase()} ` +
+	                   `and add new ${childNoun} inside it.`;
+	        }
+	        return `Anyone with this link can view this ${currentEntityName.toLowerCase()} ` +
+	               `and everything inside it.`;
+	    }
+	 
+	    if (writeAccess === 'any') {
+	        return `Anyone with this link can view and edit this ${currentEntityName.toLowerCase()}.`;
+	    }
+	    return `Anyone with this link can view this ${currentEntityName.toLowerCase()}.`;
+	}
+
 
 	handleShareAction(action, url) {
 	    switch (action) {
@@ -4697,7 +4874,8 @@ class SchemaOrchestrator {
 	        }
 	        
 	        const targetDepth = state.depth || 0;
-	        const statePath = state.path || [];
+			const statePath = state.path || [];
+			console.log('[popstate] statePath[0]:', JSON.stringify(statePath[0]));
 	        
 	        // Rebuild currentPath from state
 	        this.currentPath = statePath.map(pathItem => ({
@@ -4719,7 +4897,8 @@ class SchemaOrchestrator {
 
 	// ✅ HANDLE INITIAL PAGE LOAD - ADD THIS METHOD
 	handleInitialState() {
-		
+		console.log('[handleInitialState] URL:', window.location.href);
+		console.log('[handleInitialState] pathname:', window.location.pathname);
 		if (this.currentPath?.length > 0) {
 		        console.log('[handleInitialState] Path already initialized - skipping reset');
 		        return;
@@ -4989,7 +5168,7 @@ class SchemaOrchestrator {
 	    console.log('=====================================');
 	    return parent[childrenField];
 	}   
-
+	
 	/**
 	 * Navigate through the full hierarchy structure to find children at current path
 	 * Returns null if navigation fails (indicates we should try flattened structure)
@@ -5239,27 +5418,66 @@ class SchemaOrchestrator {
 	    return positions;
 	}
 
+	// ============================================================================
+	// PATCH: _resolveDotColor — simplified priority chain
+	//
+	// typeBehaviorMap and color are mutually exclusive:
+	// - If entityConfig has typeBehaviorMap + typeField → use behavior map color
+	// - Otherwise → use color config (hex string or true)
+	// - Final fallback → instance hash from item.ID
+	//
+	// REPLACE the entire _resolveDotColor method with:
+	// ============================================================================
+
 	_resolveDotColor(item, entityType) {
 	    const entityConfig = this.currentApp?.entityConfigs?.[entityType];
 
-	    // ── Priority 1: Fixed hex color on entity config ──────────────
-	    if (entityConfig?.color && typeof entityConfig.color === 'string' && entityConfig.color.startsWith('#')) {
-	        return entityConfig.color;
+	    // ── Priority 0: Per-item explicit color ───────────────────────────────
+	    // item.metadata.displayConfig.color — intentionally set on a specific item.
+	    // Used e.g. by simulation overlay to show new investor dot as gray.
+	    if (item?.metadata?.displayConfig?.color) {
+	        return item.metadata.displayConfig.color;
 	    }
 
-	    // ── Priority 2: Urgency mode — caller handles this via tier ───
-	    // (urgencyMode colors are applied in the dot loop, not here)
-	    // Return null so the loop knows to use urgency palette instead
+	    // ── Priority 1: typeBehaviorMap color ────────────────────────────────
+	    // If entityConfig defines typeField + typeBehaviorMap, look up the
+	    // item's type value in the behavior map. Color lives there alongside
+	    // icon, label, strokeStyle — single source of truth for type appearance.
+	    // When a behavior map is present, no separate color config is needed.
+	    if (entityConfig?.typeField && entityConfig?.typeBehaviorMap) {
+	        const typeValue = item[entityConfig.typeField];
+	        const behaviorMap = this.currentApp?.[entityConfig.typeBehaviorMap];
+	        if (typeValue && behaviorMap?.[typeValue]?.color) {
+	            return behaviorMap[typeValue].color;
+	        }
+	        // Type value present but no map entry — auto-hash for consistency
+	        if (typeValue) {
+	            return this._colorFromHash(typeValue);
+	        }
+	        // No type value — fall through to color config or instance hash
+	    }
+
+	    // ── Priority 2: Urgency mode — caller handles ─────────────────────────
 	    if (entityConfig?.sortConfig?.urgencyMode) {
 	        return null;
 	    }
 
-	    // ── Priority 3: color = true → hash from entity type name ─────
-	    if (entityConfig?.color === true) {
-	        return this._colorFromHash(entityType);
+	    // ── Priority 3: color config on entityConfig ──────────────────────────
+	    // Only used when no typeBehaviorMap is defined.
+	    const colorConfig = entityConfig?.color;
+	    if (colorConfig) {
+	        // Fixed hex — all items same color
+	        if (typeof colorConfig === 'string' && colorConfig.startsWith('#')) {
+	            return colorConfig;
+	        }
+	        // true — all items auto-colored from entity type name hash
+	        if (colorConfig === true) {
+	            return this._colorFromHash(entityType);
+	        }
 	    }
 
-	    // ── Priority 4: Instance hash, stored permanently on item ──────
+	    // ── Priority 4: Instance hash, cached on item ─────────────────────────
+	    // Unique color per item derived from its ID. Stable across re-renders.
 	    if (!item._dotColor) {
 	        const seed = item.ID || item.name || item.displayID || item.displayname || 'unknown';
 	        item._dotColor = this._colorFromHash(seed);
@@ -5370,57 +5588,111 @@ class SchemaOrchestrator {
 	    canvas.appendChild(centerZone);
 
 	    // ── Item resolution (unchanged) ───────────────────────────────
-	    let items = [];
-	    const pathDepth = this.currentPath.length;
+		let items = [];
+		const pathDepth = this.currentPath.length;
 
-	    if (pathDepth === 0) {
-	        items = this.data?.items || [];
-	    } else if (pathDepth >= 1 && this.data?.items?.length > 0) {
-	        const firstItem = this.data.items[0];
-	        const lastPathEntity = this.currentPath[pathDepth - 1];
-	        const isPartialResponse =
-	            firstItem.entityType === lastPathEntity.entityType &&
-	            firstItem.displayID === lastPathEntity.displayID;
+		if (pathDepth === 0) {
+		    items = this.data?.items || [];
+		} else if (pathDepth >= 1 && this.data?.items?.length > 0) {
+		    const firstItem = this.data.items[0];
 
-	        if (isPartialResponse) {
-	            const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
-	            const config = this.currentApp.entityConfigs[currentEntityType];
-	            if (config?.childrenField) items = firstItem[config.childrenField] || [];
-			} else {
-			    let currentItems = this.data.items;
-			    let currentEntity = null;
-			    for (let i = 0; i < pathDepth; i++) {
-			        const pathItem = this.currentPath[i];
-			        const entityType = this.currentApp.hierarchy[i];
-					
-					if (i === 1) {
-					    console.log('[traversal depth1] polls:', currentItems.map(p => ({displayID: p.displayID, name: p.name})));
-					    console.log('[traversal depth1] looking for:', pathItem.displayID);
-					}
-			        currentEntity = currentItems.find(item =>
-			            item.ID === pathItem.id ||
-			            item.displayID === pathItem.displayID ||
-			            (!pathItem.id.includes('-') && item.ID.includes('-') && this.db.hashUUID(item.ID) === pathItem.id)
-			        );
-			        console.log('[traversal] depth:', i, 'entityType:', entityType, 'looking for:', pathItem.displayID, 'found:', currentEntity?.displayID, currentEntity?.entityType);
-			        if (!currentEntity) break;
-			        if (i < pathDepth - 1) {
-			            const config = this.currentApp.entityConfigs[entityType];
-			            currentItems = currentEntity[config.childrenField] || [];
-			            console.log('[traversal] next items:', currentItems.map(x => ({name: x.name, type: x.entityType})));
-			        }
-			    }
-				
-				console.log('[traversal] final currentEntity:', currentEntity?.displayID, currentEntity?.entityType);
-				console.log('[traversal] childrenField:', this.currentApp.entityConfigs[this.currentApp.hierarchy[pathDepth-1]]?.childrenField);
-				console.log('[traversal] children:', currentEntity?.[this.currentApp.entityConfigs[this.currentApp.hierarchy[pathDepth-1]]?.childrenField]?.map(x => ({name: x.name, type: x.entityType})));
-	            if (currentEntity) {
-	                const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
-	                const config = this.currentApp.entityConfigs[currentEntityType];
-	                if (config?.childrenField) items = currentEntity[config.childrenField] || [];
-	            }
-	        }
-	    }
+		    // Find which path level firstItem belongs to
+		    // (could be 0=investor, 1=company, etc. depending on fetch depth)
+		    let firstItemDepth = -1;
+		    for (let i = 0; i < pathDepth; i++) {
+		        const pathItem = this.currentPath[i];
+		        if (firstItem.displayID === pathItem.displayID ||
+		            firstItem.ID === pathItem.id ||
+		            (!pathItem.id?.includes('-') && firstItem.ID?.includes('-') &&
+		             this.db.hashUUID(firstItem.ID) === pathItem.id)) {
+		            firstItemDepth = i;
+		            break;
+		        }
+		    }
+
+		    if (firstItemDepth === pathDepth - 1) {
+		        // firstItem IS the entity we're inside — show its children directly
+		        // (e.g. subtenant fetch returned the company and we're at company depth)
+		        const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
+		        const config = this.currentApp.entityConfigs[currentEntityType];
+		        if (config?.childrenField) items = firstItem[config.childrenField] || [];
+
+		    } else if (firstItemDepth > 0 && firstItemDepth < pathDepth - 1) {
+		        // firstItem is an intermediate entity (e.g. company when we're at stakeholder depth)
+		        // Start traversal from firstItemDepth, using firstItem's children
+		        const startEntityType = this.currentApp.hierarchy[firstItemDepth];
+		        const startConfig = this.currentApp.entityConfigs[startEntityType];
+		        let currentItems = firstItem[startConfig?.childrenField] || [];
+		        let currentEntity = null;
+
+		        for (let i = firstItemDepth + 1; i < pathDepth; i++) {
+		            const pathItem = this.currentPath[i];
+		            const entityType = this.currentApp.hierarchy[i];
+		            currentEntity = currentItems.find(item =>
+		                item.ID === pathItem.id ||
+		                item.displayID === pathItem.displayID ||
+		                (!pathItem.id?.includes('-') && item.ID?.includes('-') &&
+		                 this.db.hashUUID(item.ID) === pathItem.id)
+		            );
+		            console.log('[traversal] depth:', i, 'entityType:', entityType,
+		                'looking for:', pathItem.displayID, 'found:', currentEntity?.displayID);
+		            if (!currentEntity) break;
+		            if (i < pathDepth - 1) {
+		                const config = this.currentApp.entityConfigs[entityType];
+		                currentItems = currentEntity[config?.childrenField] || [];
+		            }
+		        }
+
+		        if (currentEntity) {
+		            const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
+		            const config = this.currentApp.entityConfigs[currentEntityType];
+		            if (config?.childrenField) items = currentEntity[config.childrenField] || [];
+		        }
+
+		    } else {
+		        // firstItemDepth === 0 or not found — traverse from root (original behavior)
+		        let currentItems = this.data.items;
+		        let currentEntity = null;
+
+		        for (let i = 0; i < pathDepth; i++) {
+		            const pathItem = this.currentPath[i];
+		            const entityType = this.currentApp.hierarchy[i];
+
+		            if (i === 1) {
+		                console.log('[traversal depth1] items:', currentItems.map(p => ({displayID: p.displayID, name: p.name})));
+		                console.log('[traversal depth1] looking for:', pathItem.displayID);
+		            }
+
+		            currentEntity = currentItems.find(item =>
+		                item.ID === pathItem.id ||
+		                item.displayID === pathItem.displayID ||
+		                (!pathItem.id?.includes('-') && item.ID?.includes('-') &&
+		                 this.db.hashUUID(item.ID) === pathItem.id)
+		            );
+		            console.log('[traversal] depth:', i, 'entityType:', entityType,
+		                'looking for:', pathItem.displayID,
+		                'found:', currentEntity?.displayID, currentEntity?.entityType);
+		            if (!currentEntity) break;
+		            if (i < pathDepth - 1) {
+		                const config = this.currentApp.entityConfigs[entityType];
+		                currentItems = currentEntity[config?.childrenField] || [];
+		                console.log('[traversal] next items:', currentItems.map(x => ({name: x.name, type: x.entityType})));
+		            }
+		        }
+
+		        console.log('[traversal] final currentEntity:', currentEntity?.displayID, currentEntity?.entityType);
+		        console.log('[traversal] childrenField:', this.currentApp.entityConfigs[this.currentApp.hierarchy[pathDepth-1]]?.childrenField);
+		        console.log('[traversal] children:', currentEntity?.[
+		            this.currentApp.entityConfigs[this.currentApp.hierarchy[pathDepth-1]]?.childrenField
+		        ]?.map(x => ({name: x.name, type: x.entityType})));
+
+		        if (currentEntity) {
+		            const currentEntityType = this.currentApp.hierarchy[pathDepth - 1];
+		            const config = this.currentApp.entityConfigs[currentEntityType];
+		            if (config?.childrenField) items = currentEntity[config.childrenField] || [];
+		        }
+		    }
+		}
 		
 		// ── POLL app: depth-2 answer dots + voter UX ─────────────────────────────────
 		if (this.currentApp?.id === 'poll' && this.currentPath.length === 2) {
@@ -5954,9 +6226,10 @@ class SchemaOrchestrator {
 		calculateVisualScores(items, entityType) {
 
 		    const currentTime = Date.now();
-		    const entityConfig = this.currentApp?.entityConfigs?.[entityType];
-		    const childrenField = entityConfig?.childrenField;
-		    const sortConfig = entityConfig?.sortConfig;
+			const entityConfig = this.currentApp?.entityConfigs?.[entityType];
+			const childrenField = entityConfig?.childrenField;
+			const { sortConfig, sortConfigs, activeSortIndex } = this._resolveSortConfig(entityType);
+
 		    const itemCount = items.length;
 
 		    // ✅ GET CANVAS DIMENSIONS
@@ -5998,9 +6271,15 @@ class SchemaOrchestrator {
 
 		    // ✅ RESOLVE SCORING CONFIG
 		    const invertScore = sortConfig?.invertScore;
-		    const scoreField = sortConfig?.type === 'field'
-		        ? sortConfig.scoreField
-		        : sortConfig?.aggregateField;
+			
+			const defaultScoreField = sortConfig?.type === 'field'
+			    ? sortConfig.scoreField
+			    : sortConfig?.aggregateField;
+			 
+			// Use session-active field if set, otherwise default from sortConfig
+			let scoreField = (this._activeScoreField?.[entityType]) || defaultScoreField;
+			 
+			
 		    const alertThresholdField = sortConfig?.alertThresholdField;
 		    const alertDirection = sortConfig?.alertDirection || 'below';
 		    const recencyBias = this._getRecencyBiasValue(sortConfig?.recencyBias);
@@ -6025,13 +6304,47 @@ class SchemaOrchestrator {
 				    }
 				}
 
-		        if (sortConfig?.type === 'aggregate') {
-		            const agg = this.calculateAggregate(item, entityType, sortConfig);
-		            rawValues[i] = agg === null ? null : agg;
-		        } else {
-		            rawValues[i] = scoreField ? (parseFloat(item[scoreField]) || 0) : null;
-		        }
+				if (sortConfig?.type === 'aggregate') {
+				    const agg = this.calculateAggregate(item, entityType, sortConfig);
+				    rawValues[i] = agg === null ? null : agg;
+				} else {
+				    const preComputed = this.preComputeScore(item, entityType, scoreField);
+				    rawValues[i] = scoreField
+				        ? (preComputed !== null && preComputed !== undefined
+				            ? parseFloat(preComputed) || 0
+				            : parseFloat(item[scoreField]) || 0)
+				        : null;
+				}
+
 		    }
+			
+			if (sortConfigs && sortConfigs.length > 1) {
+			    const allZero = rawValues.every(v => v === null || v === 0);
+			    if (allZero) {
+			        const nextIdx = (activeSortIndex + 1);
+			        if (nextIdx < sortConfigs.length) {
+			            const nextConfig = sortConfigs[nextIdx];
+			            const nextScoreField = nextConfig.type === 'field'
+			                ? nextConfig.scoreField
+			                : nextConfig.aggregateField;
+			            for (let i = 0; i < itemCount; i++) {
+			                if (!isIncomplete[i]) {
+			                    if (nextConfig.type === 'aggregate') {
+			                        const agg = this.calculateAggregate(items[i], entityType, nextConfig);
+			                        rawValues[i] = agg === null ? 0 : agg;
+			                    } else {
+			                        const preComp = this.preComputeScore(items[i], entityType, nextScoreField);
+			                        rawValues[i] = preComp !== null && preComp !== undefined
+			                            ? parseFloat(preComp) || 0
+			                            : parseFloat(items[i][nextScoreField]) || 0;
+			                    }
+			                }
+			            }
+			            
+			        }
+			    }
+			}
+
 
 		    // ✅ COMPUTE ENGAGEMENT SCORES (0.0-1.0)
 		    const engagementScores = new Array(itemCount);
@@ -6143,25 +6456,28 @@ class SchemaOrchestrator {
 		        : { minTime: currentTime, maxTime: currentTime, timeSpan: 1 };
 
 		    // ✅ CONTEXT MESSAGE
-		    let contextMessage = '';
-		    if (scoreField && invertScore) {
-		        contextMessage = flipped
-		            ? `Bigger dots = highest ${scoreField}`
-		            : `Bigger dots = lowest ${scoreField}`;
-		    } else {
-		        const bias = sortConfig?.recencyBias ?? 'medium';
-				if (bias === 'none') {
-				    contextMessage = `Bigger dots = most ${scoreField || 'active'}`;
-				} else if (bias === 'full') {
-				    contextMessage = 'Bigger dots = most recently active';
-				} else if (bias === 'high') {
-				    contextMessage = 'Bigger dots = most recently active (value secondary)';
-				} else if (bias === 'low') {
-				    contextMessage = `Bigger dots = most ${scoreField || 'active'} (recency secondary)`;
-				} else {
-				    contextMessage = 'Bigger dots = most active recently';
-				}
-		    }
+			const activeLabel = sortConfig?.label || scoreField || 'active';
+			let contextMessage = '';
+			if (scoreField && sortConfig?.invertScore) {
+			    const flipped = !!this._contextBarFlipped;
+			    contextMessage = flipped
+			        ? `Bigger dots = highest ${activeLabel}`
+			        : `Bigger dots = lowest ${activeLabel}`;
+			} else {
+			    const bias = sortConfig?.recencyBias ?? 'medium';
+			    if (bias === 'none') {
+			        contextMessage = `Bigger dots = most ${activeLabel}`;
+			    } else if (bias === 'full') {
+			        contextMessage = 'Bigger dots = most recently active';
+			    } else if (bias === 'high') {
+			        contextMessage = 'Bigger dots = most recently active (value secondary)';
+			    } else if (bias === 'low') {
+			        contextMessage = `Bigger dots = most ${activeLabel} (recency secondary)`;
+			    } else {
+			        contextMessage = 'Bigger dots = most active recently';
+			    }
+			}
+
 
 		    return {
 		        recencyPercentiles,
@@ -6177,6 +6493,8 @@ class SchemaOrchestrator {
 		        scoreField,
 		        contextMessage,
 		        timeContext,
+				sortConfigs,
+				activeSortIndex,
 		        stats: {
 		            itemCount,
 		            canvasDimensions: { width: canvasWidth, height: canvasHeight },
@@ -6296,6 +6614,11 @@ class SchemaOrchestrator {
 		    return items;
 		}
 		
+		_pollMetaOnly(pollItem) {
+		    const { answers, votes, polls, ...meta } = pollItem || {};
+		    return meta;
+		}
+		
 		renderContextBar(items, entityType, visualScores) {
 			var self = this; 
 			console.log('[renderContextBar] received contextMessage:', visualScores?.contextMessage, 'flipped:', this._contextBarFlipped);
@@ -6377,9 +6700,129 @@ class SchemaOrchestrator {
 			        }, 300);
 			    };
 			} else {
-			    // ✅ No flip pill, just count + context message
-			    msgEl.appendChild(document.createTextNode(' ' + entityLabel + plural + ' — ' + visualScores.contextMessage));
+			    const sortConfigs = visualScores?.sortConfigs;
+			    const activeSortIndex = visualScores?.activeSortIndex ?? 0;
+			 
+			    if (sortConfigs && sortConfigs.length > 1) {
+			        // Multi-option sort — active label is tappable
+			        const activeConfig = sortConfigs[activeSortIndex];
+			        const activeLabel = activeConfig?.label
+			            || activeConfig?.scoreField
+			            || activeConfig?.aggregateField
+			            || 'active';
+			 
+			        const bias = activeConfig?.recencyBias ?? 'medium';
+			        const prefix = bias === 'none' || bias === 'low'
+			            ? ' — Bigger dots = most '
+			            : null;
+			 
+			        if (prefix) {
+			            msgEl.appendChild(document.createTextNode(entityLabel + plural + prefix));
+			 
+			            const fieldPill = document.createElement('span');
+			            fieldPill.textContent = activeLabel;
+			            fieldPill.style.cssText = `
+			                display: inline-block; padding: 1px 8px; border-radius: 10px;
+			                border: 1px solid #b2bec3; cursor: pointer; font-weight: 600;
+			                color: #2d3436; background: #f0f0f0; transition: all 0.15s;
+			                user-select: none;
+			            `;
+			            fieldPill.title = 'Click to change what dot size represents';
+			 
+			            fieldPill.onmouseenter = () => {
+			                fieldPill.style.background = '#dfe6e9';
+			                fieldPill.style.borderColor = '#636e72';
+			            };
+			            fieldPill.onmouseleave = () => {
+			                if (!document.getElementById('score-field-picker')) {
+			                    fieldPill.style.background = '#f0f0f0';
+			                    fieldPill.style.borderColor = '#b2bec3';
+			                }
+			            };
+			 
+			            fieldPill.onclick = (e) => {
+			                e.stopPropagation();
+			                const existing = document.getElementById('score-field-picker');
+			                if (existing) { existing.remove(); return; }
+			 
+			                const pillRect = fieldPill.getBoundingClientRect();
+			                const picker = document.createElement('div');
+			                picker.id = 'score-field-picker';
+			                picker.style.cssText = `
+			                    position: fixed; top: ${pillRect.bottom + 4}px; left: ${pillRect.left}px;
+			                    background: white; border: 1px solid #ddd; border-radius: 8px;
+			                    box-shadow: 0 4px 16px rgba(0,0,0,0.12); z-index: 10000;
+			                    padding: 4px 0; min-width: 180px;
+			                `;
+			 
+			                sortConfigs.forEach((config, idx) => {
+			                    const label = config.label
+			                        || config.scoreField
+			                        || config.aggregateField
+			                        || `Option ${idx + 1}`;
+			                    const isActive = idx === activeSortIndex;
+			 
+			                    const opt = document.createElement('div');
+			                    opt.textContent = label;
+			                    opt.style.cssText = `
+			                        padding: 8px 14px; cursor: pointer; font-size: 13px;
+			                        color: ${isActive ? '#6c5ce7' : '#2d3436'};
+			                        font-weight: ${isActive ? '700' : '400'};
+			                        background: ${isActive ? '#f8f6ff' : 'white'};
+			                    `;
+			                    opt.onmouseenter = () => {
+			                        if (!isActive) opt.style.background = '#f5f5f5';
+			                    };
+			                    opt.onmouseleave = () => {
+			                        opt.style.background = isActive ? '#f8f6ff' : 'white';
+			                    };
+			                    opt.onclick = (e) => {
+			                        e.stopPropagation();
+			                        picker.remove();
+			                        if (idx === activeSortIndex) return; // already active
+			                        const canvas = document.getElementById('canvas-area');
+			                        canvas.style.transition = 'opacity 0.2s ease';
+			                        canvas.style.opacity = '0.3';
+			                        setTimeout(() => {
+			                            self.setActiveSortConfig(entityType, idx);
+			                            canvas.style.opacity = '1';
+			                        }, 200);
+			                    };
+			                    picker.appendChild(opt);
+			                });
+			 
+			                document.body.appendChild(picker);
+			 
+			                // Close on outside click
+			                setTimeout(() => {
+			                    document.addEventListener('click', function closePicker() {
+			                        picker.remove();
+			                        fieldPill.style.background = '#f0f0f0';
+			                        fieldPill.style.borderColor = '#b2bec3';
+			                        document.removeEventListener('click', closePicker);
+			                    }, { once: true });
+			                }, 50);
+			            };
+			 
+			            msgEl.appendChild(fieldPill);
+			 
+			            if (bias === 'low') {
+			                msgEl.appendChild(document.createTextNode(' (recency secondary)'));
+			            }
+			        } else {
+			            // Other bias types — plain contextMessage
+			            msgEl.appendChild(document.createTextNode(
+			                ' ' + entityLabel + plural + ' — ' + visualScores.contextMessage
+			            ));
+			        }
+			    } else {
+			        // Single sort config or no toggle — plain text, unchanged behavior
+			        msgEl.appendChild(document.createTextNode(
+			            ' ' + entityLabel + plural + ' — ' + visualScores.contextMessage
+			        ));
+			    }
 			}
+
 			
 			const totalPages = Math.ceil(itemCount / (this._dotPageSize || 30));
 			if (totalPages > 1) {
@@ -6477,6 +6920,81 @@ class SchemaOrchestrator {
 			        }
 			    };
 			    bar.appendChild(pollCtrlBtn);
+				
+				// ── Reset poll button ─────────────────────────────────────────────────────────
+				const resetBtn = document.createElement('button');
+				resetBtn.textContent = '🔄 Reset Votes';
+				resetBtn.style.cssText = `
+				    background: none; border: 1px solid #b2bec3; border-radius: 12px;
+				    padding: 3px 10px; font-size: 12px; color: #636e72;
+				    cursor: pointer; font-weight: 600; margin-left: 8px;
+				`;
+				resetBtn.onmouseenter = () => {
+				    resetBtn.style.background = '#fff8f0';
+				    resetBtn.style.borderColor = '#e17055';
+				    resetBtn.style.color = '#e17055';
+				};
+				resetBtn.onmouseleave = () => {
+				    resetBtn.style.background = 'none';
+				    resetBtn.style.borderColor = '#b2bec3';
+				    resetBtn.style.color = '#636e72';
+				};
+				resetBtn.onclick = async () => {
+				    const totalVotes = (pollItem?.answers || [])
+				        .reduce((sum, a) => sum + (a.hit || 0), 0);
+
+				    // ✅ Hard stop at 10k
+				    if (totalVotes > 10000) {
+				        this.showNotification(
+				            `⛔ This poll has ${formatVoteCount(totalVotes)} votes — too large to reset. Contact support.`, 
+				            'error'
+				        );
+				        return;
+				    }
+
+				    // ✅ Warning between 5k and 10k
+				    if (totalVotes > 5000) {
+				        if (!confirm(`⚠️ This poll has ${formatVoteCount(totalVotes)} votes. Reset may take a few seconds. Continue?`)) return;
+				    } else {
+				        if (!confirm('Reset all votes? This cannot be undone. The poll will reopen and all votes will be cleared.')) return;
+				    }
+
+				    try {
+				        const creatorDisplayID = this.currentPath[0]?.displayID;
+				        const pollDisplayID    = this.currentPath[1]?.displayID;
+				        const pollPath = `apps/poll/${creatorDisplayID}/${pollDisplayID}`;
+
+				        // ✅ Single server call handles everything
+				        const res = await fetch(`/newauth/api/resetpoll/poll`, {
+				            method: 'POST',
+				            headers: { 'Content-Type': 'application/json' },
+				            body: JSON.stringify({ pollPath })
+				        });
+				        
+				        if (!res.ok) throw new Error('Reset failed');
+
+				        // ✅ Also update poll status client-side
+				        const pollSavePath = ['apps', 'poll', creatorDisplayID, pollDisplayID].join('/');
+						await this.db.saveEntityData(pollSavePath, {
+						    ...this._pollMetaOnly(pollItem),
+						    status: 'open',
+						    voteCount: 0,
+						    resetTimestamp: Date.now()
+						}, true);
+
+				        this.showNotification('🔄 Poll reset — all votes cleared, poll is open again.', 'success');
+
+				        // Re-fetch and re-render
+				        const fetchContext = [this.currentPath[0].displayID];
+				        this.data = await this.db.getAppData('poll', fetchContext, { bypassCache: true });
+				        this.render();
+
+				    } catch (e) {
+				        console.error('[resetPoll] failed:', e);
+				        this.showNotification('❌ Failed to reset poll.', 'error');
+				    }
+				};
+				bar.appendChild(resetBtn);
 			}
 			
 			// ── Non-owner: Create your own poll ──────────────────────────────────────────
@@ -8423,6 +8941,9 @@ class SchemaOrchestrator {
 		     };
 		 }
 		 dot.style.opacity = '1';
+		 dot.style.setProperty('--dot-target-opacity', '1');
+		 dot.classList.remove('dot-fade-in');
+		 dot.style.animation = 'none';
 	    
 	    // Store original position NOW (when transformation happens, dot is in DOM)
 	    if (!dot.originalPosition) {
@@ -9686,7 +10207,7 @@ class SchemaOrchestrator {
 	}
 	
 	// ✅ UPDATED NAVIGATE TO METHOD WITH FULL HISTORY SUPPORT
-	navigateTo(item, entityType) {
+	async navigateTo(item, entityType) {
 		
 		this.stopVersionPolling();
 		this._pendingRipples?.delete(item.displayID); 
@@ -9714,10 +10235,17 @@ class SchemaOrchestrator {
 
 	    
 	    // Create history state with depth information
-	    const historyState = { 
-	        depth: targetDepth,
-	        path: newPath.map(p => ({ id: p.id, entityType: p.entityType }))
-	    };
+		const historyState = {
+		    depth: targetDepth,
+		    path: newPath.map(p => ({ 
+		        id: p.id, 
+		        entityType: p.entityType,
+		        displayID: p.displayID,
+		        shortName: p.shortName  
+		    }))
+		};
+		
+		
 	    
 	    // Determine URL to use
 	    if (targetDepth <= 2) {
@@ -9730,9 +10258,78 @@ class SchemaOrchestrator {
 	        window.history.pushState(historyState, '', currentUrl);
 	    }
 		
-		// After loading customer data
-		console.log('After navigation - currentPath:', this.currentPath);  
-		console.log('After navigation - data.items:', this.data.items);
+		// ── Lazy subtree fetch ──────────────────────────────────────────────
+	    // At depth 2 (e.g. company in captable, customer in custsupport),
+	    // the parent-level fetch only assembled MAX_ASSEMBLE_DEPTH=2 levels,
+	    // meaning grants (depth 3 from investor) were never included.
+	    // Fire a subtenant-level fetch now to load the full subtree:
+	    // company → stakeholders (depth 1) → grants (depth 2).
+	    if (this.currentPath.length === 2) {
+			// Temporarily add right after: if (this.currentPath.length === 2) {
+			console.log('[navigateTo] lazy fetch check - entityType:', entityType, 
+			    'distributed:', this.currentApp?.entityConfigs?.[entityType]?.distributed,
+			    'childEntity:', this.currentApp?.entityConfigs?.[entityType]?.childEntity);
+	        const navEntityConfig = this.currentApp?.entityConfigs?.[entityType];
+	        if (navEntityConfig?.distributed && navEntityConfig?.childEntity) {
+	            try {
+	                const pathContext = this.currentPath.map((p, i) =>
+	                    i === 0 ? (p.id || p.displayID) : p.displayID
+	                );
+	                const freshData = await this.db.getAppData(
+	                    this.currentApp.id, pathContext, { bypassCache: true }
+	                );
+					// After: const freshData = await this.db.getAppData(...)
+					console.log('[navigateTo] freshData items:', freshData?.items?.length,
+					    'stakeholders:', freshData?.items?.[0]?.stakeholders?.length,
+					    'grants on first stakeholder:', freshData?.items?.[0]?.stakeholders?.[0]?.grants?.length);
+						if (freshData?.items?.length > 0) {
+						    const fetchedEntity = freshData.items[0];
+						 
+						    // Merge richer subtree into existing investor-level data in place.
+						    // Never replace this.data entirely — that loses the investor context.
+						    const parentEntityType = this.currentApp.hierarchy[0];
+						    const parentChildrenField = this.currentApp
+						        .entityConfigs[parentEntityType]?.childrenField;
+						    const parentChildren = this.data?.items?.[0]?.[parentChildrenField];
+						 
+						    if (parentChildren) {
+						        const idx = parentChildren.findIndex(c =>
+						            c.ID === fetchedEntity.ID ||
+						            c.displayID === fetchedEntity.displayID
+						        );
+						        if (idx >= 0) {
+						            // Update company in place with richer version
+						            // (now contains stakeholders with grants embedded)
+						            parentChildren[idx] = fetchedEntity;
+						            console.log('[navigateTo] merged richer subtree for',
+						                fetchedEntity.name, 'at index', idx);
+						        }
+						    }
+						 
+						    // Re-render if user is still at this entity (hasn't navigated away)
+						    if (this.currentPath.length === 2 &&
+						        this.currentPath[1].displayID === fetchedEntity.displayID) {
+								if (this.data?.items?.[0] && this.currentPath[0]) {
+								    const rootType = this.currentApp?.hierarchy?.[0];
+								    const resolvedName = this.getShortName(this.data.items[0], rootType);
+								    if (resolvedName && resolvedName !== 'Unnamed') {
+								        this.currentPath[0].shortName = resolvedName;
+								    }
+								}
+
+						        this.render();
+						    }
+						}
+
+	            } catch (e) {
+	                console.warn('[navigateTo] lazy subtree fetch failed:', e.message);
+	            }
+	        }
+	    }
+
+	    // After loading customer data
+	    console.log('After navigation - currentPath:', this.currentPath);
+	    console.log('After navigation - data.items:', this.data.items);
 	}
 
 
@@ -9898,48 +10495,51 @@ class SchemaOrchestrator {
 		                return; // Prevents any further execution
 		            }
 		            
-		            // ✅ NON-OWNERS: PRESERVED EXACTLY FROM YOUR ORIGINAL CODE (NO CHANGES)
-		            const urlInfo = this.parseUrlForDataFetch();
-		            const savedContexts = this.getLastViewedContext(urlInfo?.appId);
-		            const savedContext = savedContexts?.[0];
-		            
-		            if (savedContext && savedContext.path?.length > 0) {
-		                this.currentPath = [];
-		                for (let i = 0; i < savedContext.path.length; i++) {
-		                    const id = savedContext.path[i];
-		                    let displayID = id;
-		                    if (displayID.includes('-')) {
-		                        displayID = this.db.hashUUID(id);
-		                    }
-		                    const entityType = this.currentApp.hierarchy[i];
-		                    this.currentPath.push({
-		                        id: id,
-		                        displayID: displayID, 
-		                        shortName: this.getShortName({ ID: id, displayID }, entityType) || id.substring(0, 8),
-		                        entityType: entityType
-		                    });
-		                }
-		                
-		                this.updateUrl();
-		                const pathContext = this.currentPath.map(item => item.displayID);
-		                this.db.getAppData(this.currentApp.id, pathContext).then(data => {
-		                    this.data = data;
-		                    console.log('[Breadcrumb] Tenant owner - loaded data for tenant:', savedContext.path[0]);
-		                    this.render();
-		                    this.updateBreadcrumb();
-		                }).catch(error => {
-		                    console.error('[Breadcrumb] Error fetching tenant data:', error);
-		                    this.render();
-		                    this.updateBreadcrumb();
-		                });
-		            } else {
-		                this.currentPath = [];
-		                this.updateUrl();
-		                await this.loadAppSelector();
-		                this.data = { items: [] };
-		                this.render();
-		                this.updateBreadcrumb();
-		            }
+					// ✅ NON-OWNERS / DATA OWNERS: Navigate home using savedContext
+					const urlInfo = this.parseUrlForDataFetch();
+					const savedContexts = this.getLastViewedContext(urlInfo?.appId);
+					const savedContext = savedContexts?.[0];
+					 
+					if (savedContext && savedContext.path?.length > 0) {
+					    this.currentPath = [];
+					    for (let i = 0; i < savedContext.path.length; i++) {
+					        const id = savedContext.path[i];
+					        let displayID = id;
+					        if (displayID.includes('-')) {
+					            displayID = this.db.hashUUID(id);
+					        }
+					        const entityType = this.currentApp.hierarchy[i];
+					 
+					        // Resolve name from this.data — the full tree is already in memory.
+					        // items[0] is the investor entity with name:'bdsd', no fetch needed.
+					        const existingItem = this.data?.items?.find(item =>
+					            item.ID === id || item.displayID === displayID
+					        );
+					        const resolvedName = existingItem
+					            ? this.getShortName(existingItem, entityType)
+					            : null;
+					 
+					        this.currentPath.push({
+					            id: id,
+					            displayID: displayID,
+					            shortName: resolvedName || id.substring(0, 8),
+					            entityType: entityType
+					        });
+					    }
+					 
+					    this.updateUrl();
+					    this.render();
+					    this.updateBreadcrumb();
+					 
+					} else {
+					    this.currentPath = [];
+					    this.updateUrl();
+					    await this.loadAppSelector();
+					    this.data = { items: [] };
+					    this.render();
+					    this.updateBreadcrumb();
+					}
+
 		            return;
 		        }
 		        
@@ -9971,7 +10571,8 @@ class SchemaOrchestrator {
 		                        id: p.id, 
 		                        entityType: p.entityType,
 		                        displayID: p.displayID,
-		                        hashed: p.hashed
+		                        hashed: p.hashed,
+								shortName: p.shortName 
 		                    }))
 		                };
 		                
@@ -10028,6 +10629,19 @@ class SchemaOrchestrator {
 	        alert('Entity schema not found');
 	        return;
 	    }
+		
+		// childEntity lives in the APPSCHEMA (this.currentApp.entityConfigs),
+		// not in entitySchema (which is the natent object — fields/name/etc only).
+		const appEntityConfig = this.currentApp?.entityConfigs?.[nextEntityType];
+		const childEntityType = appEntityConfig?.childEntity || null;
+		 
+		let childNounForAccess = 'items';
+		if (childEntityType) {
+		    const childNatent = await this.getEntityConfig(childEntityType);
+		    childNounForAccess = childNatent?.name
+		        ? (childNatent.name.toLowerCase() + 's')
+		        : (childEntityType + 's');
+		}
 
 	    const modal = document.getElementById('add-modal');
 	    const title = document.getElementById('modal-title');
@@ -10160,12 +10774,38 @@ class SchemaOrchestrator {
 		            accessLabel.textContent = 'Access';
 		            accessGroup.appendChild(accessLabel);
 
-		            const accessOptions = [
-		                { value: 'private',  readAccess: 'owner', writeAccess: 'owner', icon: '🔒', label: 'Private',       desc: 'Only you can access this' },
-		                { value: 'self',     readAccess: 'self',  writeAccess: 'owner', icon: '👁',  label: 'Own data only', desc: 'Each person sees only their own data' },
-		                { value: 'readonly', readAccess: 'any',   writeAccess: 'owner', icon: '👥',  label: 'Read only',     desc: 'Anyone with the link can view all' },
-		                { value: 'open',     readAccess: 'any',   writeAccess: 'any',   icon: '✏️',  label: 'Open',          desc: 'Anyone can view and add' },
-		            ];
+					const accessOptions = [
+					    {
+					        value: 'private',
+					        readAccess: 'owner',
+					        writeAccess: 'owner',
+					        icon: '🔒',
+					        label: 'Private',
+					        desc: `Only you can access this ${entitySchema.name.toLowerCase()} page and data under it`
+					    },
+					    {
+					        value: 'readonly',
+					        readAccess: 'any',
+					        writeAccess: 'owner',
+					        icon: '👥',
+					        label: 'Read only',
+					        desc: `Anyone with this ${entitySchema.name.toLowerCase()} page's link can view it and everything inside it`
+					    },
+					    {
+					        value: 'open',
+					        readAccess: 'any',
+					        writeAccess: 'any',
+					        icon: '✏️',
+					        label: 'Open',
+					        desc: childEntityType
+					            ? `Anyone with this ${entitySchema.name.toLowerCase()} page's link can view it and add new ${childNounForAccess} inside it`
+					            : `Anyone with this ${entitySchema.name.toLowerCase()} page's link can view and edit it`
+					    },
+					];
+
+
+
+
 
 		            const pillContainer = document.createElement('div');
 		            pillContainer.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
@@ -11143,12 +11783,19 @@ class SchemaOrchestrator {
 	            console.log('[_executeImport] children count:', previewItem.children?.length);
 
 	            // ✅ Build entity path
-	            const entityPath = [
-	                'apps',
-	                this.currentApp.id,
-	                ...this.currentPath.map(p => p.displayID),
-	                targetItem.displayID
-	            ].join('/');
+
+				const tenantSegment = this.currentPath.length > 0
+				    ? (this.currentPath[0].id || this.currentPath[0].displayID)
+				    : null;
+				const restSegments = this.currentPath.slice(1).map(p => p.displayID);
+				 
+				const entityPath = [
+				    'apps',
+				    this.currentApp.id,
+				    ...(tenantSegment !== null ? [tenantSegment, ...restSegments] : []),
+				    targetItem.displayID
+				].join('/');
+
 
 	            entitiesToSave.push({
 	                path: entityPath,
@@ -11356,8 +12003,10 @@ class SchemaOrchestrator {
 	        newItem.timestamp = Date.now();
 	        newItem.hidden = false;
 	        newItem.hashed = false;
-	        newItem.writeAccess = 'owner';
-	        newItem.readAccess = 'owner';
+			const _readField = entityConfig.fields.find(f => f.name === 'readAccess');
+			const _writeField = entityConfig.fields.find(f => f.name === 'writeAccess');
+			newItem.readAccess = _readField?.default || 'owner';
+			newItem.writeAccess = _writeField?.default || 'owner';
 	    }
 
 	    // ✅ Process form data
@@ -11518,12 +12167,19 @@ class SchemaOrchestrator {
 	        }
 
 	        // ✅ UNIVERSAL SAVE - same path for everyone
-	        const entityPath = [
-	            'apps',
-	            this.currentApp.id,
-	            ...this.currentPath.map(p => p.displayID),
-	            newItem.displayID
-	        ].join('/');
+
+			const tenantSegment = this.currentPath.length > 0
+			    ? (this.currentPath[0].id || this.currentPath[0].displayID)
+			    : null;
+			const restSegments = this.currentPath.slice(1).map(p => p.displayID);
+			 
+			const entityPath = [
+			    'apps',
+			    this.currentApp.id,
+			    ...(tenantSegment !== null ? [tenantSegment, ...restSegments] : []),
+			    newItem.displayID
+			].join('/');
+
 
 	        console.log('[TTT addItem] newItem before save:', JSON.stringify(newItem).substring(0, 300));
 			await this.db.saveEntityData(entityPath, newItem, false);
@@ -11566,24 +12222,26 @@ class SchemaOrchestrator {
 			        }
 			    }
 
-	            this.currentPath = [{
-	                id: newItem.ID,
-	                displayID: newItem.displayID,
-	                shortName: newItem.name || newItem.orgname || 'New ' + entityDisplayName,
-	                hashed: newItem.hashed,
-	                entityType: entityType
-	            }];
+				this.currentPath = [{
+				    id: newItem.ID,
+				    displayID: newItem.displayID,
+				    shortName: newItem.name || newItem.orgname || 'New ' + entityDisplayName,
+				    hashed: newItem.hashed,
+				    entityType: entityType
+				}];
+				 
+				window.history.pushState({}, '', this.getAppUrl(this.currentPath));
+				 
+				try {
+				    // Use .id (the raw UUID) here, NOT .displayID — see file header.
+				    const freshData = await this.db.getAppData(
+				        this.currentApp.id, [this.currentPath[0].id || this.currentPath[0].displayID]
+				    );
+				    this.data = freshData;
+				} catch (error) {
+				    console.warn('Failed to fetch fresh tenant data:', error);
+				}
 
-	            window.history.pushState({}, '', this.getAppUrl(this.currentPath));
-
-	            try {
-	                const freshData = await this.db.getAppData(
-	                    this.currentApp.id, [this.currentPath[0].displayID]
-	                );
-	                this.data = freshData;
-	            } catch (error) {
-	                console.warn('Failed to fetch fresh tenant data:', error);
-	            }
 
 	            this.render();
 	            this.updateBreadcrumb();
@@ -11633,11 +12291,14 @@ class SchemaOrchestrator {
 
 			// ✅ Post-save: re-fetch and re-render in place if navigation suppressed
 			if (skipNavigation) {
-			    let pathContext = this.currentPath.map(p => p.displayID);
-			    // Poll at depth 2: fetch from creator level to get assembled answers
-			    if (this.currentApp.id === 'poll' && pathContext.length === 2) {
-			        pathContext = [pathContext[0]];
-			    }
+			    // Tenant segment (index 0) uses .id when available, not .displayID —
+			    // same fix as the root-level refetch above and init()'s savedContext
+			    // branch. Every other segment stays .displayID.
+			    let pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
+				if (this.currentApp.id === 'poll' && pathContext.length === 2 && this.isDataOwner()) {
+				    pathContext = [pathContext[0]];
+				}
+
 			    try {
 			        this.data = await this.db.getAppData(
 			            this.currentApp.id,
@@ -11650,6 +12311,7 @@ class SchemaOrchestrator {
 			    this.render();
 			    this.updateBreadcrumb();
 			}
+
 
 	    } catch (error) {
 	        console.error('Error during add:', error);
@@ -11928,8 +12590,14 @@ class SchemaOrchestrator {
 	    // Ensure other base fields have defaults
 	    if (item.hidden === undefined) item.hidden = false;
 	    if (item.hashed === undefined) item.hashed = false;
-	    if (item.writeAccess === undefined) item.writeAccess = 'owner';
-	    if (item.readAccess === undefined) item.readAccess = 'owner';
+		if (item.writeAccess === undefined) {
+		    const writeField = entityConfig?.fields?.find(f => f.name === 'writeAccess');
+		    item.writeAccess = writeField?.default || 'owner';
+		}
+		if (item.readAccess === undefined) {
+		    const readField = entityConfig?.fields?.find(f => f.name === 'readAccess');
+		    item.readAccess = readField?.default || 'owner';
+		}
 	    if (!item.timestamp) item.timestamp = Date.now();
 	    
 		if (!item.dotLabel && item.name) {
@@ -12313,18 +12981,19 @@ class SchemaOrchestrator {
 	    console.log('[Refresh] STARTED - _isRefreshing set to true');
 	    
 	    try {
-	        let pathContext = this.currentPath.map(item => item.displayID);
-	       
-			// ✅ Poll at depth 2: fetch from creator level to get assembled answers
-			if (this.currentApp.id === 'poll' && pathContext.length === 2) {
+			let pathContext = this.currentPath.map((item, i) => i === 0 ? (item.id || item.displayID) : item.displayID);
+			 
+			if (this.currentApp.id === 'poll' && pathContext.length === 2 && this.isDataOwner()) {
 			    pathContext = [pathContext[0]];
 			}
-			
+
+			 
 			const freshPartial = await this.db.getAppData(
-			    this.currentApp.id, 
+			    this.currentApp.id,
 			    pathContext,
-			    { bypassCache: true } // ✅ Signal to bypass cache
+			    { bypassCache: true }
 			);
+
 			console.log('[Refresh] Fresh data received - items:', freshPartial?.items?.length);
 
 	        
