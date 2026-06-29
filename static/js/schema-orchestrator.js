@@ -1124,28 +1124,39 @@ class SchemaOrchestrator {
 		            const targetId = urlInfo.pathIds[0];
 
 		            // ✅ Access validation for non-owners
-		            if (!isowner) {
-		                const hasRealUuid = this.isRealUuid(targetId);
-		                if (!hasRealUuid) {
-		                    const savedContexts = this.getLastViewedContext(urlInfo.appId);
-		                    const savedContext = savedContexts?.[0];
-		                    let canAccess = false;
+					if (!isowner) {
+					    const hasRealUuid = this.isRealUuid(targetId);
+					    if (!hasRealUuid) {
+					        const savedContexts = this.getLastViewedContext(urlInfo.appId);
+					        const savedContext = savedContexts?.[0];
+					        let canAccess = false;
+					 
+					        if (savedContext) {
+					            const savedId = savedContext.path[0];
+					            const creatorMatches = savedId === targetId ||
+					                (savedId.includes('-') && this.db.hashUUID(savedId) === targetId);
+					 
+					            if (creatorMatches) {
+					                // For depth-1 (creator root) access, require ownership proof:
+					                // either isOwnerAccess flag (data owner) or a depth-1 saved path.
+					                // A poll voter's savedContext has path.length >= 2 and no
+					                // isOwnerAccess — they should not reach the creator root.
+					                const entitledToDepth1 = savedContext.isOwnerAccess === true ||
+					                    savedContext.path.length === 1;
+					 
+					                if (entitledToDepth1) {
+					                    canAccess = true;
+					                }
+					            }
+					        }
+					 
+					        if (!canAccess) {
+					            this.showNotification('Access restricted: You cannot view this page.', 'error');
+					            return;
+					        }
+					    }
+					}
 
-		                    if (savedContext) {
-		                        const savedId = savedContext.path[0];
-		                        if (savedId === targetId) {
-		                            canAccess = true;
-		                        } else if (savedId.includes('-')) {
-		                            canAccess = this.db.hashUUID(savedId) === targetId;
-		                        }
-		                    }
-
-		                    if (!canAccess) {
-		                        this.showNotification('Access restricted: You cannot view this tenant.', 'error');
-		                        return;
-		                    }
-		                }
-		            }
 
 					await this.loadAppSelector();
 					 
@@ -1583,33 +1594,55 @@ class SchemaOrchestrator {
 		        answerDisplayId, voteDisplayID
 		    ].join('/');
 
-		    try {
-		        await this.db.saveEntityData(votePath, voteItem, false);
+			   try {
+			       await this.db.saveEntityData(votePath, voteItem, false);
 
-		        // ✅ Store only current vote — replace entire entry for changeable
-		        localStorage.setItem(votedKey, JSON.stringify({
-		            ...(voteMode !== 'changeable' ? votedAnswers : {}),
-		            [answerId]: {
-		                voteId:          voteDisplayID,
-		                votePath:        votePath,
-		                answerDisplayId: answerDisplayId,
-		                timestamp:       Date.now()
-		            }
-		        }));
+			       // ✅ Store vote in localStorage
+			       localStorage.setItem(votedKey, JSON.stringify({
+			           ...(voteMode !== 'changeable' ? votedAnswers : {}),
+			           [answerId]: {
+			               voteId:          voteDisplayID,
+			               votePath:        votePath,
+			               answerDisplayId: answerDisplayId,
+			               timestamp:       Date.now()
+			           }
+			       }));
 
-		        // Re-fetch from creator level
-		        const pathContext = this.currentPath.map(p => p.displayID);
-		        const fetchContext = this.currentApp.id === 'poll' && pathContext.length === 2
-		            ? [pathContext[0]]
-		            : pathContext;
-		        this.data = await this.db.getAppData('poll', fetchContext, { bypassCache: true });
-		        this.render();
-		        this.showNotification(supersedesId ? '✅ Vote changed!' : '✅ Vote added!', 'success');
+			       // ✅ Update answer hit count in-memory — no re-fetch needed.
+			       // this.data already has the full tree. Replacing it with a fresh fetch
+			       // requires the raw UUID (not displayID hash) for owner access, and is
+			       // unnecessary since we know exactly what changed: one answer's hit count.
+			       const treePoll = this.data?.items?.find(i => i.entityType === 'poll')
+			           || this.data?.items?.[0]?.polls?.find(p => p.displayID === pollDisplayID)
+			           || this.data?.items?.[0]?.polls?.[0];
 
-		    } catch (err) {
-		        console.error('[castVote] failed:', err);
-		        this.showNotification('❌ Failed to cast vote. Please try again.', 'error');
-		    }
+			       if (treePoll) {
+			           const answerItem = treePoll.answers?.find(a =>
+			               a.displayID === answerDisplayId || a.ID === answerId
+			           );
+			           if (answerItem) {
+			               answerItem.hit = (answerItem.hit || 0) + 1;
+			           }
+
+			           // If changeable and we decremented a previous answer, reflect that too
+			           if (prevEntry?.answerDisplayId && prevEntry.answerDisplayId !== answerDisplayId) {
+			               const prevAnswerItem = treePoll.answers?.find(a =>
+			                   a.displayID === prevEntry.answerDisplayId
+			               );
+			               if (prevAnswerItem) {
+			                   prevAnswerItem.hit = Math.max(0, (prevAnswerItem.hit || 0) - 1);
+			               }
+			           }
+			       }
+
+			       this.render();
+			       this.showNotification(supersedesId ? '✅ Vote changed!' : '✅ Vote added!', 'success');
+
+			   } catch (err) {
+			       console.error('[castVote] failed:', err);
+			       this.showNotification('❌ Failed to cast vote. Please try again.', 'error');
+			   }
+
 		}
 
 		// ─── POLL: add picker menu ────────────────────────────────────────────────────
@@ -6423,10 +6456,14 @@ class SchemaOrchestrator {
 		    }
 
 		    // ✅ SMART SIZE SCALING
-		    const charLength = Math.sqrt(canvasArea / Math.max(1, itemCount));
-		    const maxSizeRaw = 0.35 * charLength;
-		    const maxSize = Math.min(72, Math.max(16, maxSizeRaw));
-		    const minSize = Math.max(20, maxSize * 0.15);
+			const realEstatePerDot = canvasArea / Math.max(1, itemCount);
+			const cellSize = Math.sqrt(realEstatePerDot);
+
+			const packingLimit = Math.sqrt(canvasArea * 0.35 / Math.max(1, itemCount)) * 2;
+			const viewportCap = Math.min(canvasWidth, canvasHeight) * 0.16;  // was 0.20
+			const maxSize = Math.min(cellSize * 0.45, packingLimit, viewportCap);  // was 0.55
+			const minTapSize = Math.min(canvasWidth, canvasHeight) * 0.08; // 8% of shorter dimension
+			const minSize = Math.max(cellSize * 0.09, minTapSize);  // replaces the fixed 14
 
 		    const sortedScores = [...engagementScores].sort((a, b) => a - b);
 		    const len = sortedScores.length;
@@ -6495,22 +6532,22 @@ class SchemaOrchestrator {
 		        timeContext,
 				sortConfigs,
 				activeSortIndex,
-		        stats: {
-		            itemCount,
-		            canvasDimensions: { width: canvasWidth, height: canvasHeight },
-		            canvasArea: Math.round(canvasArea),
-		            charLength: charLength.toFixed(1),
-		            spacePerItem: (canvasArea / itemCount).toFixed(0),
-		            maxHit: Math.max(...safeHits, 0),
-		            minAge: Math.min(...agesInMs),
-		            maxAge: Math.max(...agesInMs),
-		            sizeRange: {
-		                min: minSize.toFixed(1),
-		                max: maxSize.toFixed(1),
-		                ratio: (minSize / maxSize).toFixed(2),
-		                formula: `15% of sqrt(canvasArea/${itemCount})`
-		            }
-		        }
+				stats: {
+				    itemCount,
+				    canvasDimensions: { width: canvasWidth, height: canvasHeight },
+				    canvasArea: Math.round(canvasArea),
+				    cellSize: cellSize.toFixed(1),              // ← was charLength
+				    spacePerItem: (canvasArea / itemCount).toFixed(0),
+				    maxHit: Math.max(...safeHits, 0),
+				    minAge: Math.min(...agesInMs),
+				    maxAge: Math.max(...agesInMs),
+				    sizeRange: {
+				        min: minSize.toFixed(1),
+				        max: maxSize.toFixed(1),
+				        ratio: (minSize / maxSize).toFixed(2),
+				        formula: `cellSize * 0.55 / 0.12 per sqrt(canvasArea/${itemCount})`  
+				    }
+				}
 		    };
 		}
 		
