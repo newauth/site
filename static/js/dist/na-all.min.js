@@ -587,6 +587,23 @@ function submitFormAjax(url, formname)
         	//if (debugappui) 
         	
         	if (url == '/newauth/authenticate') {
+                
+                // ── SSO intercept ─────────────────────────────────────────
+                // If server redirected to an SSO page, do a full page navigation
+                // Scripts in innerHTML don't execute — SSO pages need full load
+                if (xmlhttp.responseURL) {
+                    var finalUrl = xmlhttp.responseURL;
+                    var ssoPages = ['/sso/onboard', '/sso/register',
+                                    '/sso/welcome', '/sso/clients'];
+                    var isSsoRedirect = ssoPages.some(function(page) {
+                        return finalUrl.indexOf(page) !== -1;
+                    });
+                    if (isSsoRedirect) {
+                        window.location.href = finalUrl;
+                        
+                        return;
+                    }
+                }
 				
 				if (document.getElementById('app-header') != null) {
         			removeheaderandfooter();
@@ -625,6 +642,18 @@ function submitFormAjax(url, formname)
         	if ( url == '/newauth/postAuthClickData') {
         		//alert(url + ' onreadystatechange 4  ' +  xmlhttp.status);
             	//console.log(url + ' within status 200: ' + xmlhttp.status + ' resp: ' + xmlhttp.responseText); // Here is the response
+                
+                // ── SSO intercept ─────────────────────────────────────────
+                if (xmlhttp.responseURL) {
+                    var finalUrl = xmlhttp.responseURL;
+                    if (finalUrl.indexOf('/vn/sso/') !== -1 ||
+                        finalUrl.indexOf('/sso/') !== -1 ||
+                        finalUrl.indexOf('/oauth2/authorize/resume') !== -1) {
+                        window.location.href = finalUrl;
+                        return;
+                    }
+                }
+                    
         		if (document.getElementById("re-auth-overlay") != null) { // this was a submit from within re-auth-overlay
 	      			
         			if ('FAIL' == xmlhttp.getResponseHeader("AUTH_RESULT")) { 
@@ -7376,104 +7405,57 @@ function showurlinapp(url) {
 }
 
 
-function showurloverapp(url) { // thisdoes not remove the app div
-	//alert('will show topic ' + topic + ' in app');	
-	
-	//document.body.innerHTML = '';
-	fadeoutelement('app');
-	var displayloadingcontainer = document.createElement("div");
-	displayloadingcontainer.setAttribute("id", "displayloadingcontainer");
-	displayloadingcontainer.style.position = 'absolute';
-	displayloadingcontainer.style.margin = 'auto'; 
-	displayloadingcontainer.style.top='0'; 
-	displayloadingcontainer.style.left='0'; 
-	displayloadingcontainer.style.right='0'; 
-	displayloadingcontainer.style.bottom='0'; 
-	displayloadingcontainer.style.width= '200px'; 
-	displayloadingcontainer.style.height= '40px' ;	
-			
-	var loader = document.createElement('div');
-	loader.classList.add('loader');
-	loader.innerHTML = "<h4>Loading...</h4>";
-	displayloadingcontainer.appendChild(loader);	
-	
-	displayloadingcontainer.style.zIndex = '1000';
-	displayloadingcontainer.style.opacity = '1';
-	
-	document.getElementById('app').appendChild(displayloadingcontainer);
-	displayloadingicon();	
-	
-	//alert('loader added ' );	
-	
-	var flakeoverlay = document.getElementById("url-over-app-display"); // this id is setup as blocking overlay
-	
-	if (flakeoverlay != null) {
-		removediv(flakeoverlay);
-	}	
-	
-	flakeoverlay = document.createElement("div");
-	flakeoverlay.setAttribute("id", "url-over-app-display");
-	document.body.appendChild(flakeoverlay);	
-	
-	let closeanchor = document.createElement('span');
-    closeanchor.innerHTML = '&times;';
-    closeanchor.style.float='right';
-    closeanchor.style.padding= '5px';
-    closeanchor.style.fontSize= '4em';
-    closeanchor.style.top= '-0.4em';
-    closeanchor.style.right = '0px';
-    closeanchor.style.zIndex = '10000';
-    closeanchor.style.position= 'absolute';
-    closeanchor.style.display = 'inline-block';
-    closeanchor.style.color = 'darkgray';
-    closeanchor.style.cursor = 'default';
-    closeanchor.addEventListener('mouseover', function(e) {
-    	e.target.style.color = '#d3d3d3';
-    });
-    closeanchor.addEventListener('mouseout', function(e) {
-    	e.target.style.color = '#a2a2a2';
-    });
-    
-    closeanchor.addEventListener('click', function() {
-    	hideloadingicon();
-    	$("#url-over-app-display").fadeOut(200);
-    	if (postimagesinterval) clearInterval(postimagesinterval);
-    	if (settimeoutid) clearTimeout(settimeoutid);
-    	
-    	document.body.removeEventListener('click', topicdocumentclick);
-    	document.title = 'newauth';
+function showurloverapp(url) {
+    var existing = document.getElementById("url-over-app-display");
+    if (existing) removediv(existing);
 
-    	//alert('closing ');
-    	fadeinelement('app');
-    	//loadWelcome();
+    var frame = document.createElement('iframe');
+    frame.setAttribute('id', 'url-over-app-display');
+    frame.setAttribute('src', url);
+    frame.style.position = 'fixed';
+    frame.style.top = '0';
+    frame.style.left = '0';
+    frame.style.width = '100vw';
+    frame.style.height = '100vh';
+    frame.style.zIndex = '9999';
+    frame.style.border = 'none';
+    frame.style.backgroundColor = '#fbfbfb';
+    document.body.appendChild(frame);
+    frame.style.setProperty('display', 'block', 'important');
+
+    var closeanchor = document.createElement('span');
+    closeanchor.innerHTML = '&times;';
+    closeanchor.style.position = 'fixed';
+    closeanchor.style.top = '12px';
+    closeanchor.style.right = '18px';
+    closeanchor.style.fontSize = '2.6em';
+    closeanchor.style.lineHeight = '1';
+    closeanchor.style.zIndex = '10000';
+    closeanchor.style.color = '#b0b0b0';
+    closeanchor.style.cursor = 'pointer';
+    closeanchor.style.userSelect = 'none';
+    closeanchor.setAttribute('title', 'Close');
+    closeanchor.setAttribute('role', 'button');
+    closeanchor.setAttribute('aria-label', 'Close');
+    closeanchor.addEventListener('mouseover', function() { closeanchor.style.color = '#4a4a4a'; });
+    closeanchor.addEventListener('mouseout',  function() { closeanchor.style.color = '#b0b0b0'; });
+
+    function handleEsc(e) { if (e.key === 'Escape') closeOverlay(); }
+
+    function closeOverlay() {
+        removediv(document.getElementById('url-over-app-display'));
+        removediv(closeanchor);
+        document.removeEventListener('keydown', handleEsc);
+        document.title = 'newauth';
+    }
+
+    closeanchor.addEventListener('click', function(e) {
+        e.stopPropagation();
+        closeOverlay();
     });
-   
-	
-	var xhr = window.XMLHttpRequest ? new XMLHttpRequest() : new ActiveXObject("Microsoft.XMLHTTP");
-	//var url = '/t/' +  topic;
-	//alert('in getfullfilefrompost ' + seq + ' ' + flake);
-	xhr.open('GET', url , false);
-    xhr.setRequestHeader('Content-Type', 'application/json');  
-    
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState == 4 && xhr.status == 200) {
-           
-        	var res = xhr.responseText;        	
-        	if (res != null && res.length > 0) {
-        		//alert(res);
-        		// console.log('got data..' +  res);        		
-        		
-        		flakeoverlay.innerHTML = res;
-        		flakeoverlay.appendChild(closeanchor);
-        		flakeoverlay.style.display = 'inline-block';
-        		loadPageScripts('url-over-app-display');
-        		clearTimeout(appcalltimeoutid);
-        		//fadeinelement('app');
-        	}
-        }
-    }		    
-   
-    xhr.send(null);
+    document.addEventListener('keydown', handleEsc);
+    document.body.appendChild(closeanchor);
+
     return false;
 }
 
