@@ -60,9 +60,19 @@
     crypto.getRandomValues(a);
     return b64u(a);
   }
+  
+  function randomBase64url(n) {
+    const a = new Uint8Array(n);
+    crypto.getRandomValues(a);
+    return btoa(String.fromCharCode(...a))
+      .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+  }
 
   // ── Start OIDC flow ─────────────────────────────────────────
   function startFlow() {
+    const nonce = randomBase64url(16);
+    sessionStorage.setItem('newauth_nonce', nonce);
+    
     var verifier = generateVerifier();
     generateChallenge(verifier).then(function(challenge) {
       var state = generateState();
@@ -75,6 +85,7 @@
         response_type:         'code',
         scope:                 config.scope,
         state:                 state,
+        nonce:                 nonce,
         code_challenge:        challenge,
         code_challenge_method: 'S256'
       });
