@@ -594,7 +594,8 @@ function submitFormAjax(url, formname)
                 if (xmlhttp.responseURL) {
                     var finalUrl = xmlhttp.responseURL;
                     var ssoPages = ['/sso/onboard', '/sso/register',
-                                    '/sso/welcome', '/sso/clients'];
+                                    '/sso/welcome', '/sso/clients',
+                                    '/oauth2/authorize'];
                     var isSsoRedirect = ssoPages.some(function(page) {
                         return finalUrl.indexOf(page) !== -1;
                     });
@@ -1152,6 +1153,21 @@ function loadUrlAjax(url, target)
         	}
         	
         	if (url.startsWith("/newauth/authenticate")) {
+                
+                if (xmlhttp.responseURL) {
+                    var finalUrl = xmlhttp.responseURL;
+                    var ssoPages = ['/sso/onboard', '/sso/register',
+                                    '/sso/welcome', '/sso/clients',
+                                    '/oauth2/authorize'];
+                    var isSsoRedirect = ssoPages.some(function(page) {
+                        return finalUrl.indexOf(page) !== -1;
+                    });
+                    if (isSsoRedirect) {
+                        window.location.href = finalUrl;
+                        
+                        return;
+                    }
+                }
 	
 				if (document.getElementById('app-header') != null) {
         			removeheaderandfooter();
@@ -1613,13 +1629,42 @@ function fadeoutviajquery(elemid,sp) {
 	$('#'+elemid).fadeOut(speed);
 }
 
-function fadeincircleinfo(elem,sp) {
-	var speed = sp || 'fast';
-	var cinfoelemid = elem.getElementsByClassName('circle-info')[0].id;
-	//console.log('current display value for div ' + document.getElementById(cinfoelemid).style.display);
-	document.getElementById(cinfoelemid).style.display = 'block';
-	//console.log('new display value for div ' + document.getElementById(cinfoelemid).style.display);
-	//$("#"+cinfoelemid).fadeIn();
+function fadeincircleinfo(elem, sp) {
+    var infoEl = elem.getElementsByClassName('circle-info')[0];
+    if (!infoEl) return;
+
+    var raw = infoEl.innerText || infoEl.textContent || '';
+    var name = raw.replace(/Login/gi, '').replace(/\s+/g, ' ').trim();
+
+    infoEl.innerHTML =
+        '<div style="font-size:11px;font-weight:600;color:#2d2d2d;' +
+        'text-align:center;line-height:1.3;' +
+        'text-shadow:0 1px 3px rgba(255,255,255,0.9),' +
+        '0 0 8px rgba(255,255,255,0.9)">' +
+        name + '</div>';
+
+    // Force animation off via style attribute -- beats CSS cascade
+    infoEl.style.cssText =
+        'position:absolute;' +
+        'top:100%;' +
+        'left:50%;' +
+        'transform:translateX(-50%);' +
+        'margin-top:6px;' +
+        'display:block;' +
+        'pointer-events:none;' +
+        'z-index:5;' +
+        'width:110px;' +
+        'overflow:hidden;' +
+        'text-overflow:ellipsis;' +
+        'white-space:nowrap;' +
+        'text-align:center;' +
+        'animation:none;' +
+        '-webkit-animation:none;';
+
+    // Belt and suspenders -- also set directly since cssText
+    // may not override !important animations in all browsers
+    infoEl.style.setProperty('animation', 'none', 'important');
+    infoEl.style.setProperty('-webkit-animation', 'none', 'important');
 }
 
 function fadeoutcircleinfo(elem,sp) {
