@@ -588,6 +588,7 @@ function submitFormAjax(url, formname)
         	
         	if (url == '/newauth/authenticate') {
                 
+                 
                 // ── SSO intercept ─────────────────────────────────────────
                 // If server redirected to an SSO page, do a full page navigation
                 // Scripts in innerHTML don't execute — SSO pages need full load
@@ -618,8 +619,16 @@ function submitFormAjax(url, formname)
         		fadeinelement('app');
         		
         		if (document.querySelector('.auth-image-main-container')) {
+                    if (window.NewauthWebAuthn) {
+                        NewauthWebAuthn.captureRegOptionsFromDom();  
+                    }
         			afterauthscreenload(false);
-        		} else if (document.getElementById('setup-page-id')) {// Got redirected to setup page 
+        		} else if (document.getElementById('webauthnGate')) {  // ← NEW branch
+                    afterauthscreenload(false);
+                    if (window.NewauthWebAuthn) {
+                        NewauthWebAuthn.initGate();
+                    }
+                } else if (document.getElementById('setup-page-id')) {// Got redirected to setup page 
         			//alert('yes');
         			loadUrlAjax('/newauth/header?page=setupUser&pendSetup=true', 'app-header');
         			
@@ -665,56 +674,80 @@ function submitFormAjax(url, formname)
         				clearoverlay("re-auth-overlay");
         				//document.getElementById("re-auth-overlay").innerHTML = null;
         			}
-        		} else { // this was a regular submit from app
-        			document.getElementById('app').innerHTML = xmlhttp.responseText;
-        			if (document.querySelector('.auth-image-main-container')) {
-        				//console.log('AUTH_RESULT header ' + xmlhttp.getResponseHeader("AUTH_RESULT"));
-        				var respheader = xmlhttp.getResponseHeader("AUTH_RESULT");
-            			if ('FAIL' == respheader) {
-            				//alert('failure found');
-            				//cleardiv(document.getElementById("displayauthenticatingcontainer"));
-            				//cleardiv(document.getElementById("displayloadingcontainer"));
-            				hideloadingicon();
-            				showAuthFailureDialog();
-            				settimeoutid = setTimeout(function(){ 
-            					clearAuthFailureDialog();
-            					//alert('about to run afterauthscreenload');
-            					
-            				}, 1000);
-            				
-            				//setTimeout(function(){ 
-            					afterauthscreenload(false); 
-            					
-            				//}, 400);
-            				//afterauthscreenload(false); 
-            				
-            			} else {
-            				hideloadingicon();
-            				afterauthscreenload(false);
-            			}
-            			
-            		} else if (document.getElementById('home-page-id')) {// Home page displayed
-            			//alert('yes');
-            			restoreheaderandfooter();
-            			loadUrlAjax('/newauth/header?page=home', 'app-header');
-            			afteranyscreenload();
-            		} else if (document.getElementById('secure-page-id')) {// Got redirected to secure page 
-            			//alert('yes');
-            			restoreheaderandfooter();
-            			loadUrlAjax('/newauth/header?page=securePage', 'app-header');
-            			afteranyscreenload();
-            		} else if (document.getElementById('app-flk')) {// Forwarded to flake page in app
-	        			loadUrlAjax('/newauth/header?page=flake-page', 'app-header');
-	        			if (document.getElementById('flake-page-id') != null) document.getElementById('flake-page-id').style.top = '65px';
-	        			afteranyscreenload();
-	        		} else {
-	            			
-            			//alert('after authenticationresult');
-            			afteranyscreenload(); // authenticationresult.... for example
-            		}
-            		
-        		}
-        		
+                } else { // this was a regular submit from app
+                    document.getElementById('app').innerHTML = xmlhttp.responseText;
+                    if (document.querySelector('.auth-image-main-container')) {
+                        var respheader = xmlhttp.getResponseHeader("AUTH_RESULT");
+                        if ('FAIL' == respheader) {
+                            hideloadingicon();
+                            showAuthFailureDialog();
+                            settimeoutid = setTimeout(function(){
+                                clearAuthFailureDialog();
+                            }, 1000);
+                            if (window.NewauthWebAuthn) {
+                                NewauthWebAuthn.captureRegOptionsFromDom();
+                            }
+                            afterauthscreenload(false);
+                        } else {
+                            // Still mid-flow (correct click, but more images/rounds may
+                            // still be needed) — NOT the completion moment. Do NOT attempt
+                            // registration here; this was the original bug.
+                            hideloadingicon();
+                            afterauthscreenload(false);
+                        }
+                    } else if (document.getElementById('webauthnForceRegister')) {
+                       
+                        // webauthnRegistrationRequired.jsp, returned directly by
+                        // processImageClickForAuthentication when the pending RP
+                        // requires strict device sign-in and this user has no
+                        // credential yet. Mutually exclusive with the terminal
+                        // branches below, same reasoning as .auth-image-main-container
+                        // being checked first — this must come before them.
+                        //
+                        // ⚠ UNVERIFIED: does this branch need a loading-state-hide
+                        // call (afteranyscreenload() or similar), same as the
+                        // confirmed bug that originally broke #webauthnGate (that
+                        // branch shipped without one, page got stuck showing the
+                        // spinner forever, no error). Test this specifically —
+                        // if the page looks stuck after this branch fires, add
+                        // afteranyscreenload() here, matching the fix that
+                        // #webauthnGate needed.
+                        alert('here after webauthnForceRegister');
+                        restoreheaderandfooter(); 
+                        if (window.NewauthWebAuthn) {
+                            NewauthWebAuthn.initForceRegister();
+                        }
+                        afteranyscreenload();
+                    } else if (document.getElementById('home-page-id')) {
+                        restoreheaderandfooter();
+                        loadUrlAjax('/newauth/header?page=home', 'app-header');
+                        if (window.NewauthWebAuthn) {
+                            NewauthWebAuthn.offerRegistrationIfPending();
+                        }
+                        afteranyscreenload();
+                    } else if (document.getElementById('secure-page-id')) {
+                        restoreheaderandfooter();
+                        loadUrlAjax('/newauth/header?page=securePage', 'app-header');
+                        if (window.NewauthWebAuthn) {
+                            NewauthWebAuthn.offerRegistrationIfPending();
+                        }
+                        afteranyscreenload();
+                    } else if (document.getElementById('app-flk')) {
+                        loadUrlAjax('/newauth/header?page=flake-page', 'app-header');
+                        if (document.getElementById('flake-page-id') != null)
+                            document.getElementById('flake-page-id').style.top = '65px';
+                        if (window.NewauthWebAuthn) {
+                            NewauthWebAuthn.offerRegistrationIfPending();
+                        }
+                        afteranyscreenload();
+                    } else {
+                        if (window.NewauthWebAuthn) {
+                            NewauthWebAuthn.offerRegistrationIfPending();
+                        }
+                        afteranyscreenload(); // authenticationresult.... for example
+                    }
+
+                }
         	}
         	
         	if (url == '/createUser') {
@@ -766,6 +799,7 @@ function submitFormAjax(url, formname)
     xmlhttp.send(data);
     
 }
+
 function showAuthFailureDialog() {
 	//alert('showing auth failure');
 	hideAuthImage();
