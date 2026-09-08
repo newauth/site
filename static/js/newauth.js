@@ -594,14 +594,14 @@ function submitFormAjax(url, formname)
                 // Scripts in innerHTML don't execute — SSO pages need full load
                 if (xmlhttp.responseURL) {
                     var finalUrl = xmlhttp.responseURL;
-                    var ssoPages = ['/sso/onboard', '/sso/register',
-                                    '/sso/welcome', '/sso/clients',
-                                    '/oauth2/authorize'];
+                    var ssoPages = ['/sso/onboard', '/sso/register', '/sso/welcome', '/sso/clients',
+                                    '/oauth2/authorize', '/saml/sso', '/saml/consent', '/saml/cancel', '/oauth2/cancel'];
+                    
                     var isSsoRedirect = ssoPages.some(function(page) {
                         return finalUrl.indexOf(page) !== -1;
                     });
                     if (isSsoRedirect) {
-                        window.location.href = finalUrl;
+                        setTimeout(function() { window.location.replace(finalUrl); }, 0);
                         
                         return;
                     }
@@ -650,15 +650,24 @@ function submitFormAjax(url, formname)
         	}
         	
         	if ( url == '/newauth/postAuthClickData') {
-        		//alert(url + ' onreadystatechange 4  ' +  xmlhttp.status);
-            	//console.log(url + ' within status 200: ' + xmlhttp.status + ' resp: ' + xmlhttp.responseText); // Here is the response
+                console.log('[SSO-TRACE] postAuthClickData response. responseURL=', xmlhttp.responseURL, 'status=', xmlhttp.status);
+                // Check for SAML deliver token first
+                try {
+                    var json = JSON.parse(xmlhttp.responseText);
+                    if (json.samlDeliver) {
+                        console.log('[SSO-TRACE] SAML deliver token received, navigating');
+                        window.location.href = '/vn/saml/deliver?t=' + json.samlDeliver;
+                        return;
+                    }
+                } catch(e) { /* not JSON, continue normally */ }
                 
-                // ── SSO intercept ─────────────────────────────────────────
                 if (xmlhttp.responseURL) {
                     var finalUrl = xmlhttp.responseURL;
                     if (finalUrl.indexOf('/vn/sso/') !== -1 ||
                         finalUrl.indexOf('/sso/') !== -1 ||
-                        finalUrl.indexOf('/oauth2/authorize/resume') !== -1) {
+                        finalUrl.indexOf('/oauth2/authorize/resume') !== -1 ||
+                        finalUrl.indexOf('/saml/deliver') !== -1) {
+                        console.log('[SSO-TRACE] MATCHED — navigating to', finalUrl);
                         window.location.href = finalUrl;
                         return;
                     }
@@ -1197,7 +1206,7 @@ function loadUrlAjax(url, target)
                         return finalUrl.indexOf(page) !== -1;
                     });
                     if (isSsoRedirect) {
-                        window.location.href = finalUrl;
+                        setTimeout(function() { window.location.replace(finalUrl); }, 0);
                         
                         return;
                     }

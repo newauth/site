@@ -966,9 +966,14 @@
       const importedName = (file.name || '').replace(/\.(xlsx|xls|csv)$/i, '').toLowerCase().trim();
       // At depth 1 (investor canvas), this.data.items[0] is the investor entity.
       // Companies are nested under items[0][companiesField], not in items directly.
-      const investorEntity = orchestrator.data?.items?.[0];
-      const companiesField = orchestrator.currentApp?.entityConfigs?.investor?.childrenField || 'companies';
-      const existingCompanies = (investorEntity?.[companiesField]) || orchestrator.data?.items || [];
+      const investorEntity = orchestrator.data && orchestrator.data.items && orchestrator.data.items[0];
+
+      const companiesField = (orchestrator.currentApp && orchestrator.currentApp.entityConfigs &&
+          orchestrator.currentApp.entityConfigs.investor &&
+          orchestrator.currentApp.entityConfigs.investor.childrenField) || 'companies';
+
+      const existingCompanies = (investorEntity && investorEntity[companiesField]) ||
+          (orchestrator.data && orchestrator.data.items) || [];
       const matchingCompany = existingCompanies.find(function (item) {
         return (item.name || '').toLowerCase().trim() === importedName;
       });
