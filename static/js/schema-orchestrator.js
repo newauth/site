@@ -4640,8 +4640,8 @@ class SchemaOrchestrator {
 	                                    ${this.replaceTemplateVariables(config.securityNoticeMessage, templateData)}
 	                                </p>
 	                                <ul style="margin: 0 0 0 28px; padding-left: 20px; color: #78350f; font-size: 14px; line-height: 1.8;">
+                                        <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityDoNotForward, templateData)}</strong></li>
 	                                    <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityDoShare, templateData)}</strong></li>
-	                                    <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityDoNotForward, templateData)}</strong></li>
 	                                    <li style="margin-bottom: 8px;"><strong style="color: #92400e;">${this.replaceTemplateVariables(config.securityExternalAccess, templateData)}</strong></li>
 	                                </ul>
 	                                <p style="margin: 16px 0 0 28px; color: #92400e; font-size: 13px; font-style: italic; line-height: 1.5;">
@@ -9943,9 +9943,9 @@ class SchemaOrchestrator {
 	        const deleteHandler = (e) => {
 	            e.stopPropagation();
 	            e.preventDefault();
-	            if (confirm(`Are you sure you want to delete this ${entityType}?`)) {
-	                this.deleteItem(item, entityType);
-	            }
+	            
+	            this.deleteItem(item, entityType);
+	           
 	            this.transformCardToDot(dot);
 	        };
 	        deleteBtn.addEventListener('click', deleteHandler);
@@ -10661,10 +10661,10 @@ class SchemaOrchestrator {
 	    if (deleteBtn) {
 	        deleteBtn.addEventListener('click', (e) => {
 	            e.stopPropagation();
-	            if (confirm(`Are you sure you want to delete this ${entityType}?`)) {
-	                self.hideMobileDotCard();
-	                self.deleteItem(item, entityType);
-	            }
+	            
+	            self.hideMobileDotCard();
+	            self.deleteItem(item, entityType);
+	           
 	        });
 	    }
 	}
@@ -10694,12 +10694,126 @@ class SchemaOrchestrator {
 	    
 	    this.isShowingMobileCard = false;
 	}
-	deleteItem(item, entityType) {
-	    if (confirm(`Are you sure you want to delete this ${entityType}?`)) {
-	        // Your existing delete logic here
-	        this.hideDotInfoCard();
-	    }
-	}
+
+    async deleteItem(item, entityType) {
+        const entityConfig = await this.getEntityConfig(entityType);
+
+        if (!this.isDataOwner()) {
+            this.showNotification("You don't have permission to delete this.", 'error');
+            return;
+        }
+
+        const confirmed = await this.showConfirmDialog(
+            `This permanently deletes this ${entityConfig?.name || entityType}${entityConfig?.childrenField ? ' and everything inside it' : ''}. This can't be undone.`,
+            { title: `Delete this ${entityConfig?.name || entityType}?`, confirmLabel: 'Delete', danger: true }
+        );
+        if (!confirmed) return;
+
+        // Locate the item's array (root items[], or a parent's childrenField)
+        // and its index — same traversal duplicateItem already uses.
+        let siblings, index;
+        const isRootLevel = this.currentPath.length === 0;
+
+        if (isRootLevel) {
+            siblings = this.data.items;
+            index = siblings.findIndex(i => i.ID === item.ID || i.displayID === item.displayID);
+        } else {
+            const parentDepth = this.currentPath.length - 1;
+            const parentEntityType = this.currentApp.hierarchy[parentDepth];
+            const parentConfig = this.currentApp.entityConfigs[parentEntityType];
+            const childrenField = parentConfig.childrenField;
+
+            const firstItem = this.data?.items?.[0];
+            const lastPathEntity = this.currentPath[this.currentPath.length - 1];
+            const isPartialResponse =
+                firstItem?.entityType === lastPathEntity.entityType &&
+                firstItem.displayID === lastPathEntity.displayID;
+
+            let parent;
+            if (isPartialResponse) {
+                parent = this.data.items[0];
+            } else {
+                let currentItems = this.data.items;
+                let currentDepth = 0;
+                while (currentDepth < parentDepth && currentItems) {
+                    const currentEntityType = this.currentApp.hierarchy[currentDepth];
+                    const currentConfig = this.currentApp.entityConfigs[currentEntityType];
+                    const pathItem = this.currentPath[currentDepth];
+                    const foundItem = currentItems.find(i => i.ID === pathItem.id || i.displayID === pathItem.id);
+                    if (!foundItem) throw new Error(`Could not find ${currentEntityType} in hierarchy`);
+                    currentItems = foundItem[currentConfig.childrenField] || [];
+                    currentDepth++;
+                }
+                const parentPathItem = this.currentPath[parentDepth];
+                parent = currentItems.find(i => i.ID === parentPathItem.id || i.displayID === parentPathItem.id);
+                if (!parent) throw new Error(`Could not find parent with ID ${parentPathItem.id}`);
+            }
+            siblings = parent[childrenField] || [];
+            index = siblings.findIndex(i => i.ID === item.ID || i.displayID === item.displayID);
+        }
+
+        if (index === -1) {
+            this.showNotification('❌ Could not find item to delete', 'error');
+            return;
+        }
+
+        // Optimistic removal
+        const [removed] = siblings.splice(index, 1);
+        this.render();
+        this.updateBreadcrumb();
+
+        try {
+            const entityPath = [
+                'apps', this.currentApp.id,
+                ...this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID),
+                item.displayID
+            ].join('/');
+            const res = await fetch('/newauth/api/deleteentity', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(entityPath.replace(/^apps\//, ''))
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => ({}));
+                if (body.error === 'Not found') {
+                    throw new Error("This was just created — give it a few seconds and try again");
+                }
+                throw new Error(body.error || 'Delete request failed');
+            }
+
+            this.showNotification(`${entityConfig?.name || entityType} deleted`, 'success');
+            this.hideDotInfoCard?.(); // keep the optional-chain guard from before, harmless either way
+        } catch (error) {
+            siblings.splice(index, 0, removed); // rollback
+            this.render();
+            this.updateBreadcrumb();
+            this.showNotification(`❌ Failed to delete: ${error.message}`, 'error');
+        }
+    }
+    
+    showConfirmDialog(message, { title = 'Please confirm', confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false } = {}) {
+        return new Promise((resolve) => {
+            document.getElementById('confirm-dialog-backdrop')?.remove();
+            const backdrop = document.createElement('div');
+            backdrop.id = 'confirm-dialog-backdrop';
+            backdrop.style.cssText = `position:fixed; inset:0; background:rgba(0,0,0,0.4); z-index:10000;
+                display:flex; align-items:center; justify-content:center;`;
+            backdrop.innerHTML = `
+                <div style="background:white; border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,0.2); max-width:360px; width:90%; padding:20px;">
+                    <div style="font-weight:600; font-size:16px; color:#2d3436; margin-bottom:10px;">${title}</div>
+                    <div style="font-size:13px; color:#555; line-height:1.5; margin-bottom:20px;">${message}</div>
+                    <div style="display:flex; gap:10px;">
+                        <button id="confirm-cancel-btn" style="flex:1; padding:10px; border:1px solid #ddd; background:white; color:#555; border-radius:6px; cursor:pointer; font-weight:600;">${cancelLabel}</button>
+                        <button id="confirm-ok-btn" style="flex:1; padding:10px; border:none; border-radius:6px; cursor:pointer; font-weight:600; color:white; background:${danger ? '#e17055' : '#667eea'};">${confirmLabel}</button>
+                    </div>
+                </div>`;
+            document.body.appendChild(backdrop);
+            const done = (result) => { backdrop.remove(); resolve(result); };
+            backdrop.addEventListener('click', e => { if (e.target === backdrop) done(false); });
+            backdrop.querySelector('#confirm-cancel-btn').addEventListener('click', () => done(false));
+            backdrop.querySelector('#confirm-ok-btn').addEventListener('click', () => done(true));
+        });
+    }
 	
 	
 	async duplicateItem(item, entityType, deep = false) {
