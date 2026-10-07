@@ -781,6 +781,154 @@ class DatabaseService {
 }
 
 
+function isForkUrl(appId) {
+    const parts = window.location.pathname.split('/').filter(Boolean);
+    const appIdx = parts.indexOf(appId);
+    if (appIdx === -1) return false;
+    const last = parts[parts.length - 1];
+    return last && last.startsWith('frk_');
+}
+
+
+
+function installFork(orchestrator, appId) {
+    if (window._forkChecked) return;
+    window._forkChecked = true;
+    if (isForkUrl(appId, orchestrator.currentApp?.hierarchy || [])) {
+        setTimeout(() => showForkPreview(orchestrator, appId), 600);
+    }
+}
+
+async function showForkPreview(orchestrator, appId) {
+    if (document.getElementById('fork-preview')) return;
+
+    const parts = window.location.pathname.split('/').filter(Boolean);
+    const appIdx = parts.indexOf(appId);
+    const forkTokenIdx = parts.findIndex(p => p.startsWith('frk_'));
+    const pathIds = parts.slice(appIdx + 1, forkTokenIdx);
+    const sourcePath = [appId, ...pathIds].join('/');
+    const entityType = orchestrator.currentApp.hierarchy[pathIds.length - 1];
+    const entityConfig = orchestrator.currentApp.entityConfigs?.[entityType] || {};
+    const entityLabel = entityConfig.name || entityType;
+
+    let item;
+    try {
+        const res = await fetch(`/newauth/api/getappdata/${sourcePath}`, { credentials: 'include' });
+        if (!res.ok) { _showForkError('This link is invalid or has expired.'); return; }
+        const data = await res.json();
+        item = data?.items?.[0];
+        if (!item) { _showForkError('This link is invalid or has expired.'); return; }
+    } catch (err) {
+        _showForkError('Could not load this item. Please try again.');
+        return;
+    }
+
+    const explainer = entityConfig.forkExplainer
+        || `Get your own copy of this ${entityLabel.toLowerCase()} — ready to send to your own group.`;
+    const optionsCaption = entityConfig.forkOptionsCaption
+        || `What's inside this ${entityLabel.toLowerCase()}`;
+
+    const allAnswers = item.answers || [];
+    const MAX_PILLS = 8;
+    const shownAnswers = allAnswers.slice(0, MAX_PILLS);
+    const extraCount = allAnswers.length - shownAnswers.length;
+    const pillHTML = shownAnswers
+        .map(a => `<span style="display:inline-block; background:#f0f0f8; color:#555; padding:3px 10px; border-radius:12px; font-size:12px; margin:2px 3px 2px 0;">${a.name}</span>`)
+        .join('');
+    const morePill = extraCount > 0
+        ? `<span style="display:inline-block; color:#999; padding:3px 6px; font-size:12px;">+${extraCount} more</span>`
+        : '';
+
+    const overlay = document.createElement('div');
+    overlay.id = 'fork-preview';
+    overlay.style.cssText = `
+        position: fixed;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.4);
+        z-index: 10000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    `;
+    overlay.innerHTML = `
+        <div class="sp-card" style="background:white; border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,0.2); max-width:380px; width:90%; overflow:hidden;">
+            <div class="sp-banner" style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); padding:24px 20px; color:white;">
+                <div class="sp-banner-icon" style="background:rgba(255,255,255,0.2); width:40px; height:40px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:20px; margin-bottom:10px;">✨</div>
+                <div class="sp-banner-title" style="font-size:18px; font-weight:700;">${item.name || entityLabel}</div>
+                <div class="sp-banner-sub" style="font-size:13px; opacity:0.85; margin-top:2px;">${entityLabel} · a newauth .app</div>
+            </div>
+            <div class="sp-body" style="padding:20px;">
+                ${shownAnswers.length > 0 ? `
+                    <div style="font-size:12px; color:#999; margin-bottom:8px;">${optionsCaption}</div>
+                    <div style="margin-bottom:18px;">${pillHTML}${morePill}</div>
+                ` : ''}
+                <div class="sp-agent-card" style="font-size:13px; color:#555; line-height:1.5; margin-bottom:16px;">
+                    ${explainer}
+                </div>
+                <button class="sp-add-btn" id="fork-add-btn" style="width:100%; padding:12px; border:none; border-radius:8px; color:white; font-weight:600; cursor:pointer; background:linear-gradient(135deg,#667eea,#764ba2aa); margin-bottom:8px;">
+                    ✨ Make this your ${entityLabel.toLowerCase()} →
+                </button>
+                <button class="sp-skip" id="fork-skip-btn" style="width:100%; padding:10px; border:none; background:none; color:#999; cursor:pointer; font-size:13px;">Maybe later</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+
+    document.getElementById('fork-add-btn').addEventListener('click', async () => {
+        overlay.remove();
+
+        // Check for an existing saved context RIGHT NOW, at click time —
+        // not inside init(), which already ran before this click happened.
+        const savedContexts = orchestrator.getLastViewedContext(appId);
+        const savedContext = savedContexts?.[0];
+
+        if (savedContext?.path?.length > 0) {
+            // Existing user — fork directly into their existing space
+            const targetTenantId = savedContext.path[0];
+            await orchestrator._showCenterStatus(`Adding imported ${entityLabel.toLowerCase()}${item.name ? ' - ' + item.name : ''} to your space`);
+            try {
+                const forkRes = await fetch('/newauth/api/forkentity', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ appId, sourcePath, targetTenantId })
+                }).then(r => r.json());
+
+                if (forkRes?.newId) {
+                    const childType = orchestrator.currentApp.hierarchy[1];
+                    const rawCreatorSegment = { id: targetTenantId }; 
+                    const newPollSegment = { id: forkRes.newId, displayID: forkRes.newDisplayId, entityType: childType };
+                    const finalUrl = orchestrator.getAppUrl([rawCreatorSegment, newPollSegment]);
+                    console.log('[fork-existing] targetTenantId:', targetTenantId, '| finalUrl:', finalUrl);
+                    window.location.href = finalUrl;
+                }
+            } catch (e) {
+                console.warn('[fork] fork-into-existing-space failed:', e);
+                orchestrator.showNotification('⚠️ Could not copy this.', 'warning');
+            }
+        } else {
+            // No existing space — go through tenant creation, same as before
+            window._pendingFork = { sourcePath, appId, entityName: item.name };
+            orchestrator.data = { items: [] };
+            orchestrator.currentPath = [];
+            orchestrator.render();
+            orchestrator.updateBreadcrumb();
+            orchestrator.showCreateTenantOption();
+        }
+    });
+    
+    document.getElementById('fork-skip-btn').addEventListener('click', () => {
+        overlay.remove();
+        window.history.replaceState({}, '', `/.apps/${appId}`);
+        orchestrator.render();
+    });
+}
+
+function _showForkError(message) {
+    const overlay = document.createElement('div');
+    overlay.id = 'fork-preview';
+    overlay.innerHTML = `<div class="sp-card"><div class="sp-body" style="padding:24px;text-align:center;">${message}</div></div>`;
+    document.body.appendChild(overlay);
+}
+
 
 
 
@@ -1041,6 +1189,7 @@ class SchemaOrchestrator {
 		    console.log('[GuestMode] Dismiss dialog opened');
 		}
 
+        
 
 		async init() {
 		    console.log('[init] START');
@@ -1078,46 +1227,39 @@ class SchemaOrchestrator {
 		        console.log('[init] pathDepth:', pathDepth, 'pathIds:', urlInfo.pathIds);
 
 		        // ✅ ROOT LEVEL (no path)
-		        if (pathDepth === 0) {
-		            await this.loadAppSelector();
+                if (pathDepth === 0) {
+                    await this.loadAppSelector();
 
-		            if (isowner) {
-		                // Owner sees all tenants
-		                this.data = await this.db.getAppData(this.currentApp.id);
-		                this.currentPath = [];
-		            } else {
-		                // Non-owner redirects to saved context
-		                const savedContexts = this.getLastViewedContext(urlInfo.appId);
-		                const savedContext = savedContexts?.[0];
+                    if (isowner) {
+                        this.data = await this.db.getAppData(this.currentApp.id);
+                        this.currentPath = [];
+                    } else {
+                        const savedContexts = this.getLastViewedContext(urlInfo.appId);
+                        const savedContext = savedContexts?.[0];
 
-						if (savedContext?.path?.length > 0) {
-		                    this.currentPath = savedContext.path.map((id, i) => ({
-		                        id: id,
-		                        displayID: id.includes('-') ? this.db.hashUUID(id) : id,
-		                        shortName: id.substring(0, 8),
-		                        entityType: this.currentApp.hierarchy[i]
-		                    })).filter(p => p.entityType);
+                        if (savedContext?.path?.length > 0) {
+                            
+                            this.currentPath = savedContext.path.map((id, i) => ({
+                                id: id,
+                                displayID: id.includes('-') ? this.db.hashUUID(id) : id,
+                                shortName: id.substring(0, 8),
+                                entityType: this.currentApp.hierarchy[i]
+                            })).filter(p => p.entityType);
 
-		                    const newUrl = this.getAppUrl(this.currentPath);
-		                    window.history.replaceState({ path: this.currentPath }, '', newUrl);
+                            const newUrl = this.getAppUrl(this.currentPath);
+                            window.history.replaceState({ path: this.currentPath }, '', newUrl);
 
-		                    // Tenant segment uses .id (the raw UUID, when available)
-		                    // rather than .displayID — getAppData's existing
-		                    // tenantId rehash needs the raw form to prove ownership
-		                    // via writeAccess/readAccess's tenantOwnerProven check;
-		                    // sending the hash here would hash-of-a-hash on the
-		                    // server and fail to find anything at all. Every other
-		                    // segment stays .displayID, matching the URL itself
-		                    // (built above via getAppUrl, unaffected by this fix).
-		                    const pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
-		                    this.data = await this.db.getAppData(this.currentApp.id, pathContext,
-							    { bypassCache: true } );
-		                } else {
-		                    this.data = { items: [] };
-		                    this.currentPath = [];
-		                }
-		            }
-		        }
+                            const pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
+                            this.data = await this.db.getAppData(this.currentApp.id, pathContext, { bypassCache: true });
+
+
+                        } else {
+                          
+                            this.data = { items: [] };
+                            this.currentPath = [];
+                        }
+                    }
+                }
 
 		        // ✅ DEPTH 1 - Tenant/Seller/Org level
 		        else if (pathDepth === 1) {
@@ -1271,6 +1413,11 @@ class SchemaOrchestrator {
 		            if (typeof this.maybeEtsySync === 'function') {
 		                await this.maybeEtsySync();
 		            }
+                    
+                    if (this.currentApp?.id && typeof installFork === 'function') {
+                        installFork(this, this.currentApp.id);
+                    }
+                    
 		        } catch (setupError) {
 		            console.error('[init] CRITICAL: Event setup failed:', setupError);
 		            this.showNotification('UI controls disabled. Refresh page.', 'error');
@@ -1644,55 +1791,223 @@ class SchemaOrchestrator {
 			   }
 
 		}
+        
+        showForkLinkModal() {
+            const depth = this.currentPath.length;
+            if (depth === 0) {
+                this.showNotification('Open something first to fork it.', 'error');
+                return;
+            }
+
+            const entityType = this.currentApp?.hierarchy?.[depth - 1];
+            const entityConfig = this.currentApp?.entityConfigs?.[entityType];
+            if (!entityConfig?.forkable) {
+                this.showNotification(`${entityConfig?.name || entityType || 'This'} can't be forked.`, 'error');
+                return;
+            }
+
+            const entityLabel = entityConfig?.name || entityType || 'poll';
+
+            const item = this._getCurrentPoll
+                ? this._getCurrentPoll()
+                : (this._currentPoll
+                    || this.data?.items?.find(i => i.entityType === entityType)
+                    || this.data?.items?.[0]?.[this.currentApp.entityConfigs[this.currentApp.hierarchy[depth-2]]?.childrenField]?.find(c =>
+                        c.ID === this.currentPath[depth-1]?.id || c.displayID === this.currentPath[depth-1]?.displayID)
+                    || this.data?.items?.[0]);
+
+            if (!item) {
+                this.showNotification('Nothing to fork yet.', 'error');
+                return;
+            }
+
+            if (item.allowFork !== true && item.allowFork !== 'true') {
+                this.showNotification('Forking is turned off for this poll. Enable it in settings to share a forkable link.', 'error');
+                return;
+            }
+
+            const existing = document.getElementById('fork-link-modal-backdrop');
+            if (existing) existing.remove();
+
+            const tenantId = this.currentPath[0]?.displayID;
+            const appId = this.currentApp.id;
+            const forkUrl = `${window.location.origin}/.apps/${appId}/${tenantId}/${item.displayID}/frk_${item.displayID}`;
+
+            const backdrop = document.createElement('div');
+            backdrop.id = 'fork-link-modal-backdrop';
+            backdrop.style.cssText = `
+                position: fixed;
+                top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.4);
+                z-index: 10000;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            `;
+            backdrop.innerHTML = `
+                <div id="fork-link-modal" style="
+                    background: white;
+                    border-radius: 12px;
+                    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+                    max-width: 420px;
+                    width: 90%;
+                    padding: 0;
+                    overflow: hidden;
+                ">
+                    <div class="sm-header" style="display:flex; align-items:center; gap:12px; padding:20px 20px 0;">
+                        <div class="sm-icon" style="background:#667eea18;border:1px solid #667eea33; width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px;">✨</div>
+                        <div><div class="sm-title" style="font-weight:600; font-size:16px;">Share a ${entityLabel.toLowerCase()} people can make their own</div></div>
+                    </div>
+                    <div class="sm-body" style="padding:16px 20px 20px;">
+                        <div class="sm-url-row" style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
+                            <div class="sm-url-text" id="fork-url-text" style="flex:1; font-size:12px; color:#555; word-break:break-all; background:#f8f8f8; padding:8px 10px; border-radius:6px;">${forkUrl}</div>
+                            <button class="sm-copy-btn" id="fork-copy-btn" style="padding:8px 14px; border:1px solid #667eea; background:white; color:#667eea; border-radius:6px; cursor:pointer; font-weight:600; white-space:nowrap;">Copy</button>
+                        </div>
+                        <div class="sm-note" style="font-size:12px; color:#888; margin-bottom:16px; line-height:1.4;">
+                            Anyone with this link can create their own independent copy — not
+                            connected to yours.
+                        </div>
+                        <button class="sm-close" id="fork-close-btn" style="width:100%; padding:10px; border:none; background:#667eea; color:white; border-radius:6px; cursor:pointer; font-weight:600;">Done</button>
+                    </div>
+                </div>`;
+            document.body.appendChild(backdrop);
+            backdrop.addEventListener('click', e => { if (e.target === backdrop) backdrop.remove(); });
+
+            backdrop.querySelector('#fork-copy-btn').addEventListener('click', () => {
+                navigator.clipboard.writeText(forkUrl).then(() => {
+                    const btn = backdrop.querySelector('#fork-copy-btn');
+                    btn.textContent = 'Copied ✓';
+                    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+                });
+            });
+            backdrop.querySelector('#fork-close-btn').addEventListener('click', () => backdrop.remove());
+        }
 
 		// ─── POLL: add picker menu ────────────────────────────────────────────────────
-		_showPollAddPicker(options) {
-		    document.getElementById('poll-add-picker')?.remove();
+        // ─── POLL: add picker menu ────────────────────────────────────────────────────
+        _showPollAddPicker(options, extraField = null) {
+            document.getElementById('poll-add-picker')?.remove();
 
-		    const canvas = document.getElementById('canvas-area');
-		    const rect = canvas.getBoundingClientRect();
+            const canvas = document.getElementById('canvas-area');
+            const rect = canvas.getBoundingClientRect();
 
-		    const picker = document.createElement('div');
-		    picker.id = 'poll-add-picker';
-		    picker.style.cssText = `
-		        position: fixed;
-		        left: ${rect.left + rect.width / 2}px;
-		        top: ${rect.top + rect.height / 2 - 60}px;
-		        transform: translateX(-50%);
-		        background: white; border-radius: 12px;
-		        box-shadow: 0 8px 32px rgba(0,0,0,0.18);
-		        border: 1px solid #eee; z-index: 5000;
-		        overflow: hidden; min-width: 240px;
-		    `;
+            const picker = document.createElement('div');
+            picker.id = 'poll-add-picker';
+            picker.style.cssText = `
+                position: fixed;
+                left: ${rect.left + rect.width / 2}px;
+                top: ${rect.top + rect.height / 2 - 60}px;
+                transform: translateX(-50%);
+                background: white; border-radius: 12px;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+                border: 1px solid #eee; z-index: 5000;
+                overflow: hidden; min-width: 240px;
+            `;
 
-		    options.forEach(opt => {
-		        const row = document.createElement('div');
-		        row.style.cssText = `
-		            padding: 14px 18px; cursor: pointer;
-		            border-bottom: 1px solid #f0f0f0;
-		            transition: background 0.15s;
-		        `;
-		        row.innerHTML = `
-		            <div style="font-size:14px;font-weight:600;color:#2d3436;">${opt.label}</div>
-		            <div style="font-size:12px;color:#999;margin-top:2px;">${opt.desc}</div>
-		        `;
-		        row.onmouseenter = () => row.style.background = '#f8f8f8';
-		        row.onmouseleave = () => row.style.background = 'white';
-		        row.onclick = () => { picker.remove(); opt.action(); };
-		        picker.appendChild(row);
-		    });
+            options.forEach(opt => {
+                const row = document.createElement('div');
+                row.style.cssText = `
+                    padding: 14px 18px; cursor: pointer;
+                    border-bottom: 1px solid #f0f0f0;
+                    transition: background 0.15s;
+                `;
+                row.innerHTML = `
+                    <div style="font-size:14px;font-weight:600;color:#2d3436;">${opt.label}</div>
+                    <div style="font-size:12px;color:#999;margin-top:2px;">${opt.desc}</div>
+                `;
+                row.onmouseenter = () => row.style.background = '#f8f8f8';
+                row.onmouseleave = () => row.style.background = 'white';
+                row.onclick = () => { picker.remove(); opt.action(); };
+                picker.appendChild(row);
+            });
 
-		    document.body.appendChild(picker);
+            // ✅ Optional non-clickable field row — stepper input, not a menu action.
+            // Lives below the options list; clicking inside it must not close the picker,
+            // since the outside-click handler below would otherwise dismiss it on every +/- tap.
+            if (extraField) {
+                const fieldRow = document.createElement('div');
+                fieldRow.style.cssText = `padding: 14px 18px; background: #fafafa;`;
+                fieldRow.innerHTML = `
+                    <div style="font-size:13px;font-weight:600;color:#2d3436;margin-bottom:8px;">${extraField.label}</div>
+                    <div class="stepper-control" style="display:flex;align-items:center;gap:10px;">
+                        <button class="stepper-btn minus" type="button">−</button>
+                        <span class="stepper-value">${extraField.value}</span>
+                        <button class="stepper-btn plus" type="button">+</button>
+                    </div>
+                `;
+                fieldRow.addEventListener('click', e => e.stopPropagation());
 
-		    setTimeout(() => {
-		        document.addEventListener('click', function handler(e) {
-		            if (!picker.contains(e.target)) {
-		                picker.remove();
-		                document.removeEventListener('click', handler);
-		            }
-		        });
-		    }, 100);
-		}
+                const valueEl = fieldRow.querySelector('.stepper-value');
+                const minusBtn = fieldRow.querySelector('.minus');
+                const plusBtn = fieldRow.querySelector('.plus');
+                let currentVal = extraField.value;
+
+                minusBtn.onclick = () => {
+                    currentVal = Math.max(0, currentVal - 1);
+                    valueEl.textContent = currentVal;
+                    extraField.onChange(currentVal);
+                };
+                plusBtn.onclick = () => {
+                    currentVal = currentVal + 1;
+                    valueEl.textContent = currentVal;
+                    extraField.onChange(currentVal);
+                };
+
+                picker.appendChild(fieldRow);
+            }
+
+            document.body.appendChild(picker);
+
+            setTimeout(() => {
+                document.addEventListener('click', function handler(e) {
+                    if (!picker.contains(e.target)) {
+                        picker.remove();
+                        document.removeEventListener('click', handler);
+                    }
+                });
+            }, 100);
+        }
+        
+        async _saveTargetVoteCount(poll, value) {
+            poll.targetVoteCount = Math.max(0, value);
+            try {
+                const entityPath = ['apps', this.currentApp.id, ...this.currentPath.map(p => p.displayID)].join('/');
+                await this.db.saveEntityData(entityPath, poll, true);
+            } catch (e) {
+                this.showNotification('❌ Failed to save expected voter count.', 'error');
+            }
+        }
+        
+        _shouldRevealPollResults(pollItem, visibility) {
+            if (pollItem?.resultsRevealedManually) return true; // owner override, always wins
+
+            if (visibility === 'after_close') {
+                return pollItem?.status === 'closed';
+            }
+            if (visibility === 'after_vote') {
+                return !!localStorage.getItem(`poll_voted_${pollItem?.displayID}`);
+            }
+            if (visibility === 'after_target_votes') {
+                const target = parseInt(pollItem?.targetVoteCount, 10) || 0;
+                if (target <= 0) return false;
+                const targetReached = (pollItem?.voteCount || 0) >= target;
+                const closed = pollItem?.status === 'closed';
+                return targetReached || closed;
+            }
+            return true;
+        }
+        
+        async _saveVoteCountField(poll, value, { needsVoteLimit, needsTargetCount }) {
+            const clamped = Math.max(0, value);
+            if (needsVoteLimit) poll.voteLimit = clamped;
+            if (needsTargetCount) poll.targetVoteCount = clamped;
+            try {
+                const entityPath = ['apps', this.currentApp.id, ...this.currentPath.map(p => p.displayID)].join('/');
+                await this.db.saveEntityData(entityPath, poll, true);
+            } catch (e) {
+                this.showNotification('❌ Failed to save.', 'error');
+            }
+        }
 
 		_openPollAddMenu() {
 		    const depth = this.currentPath.length;
@@ -1715,23 +2030,41 @@ class SchemaOrchestrator {
 		        const answerMode = poll?.answerMode || 'owner_defined';
 		        const canAddAnswer = this.isDataOwner() || answerMode === 'voter_added' || answerMode === 'both';
 
-		        if (this.isDataOwner()) {
-		            this._showPollAddPicker([
-		                {
-		                    label: '💬 Add Answer',
-		                    desc: 'Add an option voters can choose',
-		                    action: () => this.openAddDialog('answer')
-		                },
-		                {
-		                    label: '📨 Invite Voters',
-		                    desc: 'Share via WhatsApp, Telegram, email or link',
-		                    action: () => {
-		                        const canvas = document.getElementById('canvas-area');
-		                        this.showSharePopup(canvas);
-		                    }
-		                }
-		            ]);
-		        } else if (canAddAnswer) {
+                if (this.isDataOwner()) {
+                    
+                    const needsVoteLimit = poll?.closeMode === 'vote_limit';
+                    const needsTargetCount = poll?.resultsVisibility === 'after_target_votes';
+
+                    let extraField = null;
+                    if (needsVoteLimit || needsTargetCount) {
+                        const label = needsVoteLimit && needsTargetCount
+                            ? '🎯 Expected voters (also closes poll)'
+                            : needsVoteLimit
+                                ? '🔢 Votes before auto-close'
+                                : '🎯 Expected voters';
+
+                        // Same underlying number either way — prefer whichever is already set,
+                        // so switching modes doesn't silently reset a value the owner already chose
+                        const currentValue = parseInt(poll.voteLimit || poll.targetVoteCount || 0);
+
+                        extraField = {
+                            label,
+                            value: currentValue,
+                            onChange: (newVal) => this._saveVoteCountField(poll, newVal, { needsVoteLimit, needsTargetCount })
+                        };
+                    }
+                    
+                    this._showPollAddPicker(
+                        [
+                            { label: '💬 Add Answer', desc: 'Add an option voters can choose', action: () => this.openAddDialog('answer') },
+                            { label: '📨 Invite Voters', desc: 'Share via WhatsApp, Telegram, email or link', action: () => {
+                                const canvas = document.getElementById('canvas-area');
+                                this.showSharePopup(canvas);
+                            }}
+                        ],
+                        extraField
+                    );
+                } else if (canAddAnswer) {
 		            this.openAddDialog('answer');
 		        } else {
 		            this.showNotification('💡 The poll creator has disallowed new answer options.', 'info');
@@ -2273,6 +2606,14 @@ class SchemaOrchestrator {
 	// ✅ ADD THIS NEW METHOD (handles context saving for ANY depth)
 	saveContextIfApplicable(appId, pathIds) {
 	    if (!appId || !pathIds?.length) return;
+        
+        // Never persist a share/fork token as if it were a real entity ID —
+        // same convention agnts already uses for shr_ tokens.
+        const lastId = pathIds[pathIds.length - 1];
+        if (lastId && (lastId.startsWith('frk_') || lastId.startsWith('shr_'))) {
+            console.log('[Context] ⏭️ SKIPPED - path ends in a share/fork token, not a real path');
+            return;
+        }
 	    
 	    // Detect real UUID in FIRST path segment (root entity)
 	    const hasRealUuidInUrl = this.isRealUuid(pathIds[0]);
@@ -2306,12 +2647,20 @@ class SchemaOrchestrator {
 		        isPollOwnerMatch = this.db.hashUUID(userId) === currentNormalized;
 		    }
 		}
+        
+        let isDotConfOwnerMatch = false;
+        if (appId === 'conf' && !hasRealUuidInUrl) {
+            const userId = localStorage.getItem('dotconf_user_id');
+            if (userId) {
+                isDotConfOwnerMatch = this.db.hashUUID(userId) === currentNormalized;
+            }
+        }
 
-		if (shouldSave || isPollOwnerMatch) {
+		if (shouldSave || isPollOwnerMatch || isDotConfOwnerMatch) {
 		    const newContext = {
 		        path: pathIds,
 		        timestamp: Date.now(),
-		        isOwnerAccess: hasRealUuidInUrl || isPollOwnerMatch  // ← key change
+		        isOwnerAccess: hasRealUuidInUrl || isPollOwnerMatch || isDotConfOwnerMatch // ← key change
 		    };
 
 		    const updated = [newContext, ...existingContexts.slice(0, 9)];
@@ -3050,7 +3399,7 @@ class SchemaOrchestrator {
 	        pathIds:     idSegments
 	    };
 	}
-	
+    
 	// Add these helper methods to the SchemaOrchestrator class
 
 	// Helper to hide/show app selector button
@@ -3839,6 +4188,30 @@ class SchemaOrchestrator {
 		                window.app.copyShareLink();
 		            }
 		        });
+                
+                // Fork button (desktop) — add right after shareBtn's listener is attached
+                const forkBtn = document.createElement('button');
+                forkBtn.className = 'fork-btn header-btn';
+                forkBtn.id = 'header-fork-btn';
+                forkBtn.title = 'Fork';
+                forkBtn.style.display = 'inline-flex';
+                forkBtn.innerHTML = `
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:#fff; display:block;">
+                        <path d="M6 3v12"/>
+                        <circle cx="6" cy="18" r="3"/>
+                        <circle cx="18" cy="6" r="3"/>
+                        <path d="M18 9a9 9 0 0 1-9 9"/>
+                    </svg>
+                `;
+                forkBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (window.app?.showForkLinkModal) {
+                        window.app.showForkLinkModal();
+                    }
+                });
+
+                
+                actionsContainer.appendChild(forkBtn);
 
 		        // App selector button (desktop)
 		        const appBtn = document.createElement('button');
@@ -5529,11 +5902,29 @@ class SchemaOrchestrator {
 	    return `hsl(${hue}, 65%, 50%)`;
 	}
 	
-	
+    _getVisibilityBlindedAnswers(pollItem, answerItems) {
+        const visibility = pollItem?.resultsVisibility || 'live';
+        const revealed = this._shouldRevealPollResults(pollItem, visibility);
+        console.log('[blind-check] pollItem.resultsVisibility:', pollItem?.resultsVisibility,
+                    '| pollItem.targetVoteCount:', pollItem?.targetVoteCount,
+                    '| pollItem.voteCount:', pollItem?.voteCount,
+                    '| pollItem.status:', pollItem?.status,
+                    '| computed visibility:', visibility,
+                    '| shouldReveal result:', revealed,
+                    '| answerItems count:', answerItems?.length,
+                    '| sample hit values:', answerItems?.map(a => a.hit));
+
+        if (visibility === 'live') return answerItems;
+        if (revealed) return answerItems;
+        return answerItems.map(a => ({ ...a, hit: 0 }));
+    }
+
+ 	
 
 	async render() {
 	    const self = this;
 	    console.log('=== RENDER START ===');
+        console.log('[diag] render at', performance.now());
 		
 		console.log('[render TOP] data items[0] keys:', Object.keys(this.data?.items?.[0] || {}));
 		console.log('[render TOP] data items[0] answers:', this.data?.items?.[0]?.answers?.length);
@@ -5755,8 +6146,77 @@ class SchemaOrchestrator {
 		        } 
 
 				
-		    }
+		    } 
 		}
+        
+       
+       // RENDER HOOK — paste this block into orchestrator render()
+       // directly after the poll depth-2 hook block (around line 175 in render),
+       // following the same pattern:
+
+       if (this.currentApp?.id === 'conf' && this.currentPath.length === 2) {
+           var confDisplayID = this.currentPath[1] && this.currentPath[1].displayID;
+           var tenantId      = this.currentPath[0] && this.currentPath[0].displayID;
+
+           if (this.isPollingActive) this.stopVersionPolling();
+
+           if (typeof this.dotconfRebuildCache === 'function' || typeof this.dotconfApplyStaticPresenceStyles === 'function') {
+            if (this._dotconfStyleTimer) clearTimeout(this._dotconfStyleTimer);
+                this._dotconfStyleTimer = setTimeout(function() {
+                    if (typeof self.dotconfRebuildCache === 'function') {
+                        self.dotconfRebuildCache();
+                    }
+                    if (typeof self.dotconfApplyStaticPresenceStyles === 'function') {
+                        self.dotconfApplyStaticPresenceStyles(self);
+                    }
+                    self._dotconfStyleTimer = null;
+                }, 650);
+
+           }
+
+
+           if (this._dotconfCallLive) this.dotconfStartLayout?.(this);
+           
+           if (!this._dotconfSSEId || this._dotconfSSEId !== confDisplayID) {
+               this._dotconfSSEId = confDisplayID;
+               var myId = null;
+               if (typeof this.dotconfIsIdentified === 'function' && this.dotconfIsIdentified(this)) {
+                   if (typeof this._getMyDotConfParticipantDisplayID === 'function') {
+                       myId = this._getMyDotConfParticipantDisplayID(this);
+                   }
+               }
+               if (typeof this.dotconfOpenSSE === 'function') {
+                   this.dotconfOpenSSE(this, tenantId, confDisplayID, myId);
+               }
+           }
+
+           if (!this.isDataOwner()) {
+               if (typeof this.dotconfIsIdentified === 'function' && !this.dotconfIsIdentified(this)) {
+                   
+                   requestAnimationFrame(function() {
+                       if (typeof self.dotconfRenderIdentifyUI === 'function') {
+                           self.dotconfRenderIdentifyUI(self);
+                       }
+                   });
+               }
+           }
+
+           if (this.isDataOwner()) {
+               if (typeof this._dotconfHookParticipantEmail === 'function') {
+                   this._dotconfHookParticipantEmail(this);
+               }
+           }
+       }
+
+       if (this.currentApp?.id === 'conf' && this.currentPath.length < 2) {
+           if (this._dotconfSSEId) {
+               if (typeof this.dotconfCloseSSE === 'function') this.dotconfCloseSSE();
+               this._dotconfSSEId = null;
+               this._dotconfCallLive = false;
+               if (typeof this.dotconfStopLayout === 'function') this.dotconfStopLayout();
+           }
+       }
+        
 
 	    // ── Stress test (unchanged flag) ─────────────────────────────
 	    const STRESS_TEST = false;
@@ -5784,6 +6244,13 @@ class SchemaOrchestrator {
 		// ── Visual scores ─────────────────────────────────────────────
 		// Full scores for ALL items — used for ranking only
 		console.log('[render] entityType for scoring:', entityType, 'items[0].entityType:', items[0]?.entityType);
+        
+        // Blind vote counts before any scoring happens — affects ranking,
+        // sizing, AND the rank-based card content below, since all three
+        // derive from this same `items` array from this point forward.
+        if (this.currentApp?.id === 'poll' && entityType === 'answer') {
+            items = this._getVisibilityBlindedAnswers(this._getCurrentPoll(), items);
+        }
 		
 		const visualScores = this.calculateVisualScores(items, entityType);
 		
@@ -6946,7 +7413,7 @@ class SchemaOrchestrator {
 			                isPollClosed ? '🔓 Poll reopened.' : '🔒 Poll closed.', 'success'
 			            );
 						// Re-fetch from creator level to get assembled answers
-						const pathContext = this.currentPath.map(p => p.displayID);
+						const pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
 						const fetchContext = this.currentApp.id === 'poll' && pathContext.length === 2
 						    ? [pathContext[0]]  // fetch creator level — server assembles full tree
 						    : pathContext;
@@ -7022,7 +7489,7 @@ class SchemaOrchestrator {
 				        this.showNotification('🔄 Poll reset — all votes cleared, poll is open again.', 'success');
 
 				        // Re-fetch and re-render
-				        const fetchContext = [this.currentPath[0].displayID];
+				        const fetchContext = [this.currentPath[0].id || this.currentPath[0].displayID];
 				        this.data = await this.db.getAppData('poll', fetchContext, { bypassCache: true });
 				        this.render();
 
@@ -7036,6 +7503,7 @@ class SchemaOrchestrator {
 			
 			// ── Non-owner: Create your own poll ──────────────────────────────────────────
 			if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && !this.isDataOwner()) {
+                
 			    const createBtn = document.createElement('button');
 			    createBtn.textContent = '✨ Create poll';
 			    createBtn.style.cssText = `
@@ -7052,24 +7520,161 @@ class SchemaOrchestrator {
 			        createBtn.style.borderColor = '#b2bec3';
 			    };
 				
-				createBtn.onclick = () => {
-				    const userId = this._getPollUserId();
-				    const displayId = this.db.hashUUID(userId);
-				    
-				    // ✅ Save owner context before navigating so access check passes
-				    const newContext = {
-				        path: [displayId],
-				        timestamp: Date.now(),
-				        isOwnerAccess: true
-				    };
-				    const existing = JSON.parse(localStorage.getItem('savedContexts_poll') || '[]');
-				    const updated = [newContext, ...existing.slice(0, 9)];
-				    localStorage.setItem('savedContexts_poll', JSON.stringify(updated));
-				    
-				    window.location.href = `${window.location.origin}/.apps/poll/${displayId}`;
-				};
+                createBtn.onclick = () => {
+                    const userId = this._getPollUserId();
+                    const displayId = this.db.hashUUID(userId);
+
+                    // Check for an existing creator context first — this voter may
+                    // already have their own poll space from a prior visit.
+                    const existingContexts = JSON.parse(localStorage.getItem('savedContexts_poll') || '[]');
+                    const alreadyHasCreatorContext = existingContexts.some(
+                        ctx => ctx.isOwnerAccess === true && ctx.path?.[0] === displayId
+                    );
+
+                    if (!alreadyHasCreatorContext) {
+                        const newContext = {
+                            path: [displayId],
+                            timestamp: Date.now(),
+                            isOwnerAccess: true
+                        };
+                        const updated = [newContext, ...existingContexts.slice(0, 9)];
+                        localStorage.setItem('savedContexts_poll', JSON.stringify(updated));
+                    }
+
+                    window.location.href = `${window.location.origin}/.apps/poll/${displayId}`;
+                };
 			    bar.appendChild(createBtn);
 			}
+            
+            // ── DotConf controls ──────────────────────────────────────────────────────
+            if (this.currentApp && this.currentApp.id === 'conf' && this.currentPath.length === 2 && this._dotconfReady) {
+               // Normalise presenceState before render loop touches items
+                var _pList = [];
+                if (this.data && this.data.items && this.data.items[0]) {
+                    var _fi = this.data.items[0];
+                    if (_fi.participants) {
+                        _pList = _fi.participants;
+                    } else if (_fi.dotconfs && _fi.dotconfs[0]) {
+                        _pList = (_fi.dotconfs[0].dotconfs) || [];
+                    }
+                }
+                for (var _pi = 0; _pi < _pList.length; _pi++) {
+                    if (!_pList[_pi].presenceState) _pList[_pi].presenceState = 'invited';
+                }
+                    
+                var confItem = null;
+                if (this.data && this.data.items && this.data.items[0]) {
+                    var firstItem = this.data.items[0];
+                    if (firstItem.entityType === 'conference') {
+                        confItem = firstItem;
+                    } else if (firstItem.dotconfs) {
+                        confItem = firstItem.dotconfs.find(function(c) {
+                            return c.displayID === (window.app.currentPath[1] && window.app.currentPath[1].displayID);
+                        });
+                    }
+                }
+                var confStatus = (confItem && confItem.status) ? confItem.status : 'scheduled';
+                
+                console.log('[dotconf] renderContextBar firing, isDataOwner:', this.isDataOwner(), 
+                                                               'confItem:', confItem, 'confStatus:', confStatus);
+                               
+
+                if (this.isDataOwner()) {
+                    var isLive = confStatus === 'live';
+                    var hostBtn = document.createElement('button');
+                    hostBtn.textContent = isLive ? '📵 End Call' : '📞 Start Call';
+                    hostBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                    var hostBtnHoverColor = isLive ? '#e17055' : '#00b894';
+                    var hostBtnHoverBg    = isLive ? '#fff0f0' : '#f0fff4';
+                    hostBtn.onmouseenter = function() {
+                        hostBtn.style.background  = hostBtnHoverBg;
+                        hostBtn.style.borderColor = hostBtnHoverColor;
+                        hostBtn.style.color       = hostBtnHoverColor;
+                    };
+                    hostBtn.onmouseleave = function() {
+                        hostBtn.style.background  = 'none';
+                        hostBtn.style.borderColor = '#b2bec3';
+                        hostBtn.style.color       = '#636e72';
+                    };
+                    hostBtn.onclick = function() {
+                        if (isLive) {
+                            if (typeof window.app.dotconfLeave === 'function') {
+                                window.app.dotconfLeave(window.app);
+                            }
+                        } else {
+                            if (typeof window.app.dotconfJoin === 'function') {
+                                window.app.dotconfJoin(window.app);
+                            }
+                        }
+                    };
+                    bar.appendChild(hostBtn);
+                    
+                    if (window.app.dotconfShouldShowInviteButton(this)) {
+                        var inviteBtn = document.createElement('button');
+                        inviteBtn.textContent = '✉️ Invite';
+                        inviteBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                        inviteBtn.onmouseenter = function() {
+                            inviteBtn.style.background  = '#eef6ff';
+                            inviteBtn.style.borderColor = '#0984e3';
+                            inviteBtn.style.color       = '#0984e3';
+                        };
+                        inviteBtn.onclick = function() {
+                            if (typeof window.app.dotconfHandleInviteClick === 'function') {
+                                window.app.dotconfHandleInviteClick(window.app);
+                            }
+                        };
+                        inviteBtn.onclick = function() {
+                            _dotconfHandleInviteClick(window.app);
+                        };
+                        bar.appendChild(inviteBtn);
+                    }
+
+                } else {
+                    if (!window.app._dotconfCallLive) {
+                        var joinBtn = document.createElement('button');
+                        joinBtn.textContent = '📞 Join Call';
+                        joinBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                        joinBtn.onmouseenter = function() {
+                            joinBtn.style.background  = '#f0fff4';
+                            joinBtn.style.borderColor = '#00b894';
+                            joinBtn.style.color       = '#00b894';
+                        };
+                        joinBtn.onmouseleave = function() {
+                            joinBtn.style.background  = 'none';
+                            joinBtn.style.borderColor = '#b2bec3';
+                            joinBtn.style.color       = '#636e72';
+                        };
+                        joinBtn.onclick = function() {
+                            if (typeof window.app.dotconfJoin === 'function') {
+                                window.app.dotconfJoin(window.app);
+                            }
+                        };
+                        bar.appendChild(joinBtn);
+                    }
+
+                    if (window.app._dotconfCallLive) {
+                        var leaveBtn = document.createElement('button');
+                        leaveBtn.textContent = '📵 Leave Call';
+                        leaveBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                        leaveBtn.onmouseenter = function() {
+                            leaveBtn.style.background  = '#fff0f0';
+                            leaveBtn.style.borderColor = '#e17055';
+                            leaveBtn.style.color       = '#e17055';
+                        };
+                        leaveBtn.onmouseleave = function() {
+                            leaveBtn.style.background  = 'none';
+                            leaveBtn.style.borderColor = '#b2bec3';
+                            leaveBtn.style.color       = '#636e72';
+                        };
+                        leaveBtn.onclick = function() {
+                            if (typeof window.app.dotconfLeave === 'function') {
+                                window.app.dotconfLeave(window.app);
+                            }
+                        };
+                        bar.appendChild(leaveBtn);
+                    }
+                }
+            }
 
 			const canvas = document.getElementById('canvas-area');
 			canvas.insertBefore(bar, canvas.firstChild);
@@ -9360,14 +9965,18 @@ class SchemaOrchestrator {
 	    dot.classList.remove('transformed-card');
 	    dot.classList.remove('safe-mobile-position');
 	    
-	    // Restore the original span structure
-	    dot.innerHTML = `
-	        <span class="dot-label">
-	            <span>${displayLabel[0] || ''}</span>
-	            <span>${displayLabel[1] || ''}</span>
-	            <span>${displayLabel[2] || ''}</span>
-	        </span>
-	    `;
+        // Restore the original span structure (or plain text, matching render()'s logic)
+        if (displayLabel.length === 3) {
+            dot.innerHTML = `
+                <span class="dot-label">
+                    <span>${displayLabel[0]}</span>
+                    <span>${displayLabel[1]}</span>
+                    <span>${displayLabel[2]}</span>
+                </span>
+            `;
+        } else {
+            dot.textContent = displayLabel;
+        }
 
 	    // Reset styles using saved original state
 	    Object.assign(dot.style, {
@@ -10599,31 +11208,45 @@ class SchemaOrchestrator {
 		                return;
 		            }
 
-		            if (targetDepth > 0 && targetDepth <= this.currentPath.length) {
-		                this.currentPath = this.currentPath.slice(0, targetDepth);
-		                
-		                const historyState = {
-		                    depth: targetDepth,
-		                    path: this.currentPath.map(p => ({ 
-		                        id: p.id, 
-		                        entityType: p.entityType,
-		                        displayID: p.displayID,
-		                        hashed: p.hashed,
-								shortName: p.shortName 
-		                    }))
-		                };
-		                
-		                if (targetDepth <= 2) {
-		                    const newUrl = this.getAppUrl(this.currentPath);
-		                    window.history.pushState(historyState, '', newUrl);
-		                } else {
-		                    const currentUrl = window.location.pathname + window.location.search;
-		                    window.history.pushState(historyState, '', currentUrl);
-		                }
-		                
-		                this.render();
-		                this.updateBreadcrumb();
-		            }
+                    if (targetDepth > 0 && targetDepth <= this.currentPath.length) {
+                        // Capture BEFORE slicing — this is the entity we're navigating away from
+                        const childIdToFind = this.currentPath[targetDepth]?.id || this.currentPath[targetDepth]?.displayID;
+
+                        this.currentPath = this.currentPath.slice(0, targetDepth);
+
+                        const historyState = { /* unchanged */ };
+
+                        if (targetDepth <= 2) {
+                            const newUrl = this.getAppUrl(this.currentPath);
+                            window.history.pushState(historyState, '', newUrl);
+                        } else {
+                            const currentUrl = window.location.pathname + window.location.search;
+                            window.history.pushState(historyState, '', currentUrl);
+                        }
+
+                        const parentEntityType = this.currentApp.hierarchy[targetDepth - 1];
+                        const parentConfig = this.currentApp.entityConfigs?.[parentEntityType];
+                        const childrenField = parentConfig?.childrenField;
+                        const parentItem = this.data?.items?.[0];
+
+                        const needsChildCheck = childIdToFind != null && childrenField;
+                        const childIsPresent = !needsChildCheck || (
+                            Array.isArray(parentItem?.[childrenField]) &&
+                            parentItem[childrenField].some(c => c.ID === childIdToFind || c.displayID === childIdToFind)
+                        );
+
+                        if (!childIsPresent) {
+                            try {
+                                let pathContext = this.currentPath.map((p, i) => i === 0 ? (p.id || p.displayID) : p.displayID);
+                                this.data = await this.db.getAppData(this.currentApp.id, pathContext, { bypassCache: true });
+                            } catch (e) {
+                                console.warn('[breadcrumb] re-fetch failed:', e);
+                            }
+                        }
+
+                        this.render();
+                        this.updateBreadcrumb();
+                    }
 		        }
 		    });
 		});
@@ -12015,6 +12638,86 @@ class SchemaOrchestrator {
 	    return levels;
 	}
 	// Update the addItem method in SchemaOrchestrator to send emails
+    
+    _showCenterStatus(message, { holdMs = 900, spinner = true } = {}) {
+        const container = document.getElementById('canvas-area');
+        if (container) {
+            if (!document.getElementById('status-spin-style')) {
+                const style = document.createElement('style');
+                style.id = 'status-spin-style';
+                style.textContent = `@keyframes spin { to { transform: rotate(360deg); } }`;
+                document.head.appendChild(style);
+            }
+            container.innerHTML = `
+                <div style="
+                    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+                    text-align:center; padding:30px; background:white; border-radius:12px;
+                    box-shadow:0 4px 12px rgba(0,0,0,0.1); max-width:400px; width:90%; z-index:1000;
+                ">
+                    ${spinner ? `<div style="margin:0 auto 16px; width:28px; height:28px;
+                        border:3px solid #eee; border-top-color:#667eea; border-radius:50%;
+                        animation:spin 0.8s linear infinite;"></div>` : ''}
+                    <p style="margin:0; color:#333; font-size:17px;">${message}</p>
+                </div>
+            `;
+        }
+        return new Promise(resolve => setTimeout(resolve, holdMs));
+    }
+
+    _statusMessage(key, replacements = {}) {
+        const defaults = {
+            creating: 'Creating your ${appName} space…',
+            created: 'Your ${appName} space is created. An email has been sent.',
+            createdNoEmail: 'Your ${appName} space is created.',
+            navigating: 'Taking you to your ${appName} space…'
+        };
+        let template = this.currentApp?.onboardingMessages?.[key] || defaults[key];
+        for (const [k, v] of Object.entries(replacements)) {
+            template = template.replaceAll(`\${${k}}`, v);
+        }
+        return template;
+    }
+
+    _showAddButtonHint() {
+        const key = `hint_add_shown_${this.currentApp.id}`;
+        if (localStorage.getItem(key)) return;
+
+        const orbBtn = document.querySelector('.orb-add-btn');
+        if (!orbBtn) return;
+
+        const hint = document.createElement('div');
+        hint.className = 'add-button-hint';
+        hint.textContent = orbBtn.getAttribute('title') || 'Click + to get started';
+        hint.style.cssText = `
+            position: absolute;
+            bottom: 10px;
+            left: 0;
+            transform: translateX(-50%);
+            background: #333;
+            color: white;
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            white-space: nowrap;
+            z-index: 1001;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        `;
+        const arrow = document.createElement('div');
+        arrow.style.cssText = `
+            position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+            border: 6px solid transparent; border-top-color: #333;
+        `;
+        hint.appendChild(arrow);
+
+        // orbBtn's own parent is the wrapper _createAddButton returns — it's
+        // already position:absolute and already placed at canvas center by the
+        // caller's addBtn.style.left/top, so no extra positioning needed here.
+        orbBtn.parentElement.appendChild(hint);
+
+        const dismiss = () => { hint.remove(); localStorage.setItem(key, '1'); };
+        orbBtn.addEventListener('click', dismiss, { once: true });
+        setTimeout(dismiss, 6000);
+    }
 
 	async addItem(entityType, form) {
 	    if (!this.currentApp) {
@@ -12184,112 +12887,172 @@ class SchemaOrchestrator {
 	    // ✅ Close modal
 	    document.getElementById('add-modal').style.display = 'none';
 
-	    try {
-	        let skipEndNotification = false;
+        try {
+            let skipEndNotification = false;
+            const appDisplayName = this.currentApp?.name || entityDisplayName;
 
-	        // ✅ Send welcome email for root level
-	        if (isRootLevel) {
-	            try {
-	                const appUrl = this.getAppUrl([{
-	                    id: newItem.ID,
-	                    asuuid: true,
-	                    hashed: newItem.hashed,
-	                    displayID: newItem.displayID
-	                }]);
-	                await this.sendTenantWelcomeEmail(newItem, appUrl);
-	                console.log('Welcome email sent to tenant:', newItem.contactemail);
-	            } catch (error) {
-	                console.error('Failed to send tenant welcome email:', error);
-	            }
-	        }
+            // ✅ UNIVERSAL SAVE — now runs BEFORE the welcome email (was reversed).
+            //    Applies to ALL apps: email should never promise a space that doesn't exist yet.
+            const tenantSegment = this.currentPath.length > 0
+                ? (this.currentPath[0].id || this.currentPath[0].displayID)
+                : null;
+            const restSegments = this.currentPath.slice(1).map(p => p.displayID);
+            const entityPath = [
+                'apps', this.currentApp.id,
+                ...(tenantSegment !== null ? [tenantSegment, ...restSegments] : []),
+                newItem.displayID
+            ].join('/');
 
-	        // ✅ UNIVERSAL SAVE - same path for everyone
+            console.log('[TTT addItem] newItem before save:', JSON.stringify(newItem).substring(0, 300));
 
-			const tenantSegment = this.currentPath.length > 0
-			    ? (this.currentPath[0].id || this.currentPath[0].displayID)
-			    : null;
-			const restSegments = this.currentPath.slice(1).map(p => p.displayID);
-			 
-			const entityPath = [
-			    'apps',
-			    this.currentApp.id,
-			    ...(tenantSegment !== null ? [tenantSegment, ...restSegments] : []),
-			    newItem.displayID
-			].join('/');
+            if (isRootLevel) {
+                // Status panel overlaps the real save — adds no latency when the server is slow,
+                // and _showCenterStatus's own holdMs floor keeps it from flashing when it's fast.
+                await Promise.all([
+                    this._showCenterStatus(this._statusMessage('creating', { appName: appDisplayName })),
+                    this.db.saveEntityData(entityPath, newItem, false)
+                ]);
+            } else {
+                await this.db.saveEntityData(entityPath, newItem, false);
+            }
 
+            // ✅ Send welcome email for root level — now AFTER save succeeds (all apps)
+            let welcomeEmailSent = false;
+            if (isRootLevel) {
+                try {
+                    const appUrl = this.getAppUrl([{
+                        id: newItem.ID, asuuid: true,
+                        hashed: newItem.hashed, displayID: newItem.displayID
+                    }]);
+                    await this.sendTenantWelcomeEmail(newItem, appUrl);
+                    welcomeEmailSent = true;
+                    console.log('Welcome email sent to tenant:', newItem.contactemail);
+                } catch (error) {
+                    console.error('Failed to send tenant welcome email:', error);
+                }
 
-	        console.log('[TTT addItem] newItem before save:', JSON.stringify(newItem).substring(0, 300));
-			await this.db.saveEntityData(entityPath, newItem, false);
+                // Copy depends on the outcome above, so this hold is sequential, not overlapped
+                await this._showCenterStatus(
+                    this._statusMessage(welcomeEmailSent ? 'created' : 'createdNoEmail', { appName: appDisplayName }),
+                    { holdMs: 1100, spinner: false }
+                );
+            }
 
-			// ✅ Post-save: localStorage persistence (config-driven)
-			const lsConfig = entityConfig.postSaveLocalStorage;
-			if (lsConfig) {
-			    try {
-			        const parent = this.currentPath[this.currentPath.length - 1];
-			        const key = lsConfig.key.replace('${parentDisplayID}', parent?.displayID || '');
-			        const value = {};
-			        lsConfig.fields.forEach(f => {
-			            const [alias, source] = f.includes(':') ? f.split(':') : [f, f];
-			            value[alias] = newItem[source];
-			        });
-			        localStorage.setItem(key, JSON.stringify(value));
-			        console.log('[addItem] localStorage saved:', key);
-			    } catch (e) {
-			        console.warn('[addItem] localStorage save failed:', e);
-			    }
-			}
+            // ✅ Post-save: localStorage persistence (config-driven) — unchanged
+            const lsConfig = entityConfig.postSaveLocalStorage;
+            if (lsConfig) {
+                try {
+                    const parent = this.currentPath[this.currentPath.length - 1];
+                    const key = lsConfig.key.replace('${parentDisplayID}', parent?.displayID || '');
+                    const value = {};
+                    lsConfig.fields.forEach(f => {
+                        const [alias, source] = f.includes(':') ? f.split(':') : [f, f];
+                        value[alias] = newItem[source];
+                    });
+                    localStorage.setItem(key, JSON.stringify(value));
+                    console.log('[addItem] localStorage saved:', key);
+                } catch (e) {
+                    console.warn('[addItem] localStorage save failed:', e);
+                }
+            }
 
-			// ✅ Post-save navigation override (config-driven)
-			const skipNavigation = entityConfig.postSaveNavigation === 'none';
+            const skipNavigation = entityConfig.postSaveNavigation === 'none';
 
-			// ✅ Post-save: root level nav/animation
-			if (isRootLevel) {
-				
-				if (!isowner) {
-				    this.saveLastViewedContext(this.currentApp.id, [newItem.ID]); // hashed for non-owner
-				} 
+            // ✅ Post-save: root level nav/animation — all apps
+            if (isRootLevel) {
+                if (!isowner) {
+                    this.saveLastViewedContext(this.currentApp.id, [newItem.ID]);
+                }
 
-				if (!skipNavigation) {
-			        this.confirmDot(newItem.ID);
-			        const dot = document.querySelector(`.dot[data-id="${newItem.ID}"]`);
-			        if (dot) {
-			            await new Promise(resolve => setTimeout(resolve, 700));
-			            dot.style.transform = 'scale(1.5)';
-			            // ... rest of animation
-			        }
-			    }
+                this.currentPath = [{
+                    id: newItem.ID,
+                    displayID: newItem.displayID,
+                    shortName: newItem.name || newItem.orgname || 'New ' + entityDisplayName,
+                    hashed: newItem.hashed,
+                    entityType: entityType
+                }];
 
-				this.currentPath = [{
-				    id: newItem.ID,
-				    displayID: newItem.displayID,
-				    shortName: newItem.name || newItem.orgname || 'New ' + entityDisplayName,
-				    hashed: newItem.hashed,
-				    entityType: entityType
-				}];
-				 
-				window.history.pushState({}, '', this.getAppUrl(this.currentPath));
-				 
-				try {
-				    // Use .id (the raw UUID) here, NOT .displayID — see file header.
-				    const freshData = await this.db.getAppData(
-				        this.currentApp.id, [this.currentPath[0].id || this.currentPath[0].displayID]
-				    );
-				    this.data = freshData;
-				} catch (error) {
-				    console.warn('Failed to fetch fresh tenant data:', error);
-				}
+                // Status panel overlaps the dot animation + fresh fetch
+                const [, freshData] = await Promise.all([
+                    this._showCenterStatus(
+                        this._statusMessage('navigating', { appName: appDisplayName }),
+                        { holdMs: 1000 }
+                    ),
+                    (async () => {
+                        if (!skipNavigation) {
+                            this.confirmDot(newItem.ID);
+                            const dot = document.querySelector(`.dot[data-id="${newItem.ID}"]`);
+                            if (dot) {
+                                await new Promise(resolve => setTimeout(resolve, 700));
+                                dot.style.transform = 'scale(1.5)';
+                                // ... rest of animation
+                            }
+                        }
+                        window.history.pushState({}, '', this.getAppUrl(this.currentPath));
+                        try {
+                            // Use .id (the raw UUID) here, NOT .displayID — see file header.
+                            return await this.db.getAppData(
+                                this.currentApp.id, [this.currentPath[0].id || this.currentPath[0].displayID]
+                            );
+                        } catch (error) {
+                            console.warn('Failed to fetch fresh tenant data:', error);
+                            return null;
+                        }
+                    })()
+                ]);
+                if (freshData) this.data = freshData;
 
+                    this.render();
+                    this.updateBreadcrumb();
 
-	            this.render();
-	            this.updateBreadcrumb();
+                    if (!welcomeEmailSent && newItem.contactemail) {
+                        this.showNotification(
+                            `⚠️ ${entityDisplayName} space created, but we couldn't send the confirmation email.`,
+                            'warning'
+                        );
+                    }
 
-	            this.showNotification(
-	                `✅ ${entityDisplayName} "${newItem.name || 'New Tenant'}" created! Welcome email sent to ${newItem.contactemail}`,
-	                'success'
-	            );
-	            skipEndNotification = true;
-	           // return;
-	        }
+                    // ← INSERT FORK-CONSUMPTION BLOCK HERE
+                    if (window._pendingFork && window._pendingFork.appId === this.currentApp.id) {
+                        const { sourcePath, entityName } = window._pendingFork;
+                        delete window._pendingFork;
+
+                        const forkedEntityType = this.currentApp.hierarchy[sourcePath.split('/').length - 2]; // still useful for the label word ("poll")
+                        const forkedEntityLabel = this.currentApp.entityConfigs?.[forkedEntityType]?.name || forkedEntityType || 'item';
+
+                        await this._showCenterStatus(
+                            `Adding imported ${forkedEntityLabel.toLowerCase()}${entityName ? ' - ' + entityName : ''} to your space`
+                        );
+
+                        try {
+                            const forkRes = await fetch('/newauth/api/forkentity', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ appId: this.currentApp.id, sourcePath, targetTenantId: newItem.ID })
+                            }).then(r => r.json());
+
+                            if (forkRes?.newId) {
+                                const childType = this.currentApp.hierarchy[1];
+                                this.currentPath = [
+                                    this.currentPath[0],
+                                    { id: forkRes.newId, displayID: forkRes.newDisplayId, entityType: childType }
+                                ];
+
+                                const rawCreatorSegment = { ...this.currentPath[0] };
+                                const newUrl = this.getAppUrl([rawCreatorSegment, this.currentPath[1]]);
+                                window.location.href = newUrl;
+                                return;
+                            }
+                        } catch (e) {
+                            console.warn('[addItem] fork consumption failed:', e);
+                            this.showNotification('⚠️ Could not copy this. You can still create your own.', 'warning');
+                        }
+                    }
+
+                    this._showAddButtonHint();
+
+                    skipEndNotification = true;
+                }
 
 	        // ✅ Post-save: notification email for direct children of root
 	        const isDirectChildOfRoot = (this.currentPath.length === 1) && !isRootLevel;
@@ -13102,11 +13865,13 @@ class SchemaOrchestrator {
 	    `;
 	    
 	    // ✅ Set background based on notification type
-	    if (type === 'error') {
-	        toast.style.background = 'linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%)'; // Red gradient for errors
-	    } else {
-	        toast.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'; // Original purple for success
-	    }
+        if (type === 'error') {
+            toast.style.background = 'linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%)';
+        } else {
+            // success and warning share the purple gradient; the ⚠️ in the
+            // message text (added at the call site) is what distinguishes warning
+            toast.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)';
+        }
 	    
 	    toast.textContent = message;
 	    
@@ -15593,6 +16358,16 @@ if (typeof window !== 'undefined') {
             search(self.data.items, hierarchy[0], []);
         }
 
+        return result;
+    };
+    
+    const _parseUrl = SchemaOrchestrator.prototype.parseUrlForDataFetch;
+    SchemaOrchestrator.prototype.parseUrlForDataFetch = function() {
+        const result = _parseUrl.call(this);
+        if (result && this.currentApp && isForkUrl(result.appId, this.currentApp.hierarchy)) {
+            console.log('[fork] Fork URL detected for app:', result.appId, '— returning root level');
+            return { appId: result.appId, tenantId: null, pathIds: [], shortUrl: false };
+        }
         return result;
     };
     

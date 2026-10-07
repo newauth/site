@@ -1184,6 +1184,10 @@
 
 	  // ═══ TIER 0: FIXED - Check if structured output needed ═══
 	  if (minTier === 0) {
+        if (configured['jev'] || configured['openrouter']) {
+          return { provider: 'jev', model: 'jev-latest', smart: true, tier: 0 };
+        }
+ 
 	    // If structured output needed and WebLLM too small, skip to cloud
 	    if (needsStructured && !webllmGoodEnough) {
 	      console.log('[Smart Routing] Skipping WebLLM for structured output (too small)');
@@ -2151,6 +2155,7 @@
 	// ── Provider API adapters ──────────────────────────────────────────────
 	 // Each adapter takes (workerItem, history[], userMessage) and returns
 	 // the assistant reply string. history is in { role, content } shape.
+     
 	 
 	 // callOpenRouter — OpenAI-compatible API
 	 async function callOpenRouter(workerItem, history, userMessage) {
@@ -6355,7 +6360,11 @@
 		  }
 
 		  // ── Run Classifier if present and configured ───────────────────────
-		  if (classifierWorker && !classifierWorker.disabled && !classifierWorker._pendingLLM) {
+          const classifierReady = classifierWorker && 
+            !classifierWorker.disabled && 
+            (!classifierWorker._pendingLLM || classifierWorker.provider === 'jev');
+
+          if (classifierReady) {
 		    if (!newOnly.length) {
 		      console.log(`[Watcher(${compositionItem.name})] No new articles — skipping classifier`);
 		      await agntsUpsertAndSave(orchestrator, compositionItem);
@@ -7731,9 +7740,115 @@
         tx.onerror    = e => reject(e.target.error);
       });
     }
+    
+    async function runClassificationJev(classifierWorker, articles, topic, compositionType) {
+      const s = GlobalSettings.load();
+      
+      // Prefer direct Jev key, fall back to OpenRouter
+      const jevKey       = classifierWorker.apiKey || 
+                           s.apiKeys?.find(k => k.provider === 'jev')?.key;
+      const openrouterKey = s.apiKeys?.find(k => k.provider === 'openrouter')?.key;
+
+      const useOpenRouter = !jevKey && !!openrouterKey;
+      const apiKey        = jevKey || openrouterKey;
+
+      if (!apiKey) throw new Error('Jev classification needs a Jev or OpenRouter API key');
+
+      const endpoint = useOpenRouter
+        ? 'https://openrouter.ai/api/alpha/decisions'
+        : 'https://api.typesafe.ai/v1/systemone';
+
+      const model = useOpenRouter ? 'typesafe/jev-1.13' : 'jev-latest';
+
+      console.log(`[Jev] Using ${useOpenRouter ? 'OpenRouter' : 'TypeSafe'} endpoint`);
+
+      const defaultInstructions = {
+        sentinel:   'Is this news article directly related to the topic?',
+        journalist: 'Is this a news article or development directly related to the topic?',
+        trader:     'Does this contain actionable financial information related to the topic?',
+        researcher: 'Does this contain substantive information or findings related to the topic?',
+        default:    'Is this content directly related to the topic?'
+      };
+
+      const instruction = classifierWorker.systemPrompt?.trim()
+        || defaultInstructions[compositionType]
+        || defaultInstructions.default;
+
+      const allRelevantIndices = [];
+
+      const results = await Promise.all(articles.map(async (article, idx) => {
+        const parts = article.split(' | ');
+        const title = parts[0] || '';
+        const desc  = parts[3] || '';
+        const state = desc ? `${title} — ${desc}` : title;
+
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type':  'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+              ...(useOpenRouter ? {
+                'HTTP-Referer':       window.location.origin,
+                'X-OpenRouter-Title': 'Agent Studio'
+              } : {})
+            },
+            body: JSON.stringify({
+              model,
+              state,
+              questions: {
+                relevant: {
+                  type: 'noul',
+                  instructions: { question: instruction, topic },
+                  criteria: {
+                    true:  'Content directly relates to the topic',
+                    false: 'Content is unrelated or only tangentially connected'
+                  }
+                }
+              }
+            })
+          });
+
+          if (!response.ok) {
+            console.warn(`[Jev] Article ${idx} HTTP ${response.status}`);
+            return { idx, relevant: false, score: 0 };
+          }
+
+          const data  = await response.json();
+          const score = data.answers?.relevant?.noul ?? 0;
+          console.log(`[Jev] Article ${idx}: "${title.substring(0, 40)}" → ${score.toFixed(2)}`);
+          return { idx, relevant: score >= 0.6, score };
+
+        } catch(e) {
+          console.warn(`[Jev] Article ${idx} failed:`, e.message);
+          return { idx, relevant: false, score: 0 };
+        }
+      }));
+
+      results.filter(r => r.relevant).forEach(r => allRelevantIndices.push(r.idx));
+
+      const verdict = allRelevantIndices.length > 0 ? 'RELEVANT' : 'NOT_RELEVANT';
+      const reason  = allRelevantIndices.length > 0
+        ? `${allRelevantIndices.length} relevant article(s) found via Jev (${useOpenRouter ? 'OpenRouter' : 'TypeSafe'})`
+        : 'No relevant articles found';
+
+      console.log(`[Jev Classifier] ${verdict} — ${allRelevantIndices.length}/${articles.length} relevant`);
+      return { verdict, reason, relevantIndices: allRelevantIndices };
+    }
 
     // ── Core classification ──────────────────────────────────────────────
 	async function runClassification(orchestrator, compositionItem, classifierWorker, content, topic) {
+        
+        const articles = content.split('\n').filter(Boolean);
+          
+          // ← Jev path — parallel article-by-article classification
+          if (classifierWorker.provider === 'jev' || 
+              resolveSmartModel('classifier', classifierWorker).provider === 'jev') {
+            return runClassificationJev(
+              classifierWorker, articles, topic, 
+              compositionItem.compositionType || 'sentinel'
+            );
+          }
 		
 	  const compositionType = compositionItem.compositionType || 'sentinel';
 
@@ -7750,7 +7865,6 @@
 	    || defaultPrompts[compositionType]
 	    || defaultPrompts.default;
 
-	  const articles = content.split('\n').filter(Boolean);
 	  
 	  // Batching logic - ~2000 chars per batch (increased from 1500)
 	  const MAX_BATCH_CHARS = 4000;
@@ -7820,7 +7934,8 @@
 		//console.log('[Classifier] Prompt DEBUG:', prompt);
 	    const response = await callProvider(classifierWorker, [], prompt);
 		console.log('[Classifier] Prompt DEBUG Raw response:', response);
-	    const callDuration = ((Date.now() - callStartTime) / 1000).toFixed(1);
+        
+ 	    const callDuration = ((Date.now() - callStartTime) / 1000).toFixed(1);
 	    
 	    if (!response) {
 	      console.warn(`[Classifier] Batch ${batchNum} failed - no response`);
@@ -13621,9 +13736,7 @@
           watcherActive: true
         },
         classifier: {
-          topic: 'significant world news, breaking events, major political or economic developments',
-		  _pendingLLM: true,
-		    disabled: true
+          topic: 'significant world news, breaking events, major political or economic developments'
         },
         monitor: {
           alertThreshold:  1,
@@ -13644,9 +13757,7 @@
           watcherActive: true
         },
         classifier: {
-          topic: 'technology, AI, programming, startups, interesting hacker news',
-		  _pendingLLM: true,
-		    disabled: true
+          topic: 'technology, AI, programming, startups, interesting hacker news'
         },
         monitor: {
           alertThreshold:  1,
@@ -15539,6 +15650,7 @@
 	if (compositionItem?.entityType === 'agntuser') {
 	  console.trace('[agntsUpsertAndSave] CALLED WITH AGNTUSER — stack:');
 	}
+    
 	if (!orchestrator.currentPath?.length) {
 	    console.warn('[agntsUpsertAndSave] No currentPath — skipping save');
 	    return;
