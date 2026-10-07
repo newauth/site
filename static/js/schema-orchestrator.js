@@ -817,12 +817,14 @@ async function showForkPreview(orchestrator, appId) {
         if (!res.ok) { _showForkError('This link is invalid or has expired.'); return; }
         const data = await res.json();
         item = data?.items?.[0];
+        
         if (!item) { _showForkError('This link is invalid or has expired.'); return; }
     } catch (err) {
         _showForkError('Could not load this item. Please try again.');
         return;
     }
 
+    const forkAllowed = item.allowFork === true || item.allowFork === 'true';
     const explainer = entityConfig.forkExplainer
         || `Get your own copy of this ${entityLabel.toLowerCase()} — ready to send to your own group.`;
     const optionsCaption = entityConfig.forkOptionsCaption
@@ -862,13 +864,20 @@ async function showForkPreview(orchestrator, appId) {
                     <div style="font-size:12px; color:#999; margin-bottom:8px;">${optionsCaption}</div>
                     <div style="margin-bottom:18px;">${pillHTML}${morePill}</div>
                 ` : ''}
-                <div class="sp-agent-card" style="font-size:13px; color:#555; line-height:1.5; margin-bottom:16px;">
-                    ${explainer}
-                </div>
-                <button class="sp-add-btn" id="fork-add-btn" style="width:100%; padding:12px; border:none; border-radius:8px; color:white; font-weight:600; cursor:pointer; background:linear-gradient(135deg,#667eea,#764ba2aa); margin-bottom:8px;">
-                    ✨ Make this your ${entityLabel.toLowerCase()} →
-                </button>
-                <button class="sp-skip" id="fork-skip-btn" style="width:100%; padding:10px; border:none; background:none; color:#999; cursor:pointer; font-size:13px;">Maybe later</button>
+                ${forkAllowed ? `
+                    <div class="sp-agent-card" style="font-size:13px; color:#555; line-height:1.5; margin-bottom:16px;">
+                        ${explainer}
+                    </div>
+                    <button class="sp-add-btn" id="fork-add-btn" style="width:100%; padding:12px; border:none; border-radius:8px; color:white; font-weight:600; cursor:pointer; background:linear-gradient(135deg,#667eea,#764ba2aa); margin-bottom:8px;">
+                        ✨ Make this your ${entityLabel.toLowerCase()} →
+                    </button>
+                    <button class="sp-skip" id="fork-skip-btn" style="width:100%; padding:10px; border:none; background:none; color:#999; cursor:pointer; font-size:13px;">Maybe later</button>
+                ` : `
+                    <div style="font-size:13px; color:#888; text-align:center; line-height:1.5; margin-bottom:12px;">
+                        The owner of this ${entityLabel.toLowerCase()} has turned off copying.
+                    </div>
+                    <button class="sp-skip" id="fork-skip-btn" style="width:100%; padding:10px; border:1px solid #ddd; background:white; color:#555; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600;">Close</button>
+                `}
             </div>
         </div>`;
     document.body.appendChild(overlay);
@@ -1392,6 +1401,7 @@ class SchemaOrchestrator {
 		        // ✅ Update path names then render
 		        this.updateCurrentPathWithRealNames();
 		        this._contextBarFlipped = false;
+                this._pathResolved = true; 
 
 		        if (this.currentApp) {
 		            this.render();
@@ -1792,7 +1802,7 @@ class SchemaOrchestrator {
 
 		}
         
-        showForkLinkModal() {
+        async showForkLinkModal() {
             const depth = this.currentPath.length;
             if (depth === 0) {
                 this.showNotification('Open something first to fork it.', 'error');
@@ -1822,8 +1832,18 @@ class SchemaOrchestrator {
             }
 
             if (item.allowFork !== true && item.allowFork !== 'true') {
-                this.showNotification('Forking is turned off for this poll. Enable it in settings to share a forkable link.', 'error');
-                return;
+                if (!this.isDataOwner()) {
+                    this.showNotification("The poll owner hasn't allowed copies of this poll.", 'info');
+                    return;
+                }
+                // Owner asking for a copy link is the consent — enable it, no prompt
+                item.allowFork = 'true';
+                const { answers, votes, ...meta } = item;
+                const pollPath = ['apps', this.currentApp.id,
+                    this.currentPath[0].id || this.currentPath[0].displayID, item.displayID].join('/');
+                await this.db.saveEntityData(pollPath, meta, true);
+                this._updateShareButtonVisibility();
+                this.showNotification('Copy links turned on for this poll (was off). Turn off anytime in poll settings.', 'info', 5000);
             }
 
             const existing = document.getElementById('fork-link-modal-backdrop');
@@ -2855,6 +2875,143 @@ class SchemaOrchestrator {
 	    };
 	}
 
+    _buildWatermarkLines() {
+        const app = this.currentApp;
+        const path = this.currentPath;
+        const depth = path.length;
+        const lines = [];
+
+        // Depth 0 — owner's listing of all root entities
+        if (depth === 0) {
+            if (!isowner) return []; 
+            const rootType = app.hierarchy[0];
+            const count = this.data?.items?.length || 0;
+            lines.push({ role: 'context', text: app.name });
+            lines.push({ role: 'subject', text: `All ${this._entityPlural(rootType)}` });
+            lines.push({ role: 'dots', text: `${count} ${this._entityLabel(rootType, count)}` });
+            return lines;
+        }
+
+        // Line 1 — context
+        const rootEntity = this.data?.items?.find(i =>
+            i.ID === path[0]?.id || i.displayID === path[0]?.displayID);
+        const rootName = rootEntity ? this.getShortName(rootEntity, app.hierarchy[0]) : null;
+
+        if (depth === 1 || !rootName) {
+            // At the root itself, or the root isn't readable (e.g. voters) — app name only
+            lines.push({ role: 'context', text: app.name });
+        } else {
+            const parent = depth >= 3 ? ` · ${path[depth - 2]?.shortName || ''}` : '';
+            lines.push({ role: 'context', text: `${rootName}'s ${app.name}${parent}` });
+        }
+
+        // Line 2 — subject
+        const focus = path[depth - 1];
+        const focusType = app.hierarchy[depth - 1];
+        lines.push({ role: 'subject', text: focus?.shortName || focus?.displayID || '', id: focus?.id, entityType: focusType });
+
+        // Line 3 — what the dots are
+        const childType = app.hierarchy[depth];
+        if (childType) {
+            const focusEntity = this._getWatermarkFocusEntity();
+            const childrenField = app.entityConfigs?.[focusType]?.childrenField;
+            const children = (focusEntity && childrenField && focusEntity[childrenField]) || [];
+            const parts = [`${children.length} ${this._entityLabel(childType, children.length)}`];
+
+            const metric = this._watermarkMetric(children, childType);
+            if (metric) parts.push(metric);
+
+            const totalPages = Math.ceil((this._dotPageItemCount || 0) / (this._dotPageSize || 30));
+            if (totalPages > 1) parts.push(`page ${(this._dotPage || 0) + 1} of ${totalPages}`);
+
+            lines.push({ role: 'dots', text: parts.join(' · ') });
+        }
+
+        // Line 4 — state, only if the focused entity has a status field
+        const state = this._watermarkState(focusType);
+        if (state) lines.push({ role: 'state', text: state });
+
+        return lines;
+    }
+
+    // Sum of the children's own sortConfig score field — the same number that sizes the dots.
+    // Reads raw data, never render()'s blinded array, so it's always the true total.
+    _watermarkMetric(children, childType) {
+        const sortConfig = this._resolveSortConfig(childType)?.sortConfig;
+        const field = sortConfig?.type === 'field' ? sortConfig.scoreField : sortConfig?.aggregateField;
+        if (!field || field === 'timestamp') return null;
+
+        const fieldDef = this.nativeEntities?.[childType]?.fields?.find(f => f.name === field);
+        if (fieldDef && fieldDef.type !== 'number' && field !== 'hit') return null;
+
+        const total = sortConfig.type === 'aggregate'
+            ? children.reduce((s, c) => s + (this.calculateAggregate(c, childType, sortConfig) || 0), 0)
+            : children.reduce((s, c) => s + (parseFloat(c[field]) || 0), 0);
+
+        const label = (fieldDef?.label || field).toLowerCase();
+        const singular = label.endsWith('s') ? label.slice(0, -1) : label;
+        return `${Math.round(total).toLocaleString()} ${total === 1 ? singular : this._pluralize(singular)}`;
+    }
+
+    _watermarkState(focusType) {
+        const entity = this._getWatermarkFocusEntity();
+        const statusDef = this.nativeEntities?.[focusType]?.fields?.find(f => f.name === 'status');
+        if (!entity || !statusDef) return null;
+
+        const value = entity.status || statusDef.default || statusDef.options?.[0];
+        if (!value) return null;
+        let text = statusDef.optionLabels?.[value] || (value.charAt(0).toUpperCase() + value.slice(1));
+
+        // Poll-only: explain why the dots are all the same size
+        if (this.currentApp.id === 'poll' && focusType === 'poll') {
+            const vis = entity.resultsVisibility || 'live';
+            if (vis !== 'live' && !this._shouldRevealPollResults(entity, vis)) {
+                const target = parseInt(entity.targetVoteCount, 10) || 0;
+                if (vis === 'after_target_votes') {
+                    text += target > 0
+                        ? ` · results hidden until ${target} votes`
+                        : this.isDataOwner()
+                            ? ' · set expected voters with + to reveal results'
+                            : ' · results hidden until the poll closes';
+                } else if (vis === 'after_close') {
+                    text += ' · results hidden until close';
+                } else if (vis === 'after_vote') {
+                    text += ' · results shown after you vote';
+                }
+            }
+        }
+        return text;
+    }
+
+    // The entity the user is "standing on" — walks the tree so it works whether
+    // this.data was fetched at the root (poll depth 2) or at the focus itself.
+    _getWatermarkFocusEntity() {
+        const app = this.currentApp;
+        const path = this.currentPath;
+        if (!path.length) return null;
+        const matches = (item, seg) => item && (item.ID === seg.id || item.displayID === seg.displayID || item.displayID === seg.id);
+
+        const first = this.data?.items?.[0];
+        if (matches(first, path[path.length - 1])) return first;
+
+        let current = this.data?.items?.find(i => matches(i, path[0]));
+        for (let i = 1; i < path.length && current; i++) {
+            const field = app.entityConfigs?.[app.hierarchy[i - 1]]?.childrenField;
+            current = (current?.[field] || []).find(c => matches(c, path[i]));
+        }
+        return current || null;
+    }
+
+    _entityLabel(type, count) {
+        const singular = (this.nativeEntities?.[type]?.name || type).toLowerCase();
+        return count === 1 ? singular : this._pluralize(singular);
+    }
+    _entityPlural(type) { return this._pluralize((this.nativeEntities?.[type]?.name || type).toLowerCase()); }
+    _pluralize(word) {
+        if (/[^aeiou]y$/.test(word)) return word.slice(0, -1) + 'ies';
+        if (/(s|x|ch|sh)$/.test(word)) return word + 'es';
+        return word + 's';
+    }
 
 	// Add this method to your SchemaOrchestrator class
 	updateWatermark() {
@@ -2873,6 +3030,11 @@ class SchemaOrchestrator {
 	        watermark.style.display = 'none';
 	        return;
 	    }
+        
+        if (!this._pathResolved) {
+            watermark.style.display = 'none';
+            return;
+        }
 	    
 	    watermark.style.display = 'block';
 	    
@@ -2901,224 +3063,67 @@ class SchemaOrchestrator {
 	        transform: translate(-50%, -50%);
 	        text-align: left;
 	        pointer-events: none;
-	        opacity: 0.15;
+	        opacity: 0.16;
 	        z-index: 1;
 	        width: 100%;
 	        padding: 0 20px;
 	        box-sizing: border-box;
 	    `;
 	    
-		if (isMobile) {
-		    const breadcrumb = document.getElementById('breadcrumb');
-		    const contextBar = document.getElementById('context-bar');
-		    const breadcrumbHeight = breadcrumb ? breadcrumb.offsetHeight : 0;
-		    const contextBarHeight = contextBar ? contextBar.offsetHeight : 0;
-		    const topOffset = breadcrumbHeight + contextBarHeight + 44;
-		    watermarkPositionStyle = `
-		        position: absolute;
-		        top: ${topOffset}px;
-		        left: 50%;
-		        transform: translateX(-50%);
-		        text-align: center;
-		        pointer-events: none;
-		        opacity: 0.15;
-		        z-index: 1;
-		        width: 100%;
-		        padding: 0 20px;
-		        box-sizing: border-box;
-		    `;
-		}
+        if (isMobile) {
+            const breadcrumb = document.getElementById('breadcrumb');
+            const contextBar = document.getElementById('context-bar');
+            const canvas = document.getElementById('canvas-area');
+            const barsHeight = (breadcrumb ? breadcrumb.offsetHeight : 0)
+                             + (contextBar ? contextBar.offsetHeight : 0);
+            const canvasHeight = canvas ? canvas.offsetHeight : window.innerHeight;
+            const topOffset = barsHeight + Math.round((canvasHeight - barsHeight) * 0.18);
+            watermarkPositionStyle = `
+                position: absolute;
+                top: ${topOffset}px;
+                left: 50%;
+                transform: translateX(-50%);
+                text-align: center;
+                pointer-events: none;
+                opacity: 0.16;
+                z-index: 1;
+                width: 100%;
+                padding: 0 20px;
+                box-sizing: border-box;
+            `;
+        }
 	    
-	    if (isAtRoot) {
-	        // Root level: App name + "items" (generic term)
-	        const entityName = this.currentApp.hierarchy[0] || 'items';
-	        const displayName = ''; //this.getEntityDisplayName(entityName) || entityName;
-	        
-	        watermark.innerHTML = `
-	            <div style="${watermarkPositionStyle}">
-	                <div style="
-	                    font-size: ${sizes.base + 4}px;
-	                    font-weight: 300;
-	                    color: #666;
-	                    margin-bottom: 8px;
-	                    letter-spacing: 1px;
-	                    line-height: 1.2;
-	                ">${this.currentApp.name}</div>
-	                <div style="
-	                    font-size: ${sizes.max}px;
-	                    font-weight: 700;
-	                    color: #999;
-	                    text-transform: uppercase;
-	                    letter-spacing: 2px;
-	                    line-height: 1.1;
-	                ">${displayName}</div>
-	            </div>
-	        `;
-	    } else {
-	        // Dynamic hierarchy levels with smart capping
-	        const pathLength = this.currentPath.length;
-	        let hierarchyItems = [];
-	        
-	        // Always show app name
-	        hierarchyItems.push({
-	            text: this.currentApp.name,
-	            level: 0,
-	            isFocus: false
-	        });
-	        
-	        if (pathLength <= 4) {
-	            // Show all levels (max 5 total including app)
-	            for (let i = 0; i < pathLength; i++) {
-	                const pathItem = this.currentPath[i];
-	                const entityType = this.currentApp.hierarchy[i] || `level_${i + 1}`;
-	                const displayName = pathItem.shortName || pathItem.displayID || 
-	                                  this.getEntityDisplayName(entityType) || entityType;
-	                
-	                hierarchyItems.push({
-	                    text: displayName,
-	                    level: i + 1,
-	                    isFocus: (i === pathLength - 1),
-	                    id: pathItem.id,
-	                    entityType: entityType
-	                });
-	            }
-	        } else {
-	            // Deep hierarchy (>4 levels): Show app + ... + last 3 levels
-	            hierarchyItems.push({
-	                text: '...',
-	                level: 1,
-	                isFocus: false,
-	                isEllipsis: true
-	            });
-	            
-	            // Show last 3 levels (second-to-last, last-1, focus)
-	            const startIdx = pathLength - 3;
-	            for (let i = startIdx; i < pathLength; i++) {
-	                const pathItem = this.currentPath[i];
-	                const entityType = this.currentApp.hierarchy[i] || `level_${i + 1}`;
-	                const displayName = pathItem.shortName || pathItem.displayID || 
-	                                  this.getEntityDisplayName(entityType) || entityType;
-	                
-	                hierarchyItems.push({
-	                    text: displayName,
-	                    level: i + 1,
-	                    isFocus: (i === pathLength - 1),
-	                    id: pathItem.id,
-	                    entityType: entityType
-	                });
-	            }
-	        }
-	        
-	        // Calculate font sizes with dramatic scaling
-	        let html = `<div style="${watermarkPositionStyle}">`;
-	        
-	        hierarchyItems.forEach((item, index) => {
-	            let fontSize;
-	            if (item.isFocus) {
-	                fontSize = sizes.max;
-	            } else {
-	                // Scale down based on distance from focus
-	                const distanceFromEnd = hierarchyItems.length - 1 - index;
-	                fontSize = Math.max(sizes.base, sizes.max - (distanceFromEnd * sizes.increment));
-	            }
-	            
-	            const fontWeight = item.isFocus ? 800 : (300 + (index * 100));
-	            const colorBrightness = item.isEllipsis ? 180 : (200 - (index * 20));
-	            const color = item.isFocus ? '#bbb' : `rgb(${colorBrightness}, ${colorBrightness}, ${colorBrightness})`;
-	            const letterSpacing = item.isFocus ? '3px' : (item.isEllipsis ? '2px' : '1px');
-	            const textTransform = item.isFocus ? 'uppercase' : 'none';
-	            const marginBottom = item.isFocus ? '0' : '6px';
-	            const maxWidth = item.isFocus ? '90%' : '80%';
-	            
-	            // Truncate long names on mobile
-	            const overflowStyle = isMobile ? 'overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' : '';
-	            
-	            // Only focused items should have pointer events for hover
-	            const pointerEvents = item.isFocus ? 'pointer-events: auto; cursor: default;' : '';
-				
-				// ✅ DETERMINE IF THIS IS THE LAST/FOCUSED ITEM
-				const isLastItem = item.isFocus; // or however you determine the last item
-				    
-			    // Add animation class if it's the last item
-			    const animationClass = isLastItem ? 'watermark-last-item' : '';
-            
-				// In updateWatermark(), for the focused item div:
-				html += `
-				    <div class='${animationClass}' style="
-				        font-size: ${fontSize}px;
-				        font-weight: ${fontWeight};
-				        color: ${color};
-				        margin-bottom: ${marginBottom};
-				        letter-spacing: ${letterSpacing};
-				        line-height: 1.2;
-				        max-width: ${maxWidth};
-				        margin-left: auto;
-				        margin-right: auto;
-				        text-transform: ${textTransform};
-				        ${overflowStyle}
-				        pointer-events: none;  /* ← disable on the big container div */
-				    "
-				    ${item.isFocus ? `data-hover-entity="${item.id}" data-entity-type="${item.entityType}"` : ''}>
-				        ${item.isFocus ? `
-				            <span style="
-				                pointer-events: auto;
-				                cursor: default;
-				                display: inline-block;  /* shrinks to text width only */
-				            ">${item.text}</span>
-				        ` : item.text}
-				    </div>
-				`;
-				
-				if (item.isFocus) {
-					// ✅ Poll depth 2: show total vote count
-				    if (this.currentApp?.id === 'poll' && this.currentPath.length === 2 && this.isDataOwner()) {
-				        const currentPoll = this._getCurrentPoll();
-				        const totalVotes = currentPoll?.answers?.reduce((sum, a) => sum + (a.hit || 0), 0) || 0;
-				        html += `
-				            <div style="
-				                font-size: ${Math.round(sizes.max * 0.3)}px;
-				                font-weight: 600;
-				                color: #aaa;
-				                letter-spacing: 2px;
-				                margin-top: 6px;
-				                margin-left: auto;
-				                margin-right: auto;
-				                max-width: 90%;
-				                text-transform: uppercase;
-				                line-height: 1.2;
-				                text-align: ${isMobile ? 'center' : 'left'};
-				            ">${totalVotes} vote${totalVotes !== 1 ? 's' : ''}</div>
-				        `;
-				    }
-				    const totalPages = Math.ceil((this._dotPageItemCount || 0) / (this._dotPageSize || 30));
-				    if (totalPages > 1) {
-				        const pageNum = (this._dotPage || 0) + 1;
-				        html += `
-				            <div style="
-				                font-size: ${Math.round(sizes.max * 0.35)}px;
-				                font-weight: 900;
-				                color: #888;
-				                letter-spacing: 3px;
-				                margin-top: 4px;
-				                margin-left: auto;
-				                margin-right: auto;
-				                max-width: 90%;
-				                opacity: 0.7;
-				                text-align: ${isMobile ? 'center' : 'left'};
-				                text-transform: none;
-				                line-height: 1.2;
-				            ">${pageNum} / ${totalPages}</div>
-				        `;
-				    }
-				}
-	        });
-	        
-	        html += '</div>';
-	        watermark.innerHTML = html;
-	        
-	        // ✅ SETUP HOVER FOR FOCUSED ENTITY
-	        this.setupWatermarkEntityHover(hierarchyItems);
-	    }
+        const lines = this._buildWatermarkLines();
+        const fontsFor = {
+            context: { size: sizes.base + 4, weight: 400, color: '#666', spacing: '1px', transform: 'none' },
+            subject: { size: sizes.max,       weight: 800, color: '#888', spacing: '3px', transform: 'uppercase' },
+            dots:    { size: Math.round(sizes.max * 0.3), weight: 600, color: '#777', spacing: '2px', transform: 'uppercase' },
+            state:   { size: Math.round(sizes.max * 0.22), weight: 500, color: '#777', spacing: '1px', transform: 'none' }
+        };
+        const overflowStyle = isMobile ? 'overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' : '';
+
+        let html = `<div style="${watermarkPositionStyle}">`;
+        lines.forEach(line => {
+            const f = fontsFor[line.role];
+            const isSubject = line.role === 'subject';
+            html += `
+                <div class="${isSubject ? 'watermark-last-item' : ''}" style="
+                    font-size: ${f.size}px; font-weight: ${f.weight}; color: ${f.color};
+                    letter-spacing: ${f.spacing}; text-transform: ${f.transform};
+                    line-height: 1.2; margin: ${isSubject ? '4px auto 6px' : '0 auto 4px'};
+                    max-width: 90%; ${overflowStyle} pointer-events: none;
+                " ${isSubject && line.id ? `data-hover-entity="${line.id}" data-entity-type="${line.entityType}"` : ''}>
+                    ${isSubject ? `<span style="pointer-events:auto;cursor:default;display:inline-block;">${line.text}</span>` : line.text}
+                </div>`;
+        });
+        html += '</div>';
+        watermark.innerHTML = html;
+
+        // Keep existing hover behavior — it only needs the focused item
+        const subject = lines.find(l => l.role === 'subject');
+        if (subject?.id) {
+            this.setupWatermarkEntityHover([{ text: subject.text, isFocus: true, id: subject.id, entityType: subject.entityType }]);
+        }
 		
 
 		// Handle window resize (existing code below)
@@ -4007,6 +4012,23 @@ class SchemaOrchestrator {
 	        const computed = window.getComputedStyle(shareBtn);
 	        console.log(`[ShareBtn] Computed display: "${computed.display}" (should be "inline-block" or "flex")`);
 	    }
+        
+        // ── Fork button ───────────────────────────────────────────
+        const forkBtn = document.getElementById('header-fork-btn');
+        if (forkBtn) {
+            const forkable = entityConfig.forkable === true;
+            let showFork = forkable;
+
+            // Non-owners only see it when this instance allows copies
+            if (forkable && !this.isDataOwner()) {
+                const entity = this._getWatermarkFocusEntity();
+                showFork = entity?.allowFork === true || entity?.allowFork === 'true';
+            }
+
+            forkBtn.style.display = showFork ? 'inline-flex' : 'none';
+            if (showFork) forkBtn.removeAttribute('aria-hidden');
+            else forkBtn.setAttribute('aria-hidden', 'true');
+        }
 	}
 	
 	setupEventListeners() {
@@ -4274,6 +4296,8 @@ class SchemaOrchestrator {
 		        console.error('❌ Error in reorganizeHeaderButtons:', error);
 		        actionsContainer.classList.remove('header-reorganized');
 		    }
+            
+            window.app?._updateShareButtonVisibility?.();
 		}
 
 
@@ -11250,6 +11274,10 @@ class SchemaOrchestrator {
 		        }
 		    });
 		});
+        
+        // Header buttons depend on the loaded entity (e.g. allowFork),
+        // so re-evaluate them whenever the view has been rebuilt.
+        this._updateShareButtonVisibility();
 	}
 	
 	// ✅ HELPER: Get display ID for item
