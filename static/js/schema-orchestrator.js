@@ -6194,7 +6194,7 @@ class SchemaOrchestrator {
                         self.dotconfApplyStaticPresenceStyles(self);
                     }
                     self._dotconfStyleTimer = null;
-                }, 650);
+                }, 60);
 
            }
 
@@ -6231,6 +6231,8 @@ class SchemaOrchestrator {
                }
            }
        }
+       
+       if (typeof this.dotconfSyncAddButton === 'function') this.dotconfSyncAddButton(this);
 
        if (this.currentApp?.id === 'conf' && this.currentPath.length < 2) {
            if (this._dotconfSSEId) {
@@ -6686,11 +6688,19 @@ class SchemaOrchestrator {
 	    // ── Polling (unchanged) ───────────────────────────────────────
 	    if (this._isRefreshing) { console.log('=== RENDER COMPLETE ==='); return; }
 
-	    if (this.currentPath.length === 0) {
-	        if (this.isPollingActive) this.stopVersionPolling();
-	    } else {
-	        this.startVersionPolling();
-	    }
+        if (this.currentPath.length === 0) {
+            if (this.isPollingActive) this.stopVersionPolling();
+        } else if (this.currentApp?.id === 'conf' && this.currentPath.length === 2) {
+            // Polling is deliberately stopped for a live conference — DotConf drives
+            // its own updates via SSE + the presence-style timer instead. Falling
+            // through to startVersionPolling() here would undo that and keep
+            // render() firing on the polling interval, destroying and rebuilding
+            // every dot (see the exit-animation + canvas.innerHTML wipe above)
+            // on every tick.
+            if (this.isPollingActive) this.stopVersionPolling();
+        } else {
+            this.startVersionPolling();
+        }
 
 	    console.log('=== RENDER COMPLETE ===');
 	}
@@ -7146,8 +7156,13 @@ class SchemaOrchestrator {
 		    const { answers, votes, polls, ...meta } = pollItem || {};
 		    return meta;
 		}
+        
+        refreshContextBar() {
+            if (this._lastContextBarArgs) this.renderContextBar(...this._lastContextBarArgs);
+        }
 		
 		renderContextBar(items, entityType, visualScores) {
+            this._lastContextBarArgs = [items, entityType, visualScores];
 			var self = this; 
 			console.log('[renderContextBar] received contextMessage:', visualScores?.contextMessage, 'flipped:', this._contextBarFlipped);
 		    document.getElementById('context-bar')?.remove();
@@ -7601,103 +7616,110 @@ class SchemaOrchestrator {
                 
                 console.log('[dotconf] renderContextBar firing, isDataOwner:', this.isDataOwner(), 
                                                                'confItem:', confItem, 'confStatus:', confStatus);
-                               
+   
+                                      if (this.isDataOwner()) {
+                                          var inCall   = window.app._dotconfCallLive === true;
+                                          var confLive = confStatus === 'live' || inCall;
+                                          var mkBtn = function(label, hoverColor, hoverBg, onClick) {
+                                              var b = document.createElement('button');
+                                              b.textContent = label;
+                                              b.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                                              b.onmouseenter = function() { if (b.disabled) return; b.style.background = hoverBg; b.style.borderColor = hoverColor; b.style.color = hoverColor; };
+                                              b.onmouseleave = function() { b.style.background = 'none'; b.style.borderColor = '#b2bec3'; b.style.color = '#636e72'; };
+                                              b.onclick = onClick;
+                                              return b;
+                                          };
 
-                if (this.isDataOwner()) {
-                    var isLive = confStatus === 'live';
-                    var hostBtn = document.createElement('button');
-                    hostBtn.textContent = isLive ? '📵 End Call' : '📞 Start Call';
-                    hostBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                    var hostBtnHoverColor = isLive ? '#e17055' : '#00b894';
-                    var hostBtnHoverBg    = isLive ? '#fff0f0' : '#f0fff4';
-                    hostBtn.onmouseenter = function() {
-                        hostBtn.style.background  = hostBtnHoverBg;
-                        hostBtn.style.borderColor = hostBtnHoverColor;
-                        hostBtn.style.color       = hostBtnHoverColor;
-                    };
-                    hostBtn.onmouseleave = function() {
-                        hostBtn.style.background  = 'none';
-                        hostBtn.style.borderColor = '#b2bec3';
-                        hostBtn.style.color       = '#636e72';
-                    };
-                    hostBtn.onclick = function() {
-                        if (isLive) {
-                            if (typeof window.app.dotconfLeave === 'function') {
-                                window.app.dotconfLeave(window.app);
-                            }
-                        } else {
-                            if (typeof window.app.dotconfJoin === 'function') {
-                                window.app.dotconfJoin(window.app);
-                            }
-                        }
-                    };
-                    bar.appendChild(hostBtn);
-                    
-                    if (window.app.dotconfShouldShowInviteButton(this)) {
-                        var inviteBtn = document.createElement('button');
-                        inviteBtn.textContent = '✉️ Invite';
-                        inviteBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                        inviteBtn.onmouseenter = function() {
-                            inviteBtn.style.background  = '#eef6ff';
-                            inviteBtn.style.borderColor = '#0984e3';
-                            inviteBtn.style.color       = '#0984e3';
-                        };
-                        inviteBtn.onclick = function() {
-                            if (typeof window.app.dotconfHandleInviteClick === 'function') {
-                                window.app.dotconfHandleInviteClick(window.app);
-                            }
-                        };
-                        inviteBtn.onclick = function() {
-                            _dotconfHandleInviteClick(window.app);
-                        };
-                        bar.appendChild(inviteBtn);
-                    }
+                                          // Not in the call: Start it, or rejoin one that's still running.
+                                          if (!inCall) {
+                                              var startBtn = mkBtn(confLive ? '📞 Join Call' : '📞 Start Call', '#00b894', '#f0fff4', function() {
+                                                  if (typeof window.app.dotconfJoin === 'function') window.app.dotconfJoin(window.app);
+                                              });
+                                              startBtn.setAttribute('data-dotconf-join', '');
+                                              if (window.app._dotconfJoining) {
+                                                  startBtn.disabled = true;
+                                                  startBtn.style.opacity = '0.5';
+                                                  startBtn.style.cursor = 'default';
+                                              }
+                                              bar.appendChild(startBtn);
+                                          }
+                                          // Call running (whether or not the host is in it): End for everyone.
+                                          if (confLive) {
+                                              bar.appendChild(mkBtn('📵 End call', '#e17055', '#fff0f0', function() {
+                                                  if (typeof window.app.dotconfEndCall === 'function') window.app.dotconfEndCall(window.app);
+                                              }));
+                                          }
 
-                } else {
-                    if (!window.app._dotconfCallLive) {
-                        var joinBtn = document.createElement('button');
-                        joinBtn.textContent = '📞 Join Call';
-                        joinBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                        joinBtn.onmouseenter = function() {
-                            joinBtn.style.background  = '#f0fff4';
-                            joinBtn.style.borderColor = '#00b894';
-                            joinBtn.style.color       = '#00b894';
-                        };
-                        joinBtn.onmouseleave = function() {
-                            joinBtn.style.background  = 'none';
-                            joinBtn.style.borderColor = '#b2bec3';
-                            joinBtn.style.color       = '#636e72';
-                        };
-                        joinBtn.onclick = function() {
-                            if (typeof window.app.dotconfJoin === 'function') {
-                                window.app.dotconfJoin(window.app);
-                            }
-                        };
-                        bar.appendChild(joinBtn);
-                    }
+                                       if (window.app.dotconfShouldShowInviteButton(this)) {
+                                           var inviteBtn = document.createElement('button');
+                                           inviteBtn.textContent = '✉️ Invite';
+                                           inviteBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                                           inviteBtn.onmouseenter = function() {
+                                               inviteBtn.style.background  = '#eef6ff';
+                                               inviteBtn.style.borderColor = '#0984e3';
+                                               inviteBtn.style.color       = '#0984e3';
+                                           };
+                                           inviteBtn.onclick = function() {
+                                               if (typeof window.app.dotconfHandleInviteClick === 'function') {
+                                                   window.app.dotconfHandleInviteClick(window.app);
+                                               }
+                                           };
 
-                    if (window.app._dotconfCallLive) {
-                        var leaveBtn = document.createElement('button');
-                        leaveBtn.textContent = '📵 Leave Call';
-                        leaveBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                        leaveBtn.onmouseenter = function() {
-                            leaveBtn.style.background  = '#fff0f0';
-                            leaveBtn.style.borderColor = '#e17055';
-                            leaveBtn.style.color       = '#e17055';
-                        };
-                        leaveBtn.onmouseleave = function() {
-                            leaveBtn.style.background  = 'none';
-                            leaveBtn.style.borderColor = '#b2bec3';
-                            leaveBtn.style.color       = '#636e72';
-                        };
-                        leaveBtn.onclick = function() {
-                            if (typeof window.app.dotconfLeave === 'function') {
-                                window.app.dotconfLeave(window.app);
-                            }
-                        };
-                        bar.appendChild(leaveBtn);
-                    }
-                }
+                                           bar.appendChild(inviteBtn);
+                                       }
+
+                                   } else {
+                                       if (!window.app._dotconfCallLive) {
+                                           var joinBtn = document.createElement('button');
+                                           joinBtn.textContent = '📞 Join Call';
+                                           joinBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                                           joinBtn.onmouseenter = function() {
+                                               if (joinBtn.disabled) return;
+                                               joinBtn.style.background  = '#f0fff4';
+                                               joinBtn.style.borderColor = '#00b894';
+                                               joinBtn.style.color       = '#00b894';
+                                           };
+                                           joinBtn.onmouseleave = function() {
+                                               joinBtn.style.background  = 'none';
+                                               joinBtn.style.borderColor = '#b2bec3';
+                                               joinBtn.style.color       = '#636e72';
+                                           };
+                                           joinBtn.onclick = function() {
+                                               if (typeof window.app.dotconfJoin === 'function') {
+                                                   window.app.dotconfJoin(window.app);
+                                               }
+                                           };
+                                           joinBtn.setAttribute('data-dotconf-join', '');
+                                           if (window.app._dotconfJoining) {
+                                               joinBtn.disabled = true;
+                                               joinBtn.style.opacity = '0.5';
+                                               joinBtn.style.cursor = 'default';
+                                           }
+                                           bar.appendChild(joinBtn);
+                                       }
+
+                                       if (window.app._dotconfCallLive) {
+                                           var leaveBtn = document.createElement('button');
+                                           leaveBtn.textContent = '📵 Leave Call';
+                                           leaveBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                                           leaveBtn.onmouseenter = function() {
+                                               leaveBtn.style.background  = '#fff0f0';
+                                               leaveBtn.style.borderColor = '#e17055';
+                                               leaveBtn.style.color       = '#e17055';
+                                           };
+                                           leaveBtn.onmouseleave = function() {
+                                               leaveBtn.style.background  = 'none';
+                                               leaveBtn.style.borderColor = '#b2bec3';
+                                               leaveBtn.style.color       = '#636e72';
+                                           };
+                                           leaveBtn.onclick = function() {
+                                               if (typeof window.app.dotconfLeave === 'function') {
+                                                   window.app.dotconfLeave(window.app);
+                                               }
+                                           };
+                                           bar.appendChild(leaveBtn);
+                                       }
+                                   }
             }
 
 			const canvas = document.getElementById('canvas-area');
@@ -8452,6 +8474,17 @@ class SchemaOrchestrator {
 			    if (hoverTimer) clearTimeout(hoverTimer);
 
 			    hoverTimer = setTimeout(() => {
+                    
+                    if (self.currentApp?.id === 'conf' && entityType === 'participant') {
+                        // DotConf: never transform participant dots into the generic
+                        // card during a call — that UI doesn't make sense mid-conference.
+                        // Hook point for future conf-specific hover content:
+                        if (typeof self.dotconfOnDotHover === 'function') {
+                            self.dotconfOnDotHover(dot, item);
+                        }
+                        return;
+                    }
+                    
 			        if (!isTransformed) {
 			            self.transformDotToCard(dot, item, entityType);
 			            isTransformed = true;

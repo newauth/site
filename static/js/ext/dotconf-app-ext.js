@@ -25,9 +25,26 @@
     listening:  { background: '#00b894',     border: 'none',              color: '#fff',     opacity: 1,   useFrozenFrame: true  },
     audio_only: { background: '#00b894',     border: 'none',              color: '#fff',     opacity: 1,   useFrozenFrame: true  },
     live:       { background: '#00b894',     border: 'none',              color: '#fff',     opacity: 1,   useFrozenFrame: true  },
-    left:       { background: '#dfe6e9',     border: 'none',              color: '#b2bec3',  opacity: 0.5, useFrozenFrame: false }
+    left:       { background: '#dfe6e9',     border: 'none',              color: '#636e72',  opacity: 0.5, useFrozenFrame: false }
   };
 
+  var DOTCONF_NAME_PALETTE = [
+    '#6c5ce7', '#5f3dc4', '#4834d4', '#30336b', '#130f40',
+    '#be2edd', '#c2185b', '#e84393', '#d63031', '#b33939',
+    '#b71540', '#eb4d4b', '#e17055', '#cc8e35', '#827717',
+    '#6c3483', '#4b6584', '#535c68', '#2d3436', '#636e72',
+    '#00cec9', '#0a3d62', '#079992', '#8e44ad', '#7f8c8d'
+  ];
+
+  function _dotconfNameColor(name) {
+    if (!name) return null;
+    var str = name.trim().toLowerCase();
+    var hash = 0;
+    for (var i = 0; i < str.length; i++) {
+      hash = (hash * 31 + str.charCodeAt(i)) | 0;
+    }
+    return DOTCONF_NAME_PALETTE[Math.abs(hash) % DOTCONF_NAME_PALETTE.length];
+  }
 
   var VIDEO_SLOTS_BY_N = (n) => {
     if (n <= 6)  return n;
@@ -80,6 +97,14 @@
   const PIN_DURATION_MS   = 20000;      // must match server's DotConfUtils.PIN_DURATION_MS
   
   var _audioLevelUpdateInterval = null; // near other module-level interval handles
+  var _midToTrackName = {}; // filled from each pull response; ontrack reads it
+
+  function _recordPulledMids(pullResp) {
+    (pullResp && pullResp.tracks || []).forEach(t => {
+      if (t.mid != null && t.trackName) _midToTrackName[String(t.mid)] = t.trackName;
+    });
+  }
+  
 
   function _startAudioLevelUpdates() {
     if (_audioLevelUpdateInterval) return;
@@ -123,6 +148,20 @@
       return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
     });
   }
+  
+  // Hide the platform's "+" (add participant) for participants, who can't add
+  // anyone, and for everyone during a live call, where it would cover a tile.
+  function _dotconfSyncAddButton(orchestrator) {
+    if (!document.getElementById('dotconf-add-btn-style')) {
+      var st = document.createElement('style');
+      st.id = 'dotconf-add-btn-style';
+      st.textContent = 'body.dotconf-hide-add .orb-add-btn { display: none !important; }';
+      document.head.appendChild(st);
+    }
+    var inConf = orchestrator.currentApp?.id === 'conf' && orchestrator.currentPath?.length === 2;
+    var hide   = inConf && (!orchestrator.isDataOwner() || orchestrator._dotconfCallLive === true);
+    document.body.classList.toggle('dotconf-hide-add', !!hide);
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // preComputeScore — audioLevel as a render-time field (never stored)
@@ -149,10 +188,54 @@
     if (participantDisplayID) qs.set('participantDisplayID', participantDisplayID);
     var url = `/newauth/api/conf/sse/${dotconfDisplayID}?${qs.toString()}`;
     _sseSource = new EventSource(url);
+    
+    _sseSource.addEventListener('open', () => {
+      // Runs on every (re)connect. If we're mid-call, re-assert live in case a long
+      // outage got us marked left by the server's disconnect check.
+      if (orchestrator._dotconfCallLive && _mySessionId) {
+        var hasVideo = !!(_localStream && _localStream.getVideoTracks().some(t => t.enabled && t.readyState === 'live'));
+        var hasAudio = !!(_localStream && _localStream.getAudioTracks().length);
+        _cfApi('POST /' + dotconfDisplayID + '/participant/live?tenantId=' + tenantId,
+          { sessionId: _mySessionId, hasVideo: hasVideo, hasAudio: hasAudio })
+          .catch(err => console.warn('[dotconf] re-assert live failed:', err));
+      }
+    });
 
     _sseSource.addEventListener("participant.viewed", e => {
       var { participantDisplayID } = JSON.parse(e.data);
       _updateParticipantPresence(orchestrator, participantDisplayID, PRESENCE_STATE.VIEWED);
+    });
+    
+    _sseSource.addEventListener("participant.invited", e => {
+      var { participantDisplayID } = JSON.parse(e.data);
+      _updateParticipantPresence(orchestrator, participantDisplayID, PRESENCE_STATE.INVITED);
+    });
+    
+    _sseSource.addEventListener("conference.status", e => {
+      var data = JSON.parse(e.data);
+      var conf = _getCurrentDotConf(orchestrator);
+      if (conf) {
+        conf.status = data.status;
+        conf.autoEndAt = 0;
+      }
+      if (data.status === 'ended' && orchestrator._dotconfCallLive) {
+        _leaveDotConf(orchestrator);
+        if (!_dotconfEndingByMe && typeof orchestrator.showNotification === 'function') {
+          orchestrator.showNotification(data.reason === 'auto'
+            ? 'The call ended because everyone left.'
+            : 'The host ended the call.');
+        }
+      }
+      _dotconfEndingByMe = false;
+      _dotconfRenderAutoEnd(orchestrator);
+      if (typeof orchestrator.refreshContextBar === 'function') orchestrator.refreshContextBar();
+    });
+
+    _sseSource.addEventListener("conference.autoend", e => {
+      var { at } = JSON.parse(e.data);
+      var conf = _getCurrentDotConf(orchestrator);
+      if (conf) conf.autoEndAt = at;
+      _dotconfRenderAutoEnd(orchestrator);
     });
 
     _sseSource.addEventListener("participant.joined", e => {
@@ -191,9 +274,14 @@
       var { participantDisplayID } = JSON.parse(e.data);
       _handlePeerLeft(orchestrator, participantDisplayID);
     });
+    
+    _sseSource.addEventListener("participant.screen", e => {
+      _onScreenEvent(orchestrator, JSON.parse(e.data));
+    });
 
-     _sseSource.addEventListener("roster", e => {
+    _sseSource.addEventListener("roster", e => {
        var payload = JSON.parse(e.data);
+       var share = null;
 
        (payload.participants || []).forEach(p => {
          _roster[p.displayID] = Object.assign({}, _roster[p.displayID], {
@@ -202,6 +290,24 @@
            cfSessionId:  p.cfSessionId,
            isHost:       !!p.isHost
          });
+         
+         var conf  = _getCurrentDotConf(orchestrator);
+         var local = conf?.participants?.find(x => x.displayID === p.displayID);
+         if (local && p.presenceState && local.presenceState !== p.presenceState) {
+           _updateParticipantPresence(orchestrator, p.displayID, p.presenceState);
+         }
+
+         // Remember an in-progress screen share so a late joiner picks it up.
+         if (p.cfScreenTrackId) {
+           share = {
+             participantDisplayID: p.displayID, active: true, cfSessionId: p.cfSessionId,
+             screenTrackId: p.cfScreenTrackId, screenAudioTrackId: p.cfScreenAudioTrackId || null,
+             layout: p.screenLayout || 'split'
+           };
+         }
+         
+         _mediaState[p.displayID] = { micMuted: !!p.micMuted, cameraOff: !!p.cameraOff };
+         
        });
 
        if (payload.pinned && typeof payload.pinned === 'object') {
@@ -209,8 +315,10 @@
            _pinnedUntil.set(pid, payload.pinned[pid]);
          });
        }
-     });
 
+       _rosterShare = share;
+       if (orchestrator._dotconfCallLive) _dotconfResumeShare(orchestrator);
+     });
     
     _sseSource.addEventListener("participant.pinned", e => {
       var { participantDisplayID, pinned, expiresAt } = JSON.parse(e.data);
@@ -221,15 +329,34 @@
       }
     });
 
-
+    _sseSource.addEventListener("participant.snapshot", e => {
+      var s = JSON.parse(e.data);
+      if (s.cleared) { _dotconfDropSnapshot(s.participantDisplayID); _dotconfRenderPreviews(orchestrator); return; }
+      if (orchestrator._dotconfCallLive || !_dotconfIsViewer(orchestrator)) return;
+      _dotconfFetchSnapshot(orchestrator, s.participantDisplayID);
+    });
+    
     _sseSource.addEventListener("recording.consent.request", e => {
       _showConsentBanner(orchestrator);
+    });
+    
+    _sseSource.addEventListener("participant.media", e => {
+      var m = JSON.parse(e.data);
+      _mediaState[m.participantDisplayID] = { micMuted: !!m.micMuted, cameraOff: !!m.cameraOff };
+      _dotconfRefreshTileLabel(m.participantDisplayID);
+      _dotconfRefreshCard(orchestrator, m.participantDisplayID);
+    });
+
+    _sseSource.addEventListener("participant.removed", e => {
+      _dotconfHandleRemoved(orchestrator, JSON.parse(e.data).participantDisplayID);
     });
 
     _sseSource.onerror = () => {
       // EventSource reconnects automatically; log for diagnostics only
       console.warn("[dotconf] SSE error — browser will retry");
     };
+    
+    _dotconfRenderAutoEnd(orchestrator);
   }
 
   function _closeSSE() {
@@ -241,15 +368,18 @@
   // ─────────────────────────────────────────────────────────────────────────────
 
   function _updateParticipantPresence(orchestrator, participantDisplayID, state) {
-    // Find the participant entity in the current data and update its presenceState.
-    // The orchestrator's refreshCurrentView re-renders dots with the new typeBehaviorMap color.
     var conf = _getCurrentDotConf(orchestrator);
     if (!conf || !conf.participants) return;
     var p = conf.participants.find(p => p.displayID === participantDisplayID);
     if (!p) return;
     p.presenceState = state;
-    // Trigger a canvas re-render without a full fetch
-    orchestrator.render();
+    // Lightweight in-place update — do NOT call orchestrator.render(), which
+    // destroys and rebuilds every dot on the canvas (exit-animates, wipes
+    // canvas.innerHTML, repaints from the generic engagement-scoring loop).
+    // This was causing a full canvas rebuild on every presence SSE message.
+    if (typeof orchestrator.dotconfApplyStaticPresenceStyles === 'function') {
+      orchestrator.dotconfApplyStaticPresenceStyles(orchestrator);
+    }
   }
 
   function _applyRoster(orchestrator, participants) {
@@ -281,6 +411,9 @@
 
 
   function _stopAllMedia() {
+    console.log('[diag] _stopAllMedia called, _localStream:', _localStream,
+          _localStream?.getTracks().map(t => ({ kind: t.kind, readyState: t.readyState })));
+    _dotconfScreenTeardown(); // the peer connection is closing anyway; the server clears the share on markLeft
     if (_localStream) {
       _localStream.getTracks().forEach(t => t.stop());
       _localStream = null;
@@ -314,24 +447,173 @@
   }
   
   function _dotconfHandleInviteClick(orchestrator) {
+    _renderDotConfInviteModal(orchestrator);
+  }
+
+  function _dotconfPendingParticipants(orchestrator) {
     var conf = _getCurrentDotConf(orchestrator);
-    if (!conf) return;
+    return (conf?.participants || []).filter(
+      p => !p.isHost && p.presenceState === PRESENCE_STATE.ADDED
+    );
+  }
 
+  async function _dotconfMarkInvited(orchestrator, ids) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !ids.length) return 0;
     var tenantId = _getTenantId(orchestrator);
-
-    _cfApi(
-      'POST /' + conf.displayID + '/participant/markAllInvited?tenantId=' + tenantId,
-      {}
-    ).then(() => {
-      if (typeof orchestrator.showNotification === 'function') {
-        orchestrator.showNotification('✅ Invite sent to all pending participants!');
-      }
-    }).catch(e => {
-      console.error('[dotconf] markAllInvited failed:', e);
-      if (typeof orchestrator._showError === 'function') {
-        orchestrator._showError('Could not send invites — please try again.');
-      }
+    var resp = await _cfApi(
+      'POST /' + conf.displayID + '/participant/invite?tenantId=' + tenantId,
+      { participantDisplayIDs: ids }
+    );
+    ids.forEach(id => _updateParticipantPresence(orchestrator, id, PRESENCE_STATE.INVITED));
+    return (resp && resp.invited) || 0;
+  }
+  
+  function _dotconfSetJoining(orchestrator, on) {
+    orchestrator._dotconfJoining = on;
+    document.querySelectorAll('[data-dotconf-join]').forEach(b => {
+      b.disabled = on;
+      b.style.opacity = on ? '0.5' : '';
+      b.style.cursor  = on ? 'default' : 'pointer';
     });
+  }
+
+
+  function _renderDotConfInviteModal(orchestrator) {
+    var pending = _dotconfPendingParticipants(orchestrator);
+    var notify = msg => typeof orchestrator.showNotification === 'function' && orchestrator.showNotification(msg);
+    if (!pending.length) { notify('Everyone has already been invited.'); return; }
+
+    var conf       = _getCurrentDotConf(orchestrator);
+    var confUrl = _dotconfGuestUrl(orchestrator);
+    var parentName = orchestrator.currentPath[0]?.shortName
+      || orchestrator.currentPath[0]?.displayID || 'Conference host';
+    var message    = "You're invited to " + (conf.name || 'a call') + ": " + confUrl;
+
+    document.getElementById('dotconf-invite-modal')?.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'dotconf-invite-modal';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
+
+    var card = document.createElement('div');
+    card.style.cssText = 'background:#fff;border-radius:12px;width:100%;max-width:440px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+
+    var title = document.createElement('div');
+    title.textContent = 'Invite participants';
+    title.style.cssText = 'padding:16px 20px;font-size:16px;font-weight:700;color:#2d3436;border-bottom:1px solid #eee;';
+
+    var sub = document.createElement('div');
+    sub.textContent = 'Add an email or phone if you have one, or just share the link yourself.';
+    sub.style.cssText = 'padding:10px 20px 0;font-size:12px;color:#636e72;';
+
+    var list = document.createElement('div');
+    list.style.cssText = 'padding:4px 20px 10px;overflow-y:auto;';
+
+    var inputCss = 'width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #dfe6e9;border-radius:8px;font-size:13px;';
+    var btnCss   = 'border:1px solid #b2bec3;background:#fff;color:#2d3436;border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600;cursor:pointer;';
+
+    var rows = pending.map(function(p) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;flex-direction:column;gap:6px;padding:10px 0;border-bottom:1px solid #f1f2f6;';
+
+      var nameEl = document.createElement('div');
+      nameEl.textContent = p.name || 'Unnamed';          // textContent: names are user-supplied
+      nameEl.style.cssText = 'font-size:14px;font-weight:600;color:#2d3436;';
+
+      var email = document.createElement('input');
+      email.type = 'email'; email.placeholder = 'Email (optional)';
+      email.value = p.contactemail || ''; email.style.cssText = inputCss;
+
+      var phoneWrap = document.createElement('div');
+      phoneWrap.style.cssText = 'display:flex;gap:6px;';
+      var phone = document.createElement('input');
+      phone.type = 'tel'; phone.placeholder = 'Phone for WhatsApp (optional)';
+      phone.value = p.contactphone || ''; phone.style.cssText = inputCss;
+      var wa = document.createElement('button');
+      wa.textContent = 'WhatsApp'; wa.style.cssText = btnCss + 'white-space:nowrap;';
+      wa.onclick = async function() {
+        var digits = phone.value.replace(/\D/g, '');
+        if (!digits) { phone.focus(); return; }
+        window.open('https://wa.me/' + digits + '?text=' + encodeURIComponent(message), '_blank', 'noopener');
+        try { await _dotconfMarkInvited(orchestrator, [p.displayID]); row.style.opacity = '0.5'; }
+        catch (e) { console.error('[dotconf] mark invited failed:', e); _showError('Could not mark as invited.'); }
+      };
+      phoneWrap.append(phone, wa);
+
+      row.append(nameEl, email, phoneWrap);
+      list.appendChild(row);
+      return { p: p, email: email };
+    });
+
+    var footer = document.createElement('div');
+    footer.style.cssText = 'padding:12px 20px;border-top:1px solid #eee;display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;';
+
+    var close = () => overlay.remove();
+    var allIds = pending.map(p => p.displayID);
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancel'; cancelBtn.style.cssText = btnCss; cancelBtn.onclick = close;
+
+    var copyBtn = document.createElement('button');
+    copyBtn.textContent = 'Copy link'; copyBtn.style.cssText = btnCss;
+    copyBtn.onclick = async function() {
+      try {
+        await navigator.clipboard.writeText(confUrl);
+        await _dotconfMarkInvited(orchestrator, allIds);
+        notify('Link copied — participants marked as invited.');
+        close();
+      } catch (e) { console.error('[dotconf] copy link failed:', e); _showError('Could not copy the link.'); }
+    };
+
+    var shareBtn = null;
+    if (navigator.share) {
+      shareBtn = document.createElement('button');
+      shareBtn.textContent = 'Share…'; shareBtn.style.cssText = btnCss;
+      shareBtn.onclick = async function() {
+        try {
+          await navigator.share({ title: conf.name || 'Invitation', text: message, url: confUrl });
+          await _dotconfMarkInvited(orchestrator, allIds);
+          close();
+        } catch (e) { if (e.name !== 'AbortError') { console.error('[dotconf] share failed:', e); _showError('Could not share the link.'); } }
+      };
+    }
+
+    var sendBtn = document.createElement('button');
+    sendBtn.textContent = 'Send invites';
+    sendBtn.style.cssText = btnCss + 'background:#4c6ef5;border-color:#4c6ef5;color:#fff;';
+    sendBtn.onclick = async function() {
+      sendBtn.disabled = true; sendBtn.textContent = 'Sending…';
+      try {
+        await _dotconfMarkInvited(orchestrator, allIds);
+        var sent = 0, failed = 0;
+        for (var r of rows) {
+          var addr = r.email.value.trim();
+          if (!addr) continue;
+          try {
+            await orchestrator.sendSubtenantNotificationEmail(
+              Object.assign({}, r.p, { contactemail: addr }), parentName, confUrl);
+            sent++;
+          } catch (e) { failed++; console.error('[dotconf] invite email failed for', r.p.name, e); }
+        }
+        notify('✅ ' + allIds.length + ' invited' + (sent ? ', ' + sent + ' emailed' : '') +
+               (failed ? ' (' + failed + ' emails failed)' : ''));
+        close();
+      } catch (e) {
+        console.error('[dotconf] invite failed:', e);
+        _showError('Could not send invites — please try again.');
+        sendBtn.disabled = false; sendBtn.textContent = 'Send invites';
+      }
+    };
+
+    footer.append(cancelBtn, copyBtn);
+    if (shareBtn) footer.appendChild(shareBtn);
+    footer.appendChild(sendBtn);
+
+    card.append(title, sub, list, footer);
+    overlay.appendChild(card);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.body.appendChild(overlay);
   }
   
   async function _cfApi(methodAndPath, body) {
@@ -354,6 +636,22 @@
     return res.json();
   }
    
+  // Cloudflare returns not_found_track_error if we pull a track a moment before its
+  // publisher's packets arrive (right after they go live). Retry briefly; a failed
+  // pull returns no SDP, so it leaves our session's signaling state untouched.
+  async function _pullWithRetry(confDisplayID, tenantId, body) {
+    var delays = [0, 1000, 2000, 4000, 6000];
+    for (var i = 0; i < delays.length; i++) {
+      if (delays[i]) await new Promise(r => setTimeout(r, delays[i]));
+      try {
+        return await _cfApi('POST /' + confDisplayID + '/tracks/pull?tenantId=' + tenantId, body);
+      } catch (e) {
+        var retryable = /not_found_track_error|empty_track_error/.test(String(err && err.message));
+        if (!retryable || i === delays.length - 1) throw e;
+        console.log('[dotconf] track not ready yet, retrying pull in', delays[i + 1], 'ms');
+      }
+    }
+  }
   
   async function getIceServers() {
     const resp = await fetch('/newauth/api/getIceServers', {
@@ -396,57 +694,69 @@
   var _previewRefreshTimer = null;
   
   async function _startDotConfPreview(orchestrator) {
-      var conf = _getCurrentDotConf(orchestrator);
-      if (!conf) return;
+        if (orchestrator._dotconfCallLive || document.getElementById('dotconf-preview-widget')) return;
+        if (orchestrator._dotconfJoining || orchestrator._dotconfCallLive) return;
+        _dotconfSetJoining(orchestrator, true);
+        
+        var conf = _getCurrentDotConf(orchestrator);
+        if (!conf) return;
 
-      var n = (conf.participants || []).filter(
-        p => !p.isHost &&
-             p.presenceState !== PRESENCE_STATE.INVITED &&
-             p.presenceState !== PRESENCE_STATE.LEFT
-      ).length;
+        var n = (conf.participants || []).filter(
+          p => !p.isHost &&
+               p.presenceState !== PRESENCE_STATE.INVITED &&
+               p.presenceState !== PRESENCE_STATE.LEFT
+        ).length;
 
-      if (n >= HARD_CAP) {
-        _showError("This conference is full (max " + HARD_CAP + " participants).");
-        return;
-      }
+        if (n >= HARD_CAP) {
+          _showError("This conference is full (max " + HARD_CAP + " participants).");
+          return;
+        }
 
-      var tenantId = _getTenantId(orchestrator);
-      var myId     = _getMyDotConfParticipantDisplayID(orchestrator);
-      if (!myId) {
-        console.error("[dotconf] _startDotConfPreview — no identified participant, aborting");
-        return;
-      }
-      _cachedMyId = myId;
+        var tenantId = _getTenantId(orchestrator);
+        var myId     = _getMyDotConfParticipantDisplayID(orchestrator);
+        if (!myId) {
+          console.error("[dotconf] _startDotConfPreview — no identified participant, aborting");
+          return;
+        }
+        _cachedMyId = myId;
 
-      try {
-        _localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        // Unlock the AudioContext HERE, synchronously, while we're still inside
+        // the original click's user-activation window. Doing this after the
+        // getUserMedia await (and its permission prompt) is too late — browsers
+        // will silently leave the context suspended, and the preview audio
+        // meter never animates even though the mic itself works fine.
+        if (!_audioCtx || _audioCtx.state === 'closed') {
+          _audioCtx = new AudioContext();
+        }
+        if (_audioCtx.state === 'suspended') {
+          _audioCtx.resume().catch(function(e) {
+            console.warn('[dotconf] AudioContext resume failed at preview start:', e);
+          });
+        }
 
-        var myName = (conf.participants.find(p => p.displayID === myId) || {}).name || 'You';
+        try {
+          _localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
 
-        _renderDotConfPreview(orchestrator, _localStream, myName, () => {
-          _finishDotConfConnect(orchestrator, conf, tenantId, myId, n);
-        });
+          var myName = (conf.participants.find(p => p.displayID === myId) || {}).name || 'You';
 
-        // Kick off the expensive prep work in parallel with the user looking
-        // at the preview — peer connection, ICE gathering, offer creation.
-        // None of this touches the network's Cloudflare endpoints yet, so it's
-        // safe to do before the user has actually confirmed they want to join.
-        _prepareDotConfConnection(orchestrator, tenantId, conf.displayID);
+          _renderDotConfPreview(orchestrator, _localStream, myName, () => {
+            _finishDotConfConnect(orchestrator, conf, tenantId, myId, n);
+          });
 
-          // Keep the prepared offer fresh if the user lingers on preview —
-          // old ICE candidates/offer could go stale on a long dwell.
-          _previewRefreshTimer = setInterval(() => {
-            console.log('[dotconf] preview dwell exceeded threshold — refreshing prepared connection');
-            _teardownPreparedConnection();
-            _prepareDotConfConnection(orchestrator, tenantId, conf.displayID);
-          }, PREVIEW_REFRESH_MS);
+          _prepareDotConfConnection(orchestrator, tenantId, conf.displayID);
 
-      } catch (e) {
-        console.error('[dotconf] _startDotConfPreview failed:', e);
-        _showError('Could not access camera/microphone. Please check permissions and try again.');
-        _stopAllMedia();
-      }
-  }
+            _previewRefreshTimer = setInterval(() => {
+              console.log('[dotconf] preview dwell exceeded threshold — refreshing prepared connection');
+              _teardownPreparedConnection();
+              _prepareDotConfConnection(orchestrator, tenantId, conf.displayID);
+            }, PREVIEW_REFRESH_MS);
+
+        } catch (e) {
+          console.error('[dotconf] _startDotConfPreview failed:', e);
+          _showError('Could not access camera/microphone. Please check permissions and try again.');
+          _stopAllMedia();
+        }
+    }
   
   function _teardownPreparedConnection() {
     if (_peerConnection) {
@@ -462,6 +772,13 @@
       clearInterval(_previewRefreshTimer);
       _previewRefreshTimer = null;
     }
+  }
+  
+  // Invite links must never carry the real tenant UUID — it's the server's proof of
+  // host identity. Build the URL from display IDs only, whatever the host's own path uses.
+  function _dotconfGuestUrl(orchestrator) {
+    var guestPath = (orchestrator.currentPath || []).map(seg => Object.assign({}, seg, { asuuid: false }));
+    return orchestrator.getAppUrl(guestPath);
   }
 
   var _preparedOfferSdp = null;
@@ -550,15 +867,33 @@
           orchestrator.dotconfStartLayout(orchestrator);
 
           orchestrator._dotconfCallLive = true;
+          _dotconfSetJoining(orchestrator, false);
+          _dotconfClearAllPreviews();               // you're in — real video takes over
+          Object.keys(_previewSnaps).forEach(pid => _dotconfDropSnapshot(pid));
+          _previewFetchedAt = {};
+          _dotconfStartSnapshotUploads(orchestrator);
+          _dotconfSyncAddButton(orchestrator);
+          _dotconfResumeShare(orchestrator); // someone was already sharing when we joined
+          if (typeof orchestrator.refreshContextBar === 'function') orchestrator.refreshContextBar();
 
-        } catch (e) {
-          console.error('[dotconf] _finishDotConfConnect failed:', e);
-          _showError('Could not join the call. Please check your connection and try again.');
-          _stopAllMedia();
-          _mySessionId = null;
-          _myLocalTracks = null;
-          _preparedOfferSdp = null;
-        }
+      } catch (e) {
+        console.error('[dotconf] _finishDotConfConnect failed:', e);
+        _showError('Could not join the call. Please check your connection and try again.');
+
+        // Put the user back where they started: no dead preview, button usable again.
+        _stopPreviewAudioMeter();
+        _stopPreviewRefreshTimer();
+        document.getElementById('dotconf-preview-widget')?.remove();
+        _teardownPreparedConnection();
+        _stopAllMedia();
+
+        _mySessionId      = null;
+        _myLocalTracks    = null;
+        _preparedOfferSdp = null;
+        orchestrator._dotconfCallLive = false;
+        _dotconfSetJoining(orchestrator, false);
+        if (typeof orchestrator.refreshContextBar === 'function') orchestrator.refreshContextBar();
+      }
     }
 
 
@@ -567,50 +902,59 @@
   // ── A3. _leaveDotConf — REPLACE your existing stub. ──
    
   async function _leaveDotConf(orchestrator) {
-    var conf     = _getCurrentDotConf(orchestrator);
-    var tenantId = conf ? _getTenantId(orchestrator) : null;
-   
-    try {
-      if (_mySessionId && conf) {
-        await _cfApi(
-          'PUT /' + conf.displayID + '/tracks/close?tenantId=' + tenantId,
-          {
-            sessionId:   _mySessionId,
-            tracks:      _myLocalTracks || [],
-            // Presence of speakingSec is what tells the server this is a
-            // real leave (vs. a tier-driven single-video unsubscribe of
-            // someone else's track, which never sends this field) — see
-            // the controller's tracks/close handler.
-            speakingSec: Math.round(_mySpeakingSec)
-          }
-        );
+      var conf     = _getCurrentDotConf(orchestrator);
+      var tenantId = conf ? _getTenantId(orchestrator) : null;
+
+      try {
+        if (_mySessionId && conf) {
+          await _cfApi(
+            'PUT /' + conf.displayID + '/tracks/close?tenantId=' + tenantId,
+            { sessionId: _mySessionId, tracks: _myLocalTracks || [], speakingSec: Math.round(_mySpeakingSec) }
+          );
+        }
+      } catch (e) {
+        console.error('[dotconf] _leaveDotConf close call failed:', e);
       }
-    } catch (e) {
-      console.error('[dotconf] _leaveDotConf close call failed:', e);
-      // fall through — tear down locally regardless, don't strand the user
-    }
-    
-    var hostDisplayID = _getHostDisplayID(orchestrator);
-    var hostDot = hostDisplayID ? _getDotElement(hostDisplayID) : null;
-    if (hostDot) {
-      hostDot.remove();
-      _dotElCache.delete(hostDisplayID);
-    }
-    _removeCallControls();
-    
-    orchestrator.dotconfStopLayout(orchestrator);
-    _stopCheapAudioLevelPolling();
-    _stopAudioLevelUpdates();
-    _stopAllMedia();
-    _closeSSE();
-   
-    orchestrator._dotconfCallLive = false;
-    _mySessionId          = null;
-    _myLocalTracks        = null;
-    _mySpeakingSec        = 0;
-    _videoSubscribedTier  = new Set();
-    _initialNegotiationDone = false; 
-    
+
+      // Release camera/mic first and unconditionally — the most user-visible,
+      // privacy-sensitive step must not be skippable by a failure anywhere
+      // else in this teardown sequence.
+      try {
+        _stopAllMedia();
+      } catch (e) {
+        console.error('[dotconf] _stopAllMedia failed during leave:', e);
+      }
+
+      try {
+        var hostDisplayID = _getHostDisplayID(orchestrator);
+        var hostDot = hostDisplayID ? _getDotElement(hostDisplayID) : null;
+        if (hostDot) { hostDot.remove(); _dotElCache.delete(hostDisplayID); }
+        _removeCallControls();
+        orchestrator.dotconfStopLayout(orchestrator);
+        _stopCheapAudioLevelPolling();
+        _stopAudioLevelUpdates();
+        _closeSSE();
+        // Drop every video tile (they'd otherwise freeze on their last frame) and
+        // rebuild the canvas as plain presence dots.
+        document.querySelectorAll('#canvas-area .dot').forEach(d => {
+          if (d.dataset.morphed === 'true' || d.dataset.tier === 'feedDot') _removeTileVideo(d);
+        });
+        _dotconfStopSnapshotUploads();            // the server clears your snapshot in markLeft
+        _midToTrackName = {};
+      } catch (e) {
+        console.error('[dotconf] _leaveDotConf teardown failed partway:', e);
+      }
+
+      orchestrator._dotconfCallLive   = false;
+      _dotconfSetJoining(orchestrator, false);
+      _dotconfSyncAddButton(orchestrator);
+      if (typeof orchestrator.refreshContextBar === 'function') orchestrator.refreshContextBar();
+      if (typeof orchestrator.render === 'function') orchestrator.render();
+      _mySessionId                    = null;
+      _myLocalTracks                  = null;
+      _mySpeakingSec                  = 0;
+      _videoSubscribedTier            = new Set();
+      _initialNegotiationDone         = false;
   }
    
    
@@ -623,31 +967,50 @@
   function _attachPeerConnectionHandlers(orchestrator, tenantId, confDisplayID) {
    
     _peerConnection.ontrack = (event) => {
+      if (_screenPullExpect) { _screenPullExpect.captured.push(event); return; } // screen share — handled by _pullScreen
       var track = event.track;
       var mid   = event.transceiver ? event.transceiver.mid : null;
-   
+
+      // Cloudflare replaces track/stream IDs with its own, so track.id never equals our
+      // trackName. Match by mid instead, using the trackName → mid list from the pull.
+      var trackName = mid != null ? _midToTrackName[String(mid)] : null;
+
       var ownerId = null;
-      for (var pid in _roster) {
-        var r = _roster[pid];
-        if (r && (r.audioTrackId === track.id || r.videoTrackId === track.id)) {
-          ownerId = pid;
-          break;
+      if (trackName) {
+        for (var pid in _roster) {
+          var r = _roster[pid];
+          if (r && (r.audioTrackId === trackName || r.videoTrackId === trackName)) { ownerId = pid; break; }
         }
       }
-   
-      _tracks[track.id] = Object.assign({}, _tracks[track.id], {
+      if (!ownerId) console.warn('[dotconf] ontrack: no owner for mid', mid, 'trackName', trackName);
+
+      var entry = Object.assign({}, (trackName && _tracks[trackName]) || _tracks[track.id], {
         kind: track.kind,
         participantDisplayID: ownerId,
         mediaStreamTrack: track,
-        mid: mid
+        mid: mid,
+        trackName: trackName
       });
-   
+      // Same entry under both keys: tile code looks up by Cloudflare trackName,
+      // stats/analyser code by the browser's track id.
+      _tracks[track.id] = entry;
+      if (trackName) _tracks[trackName] = entry;
+
       // Record which mid a participant's video landed on — needed to close
       // exactly that track when the tier system demotes them.
       if (track.kind === 'video' && ownerId && _roster[ownerId]) {
         _roster[ownerId]._videoMid = mid;
       }
-   
+      
+      // The tile may have been created before this track arrived, and the morph
+      // functions only attach video when they run — attach now so it doesn't stay blank.
+      if (track.kind === 'video' && ownerId && trackName) {
+        var tileEl = _getDotElement(ownerId);
+        if (tileEl && (tileEl.dataset.morphed === 'true' || tileEl.dataset.tier === 'feedDot')) {
+          _attachVideoToTile(tileEl, ownerId, trackName, orchestrator);
+        }
+      }
+
       if (ownerId && typeof _attachTrackEvents === 'function') {
         _attachTrackEvents(ownerId, track);
       }
@@ -670,6 +1033,7 @@
       console.log('[dotconf] connectionState:', state);
    
       if (state === 'connected') {
+        console.log('[diag] live call with sessionId:', _mySessionId);
         var hasVideo = _localStream ? _localStream.getVideoTracks().length > 0 : false;
         var hasAudio = _localStream ? _localStream.getAudioTracks().length > 0 : false;
         _cfApi(
@@ -737,48 +1101,62 @@
    
   async function _subscribeAudioForRoster(orchestrator, tenantId, confDisplayID, sessionId) {
     var myId = _getMyDotConfParticipantDisplayID(orchestrator);
-    var others = Object.keys(_roster).filter(pid => {
+    var conf = _getCurrentDotConf(orchestrator);
+    var activeIds = new Set((conf?.participants || [])
+      .filter(p => ['joining', 'live', 'audio_only', 'listening'].includes(p.presenceState))
+      .map(p => p.displayID));
+
+    var ids = Object.keys(_roster).filter(pid => {
       var r = _roster[pid];
-      return r && r.audioTrackId && pid !== myId;
+      return pid !== myId && activeIds.has(pid) && r && r.audioTrackId && r.cfSessionId;
     });
-   
-    for (var i = 0; i < others.length; i++) {
-      await _subscribeAudioForParticipant(orchestrator, tenantId, confDisplayID, sessionId, others[i]);
+
+    // One pull per participant, each going through the shared _negotiationQueue
+    // inside _subscribeAudioForParticipant, so this can never interleave with a
+    // video, audio or screen negotiation on the same session.
+    for (var pid of ids) {
+      await _subscribeAudioForParticipant(orchestrator, tenantId, confDisplayID, sessionId, pid);
     }
   }
    
   async function _subscribeAudioForParticipant(orchestrator, tenantId, confDisplayID, sessionId, participantDisplayID) {
-    var r = _roster[participantDisplayID];
-    if (!r || !r.audioTrackId || !r.cfSessionId) {
-      console.warn('[dotconf] cannot subscribe audio for', participantDisplayID, '— missing cfSessionId in roster');
-      return;
+      var r = _roster[participantDisplayID];
+      if (!r || !r.audioTrackId || !r.cfSessionId) {
+        console.warn('[dotconf] cannot subscribe audio for', participantDisplayID, '— missing cfSessionId in roster');
+        return;
+      }
+      if (r._audioSubscribed || r._audioSubscribing) return;
+      r._audioSubscribing = true;
+
+      _negotiationQueue = _negotiationQueue.then(async function() {
+        try {
+          var track = { trackName: r.audioTrackId, sessionId: r.cfSessionId };
+
+          var pullResp = await _pullWithRetry(confDisplayID, tenantId,
+            { sessionId: sessionId, tracks: [track] }
+          );
+          _recordPulledMids(pullResp);
+          await _peerConnection.setRemoteDescription({ type: 'offer', sdp: pullResp.offerSdp });
+          var answer = await _peerConnection.createAnswer();
+          await _peerConnection.setLocalDescription(answer);
+          await _cfApi(
+            'PUT /' + confDisplayID + '/tracks/renegotiate?tenantId=' + tenantId,
+            { sessionId: sessionId, answerSdp: answer.sdp }
+          );
+
+          _roster[participantDisplayID]._audioSubscribed = true;
+        } catch (e) {
+          console.error('[dotconf] _subscribeAudioForParticipant failed for', participantDisplayID, e);
+        } finally {
+          if (_roster[participantDisplayID]) _roster[participantDisplayID]._audioSubscribing = false;
+        }
+      }, function(e) {
+        console.error('[dotconf] _subscribeAudioForParticipant queue error for', participantDisplayID, e);
+        if (_roster[participantDisplayID]) _roster[participantDisplayID]._audioSubscribing = false;
+      });
+
+      return _negotiationQueue;
     }
-    if (r._audioSubscribed || r._audioSubscribing) return;
-    r._audioSubscribing = true;
-   
-    try {
-      var track = { trackName: r.audioTrackId, sessionId: r.cfSessionId };
-   
-      var pullResp = await _cfApi(
-        'POST /' + confDisplayID + '/tracks/pull?tenantId=' + tenantId,
-        { sessionId: sessionId, tracks: [track] }
-      );
-   
-      await _peerConnection.setRemoteDescription({ type: 'offer', sdp: pullResp.offerSdp });
-      var answer = await _peerConnection.createAnswer();
-      await _peerConnection.setLocalDescription(answer);
-      await _cfApi(
-        'PUT /' + confDisplayID + '/tracks/renegotiate?tenantId=' + tenantId,
-        { sessionId: sessionId, answerSdp: answer.sdp }
-      );
-   
-      _roster[participantDisplayID]._audioSubscribed = true;
-    } catch (e) {
-      console.error('[dotconf] _subscribeAudioForParticipant failed for', participantDisplayID, e);
-    } finally {
-      if (_roster[participantDisplayID]) _roster[participantDisplayID]._audioSubscribing = false;
-    }
-  }
    
    
   // ── A6. Video subscription — new. Tier-gated, called only from _tickLayout. ──
@@ -786,75 +1164,91 @@
   // visible (rect/feed-dot) participants get the finer real-time level data
   // used for the visual size-pulse.
    
+  var _negotiationQueue = Promise.resolve(); // module-level, shared across all participants
+
   async function _subscribeVideoForParticipant(orchestrator, tenantId, confDisplayID, participantDisplayID, tier) {
-    var r = _roster[participantDisplayID];
-    if (!r || !r.videoTrackId || !r.cfSessionId) return;
-    if (r._videoSubscribed || r._videoSubscribing) return;
-    r._videoSubscribing = true;
-   
-    var preferredRid = (tier === 'rect') ? null : 'q'; // rect wants best available, feed-dot wants low-res
-   
-    try {
-      var track = { trackName: r.videoTrackId, sessionId: r.cfSessionId };
-      if (preferredRid) track.simulcast = { preferredRid: preferredRid };
-   
-      var pullResp = await _cfApi(
-        'POST /' + confDisplayID + '/tracks/pull?tenantId=' + tenantId,
-        { sessionId: _mySessionId, tracks: [track] }
-      );
-   
-      await _peerConnection.setRemoteDescription({ type: 'offer', sdp: pullResp.offerSdp });
-      var answer = await _peerConnection.createAnswer();
-      await _peerConnection.setLocalDescription(answer);
-      await _cfApi(
-        'PUT /' + confDisplayID + '/tracks/renegotiate?tenantId=' + tenantId,
-        { sessionId: _mySessionId, answerSdp: answer.sdp }
-      );
-   
-      _roster[participantDisplayID]._videoSubscribed = true;
-   
-      // Upgrade to the fine-grained analyser now that they're visible —
-      // their audio was already pulled broadly at join, so _tracks[audioTrackId]
-      // should already exist from ontrack.
-      var audioEntry = _tracks[r.audioTrackId];
-      if (audioEntry && audioEntry.mediaStreamTrack && !audioEntry.analyser) {
-        _attachAudioAnalyser(r.audioTrackId, audioEntry.mediaStreamTrack);
+      var r = _roster[participantDisplayID];
+      if (!r || !r.videoTrackId || !r.cfSessionId) return;
+      if (r._videoSubscribed || r._videoSubscribing) return;
+      r._videoSubscribing = true;
+
+      // Cloudflare's Realtime API requires one offer/answer cycle on a session
+      // to fully resolve before the next starts. Multiple fake participants
+      // going live close together previously fired overlapping pull+renegotiate
+      // calls against the same shared _peerConnection/_mySessionId, corrupting
+      // its signaling state ("API requests were possibly made out-of-order" —
+      // Cloudflare's own error). Chain all negotiations through one queue so
+      // they run strictly one at a time, regardless of which participant.
+      var runNegotiation = async function() {
+        var preferredRid = (tier === 'rect') ? null : 'q';
+        var track = { trackName: r.videoTrackId, sessionId: r.cfSessionId };
+        if (preferredRid) track.simulcast = { preferredRid: preferredRid };
+
+        var pullResp = await _pullWithRetry(confDisplayID, tenantId, { sessionId: _mySessionId, tracks: [track] });
+        _recordPulledMids(pullResp);
+        await _peerConnection.setRemoteDescription({ type: 'offer', sdp: pullResp.offerSdp });
+        var answer = await _peerConnection.createAnswer();
+        await _peerConnection.setLocalDescription(answer);
+        await _cfApi(
+          'PUT /' + confDisplayID + '/tracks/renegotiate?tenantId=' + tenantId,
+          { sessionId: _mySessionId, answerSdp: answer.sdp }
+        );
+
+        _roster[participantDisplayID]._videoSubscribed = true;
+
+        var audioEntry = _tracks[r.audioTrackId];
+        if (audioEntry && audioEntry.mediaStreamTrack && !audioEntry.analyser) {
+          _attachAudioAnalyser(r.audioTrackId, audioEntry.mediaStreamTrack);
+        }
+      };
+
+      // Chain with BOTH handlers so one failed negotiation doesn't permanently
+      // wedge the queue for every participant after it.
+      _negotiationQueue = _negotiationQueue.then(runNegotiation, runNegotiation);
+
+      try {
+        await _negotiationQueue;
+      } catch (e) {
+        console.error('[dotconf] _subscribeVideoForParticipant failed for', participantDisplayID, e);
+      } finally {
+        if (_roster[participantDisplayID]) _roster[participantDisplayID]._videoSubscribing = false;
       }
-   
-    } catch (e) {
-      console.error('[dotconf] _subscribeVideoForParticipant failed for', participantDisplayID, e);
-    } finally {
-      if (_roster[participantDisplayID]) _roster[participantDisplayID]._videoSubscribing = false;
-    }
   }
    
   async function _unsubscribeVideoForParticipant(orchestrator, tenantId, confDisplayID, participantDisplayID) {
-    var r = _roster[participantDisplayID];
-    if (!r || !r._videoSubscribed) return;
-   
-    var mid = r._videoMid; // set by ontrack when the pulled track actually arrived
-    if (!mid) {
-      console.warn('[dotconf] cannot unsubscribe video for', participantDisplayID, '— mid unknown yet');
-      return;
-    }
-   
-    try {
-      // No speakingSec field — tells the server this is a tier-driven
-      // unsubscribe of someone ELSE's track, not our own leave.
-      await _cfApi(
-        'PUT /' + confDisplayID + '/tracks/close?tenantId=' + tenantId,
-        { sessionId: _mySessionId, tracks: [{ trackName: r.videoTrackId, mid: mid }] }
-      );
-      _roster[participantDisplayID]._videoSubscribed = false;
-      _roster[participantDisplayID]._videoMid = null;
-   
-      // Drop back to cheap polling for this participant's audio level.
-      if (r.audioTrackId && _tracks[r.audioTrackId]) {
-        delete _tracks[r.audioTrackId].analyser;
+      var r = _roster[participantDisplayID];
+      if (!r || !r._videoSubscribed) return;
+
+      var mid = r._videoMid;
+      if (!mid) {
+        console.warn('[dotconf] cannot unsubscribe video for', participantDisplayID, '— mid unknown yet');
+        return;
       }
-    } catch (e) {
-      console.error('[dotconf] _unsubscribeVideoForParticipant failed for', participantDisplayID, e);
-    }
+
+      // Same shared queue as _subscribeVideoForParticipant — see the comment
+      // there. Closing tracks still mutates this session on Cloudflare's
+      // side, so it needs to serialize against any in-flight pull/renegotiate
+      // too, not just against other unsubscribes.
+      var runClose = async function() {
+        await _cfApi(
+          'PUT /' + confDisplayID + '/tracks/close?tenantId=' + tenantId,
+          { sessionId: _mySessionId, tracks: [{ trackName: r.videoTrackId, mid: mid }] }
+        );
+        _roster[participantDisplayID]._videoSubscribed = false;
+        _roster[participantDisplayID]._videoMid = null;
+
+        if (r.audioTrackId && _tracks[r.audioTrackId]) {
+          delete _tracks[r.audioTrackId].analyser;
+        }
+      };
+
+      _negotiationQueue = _negotiationQueue.then(runClose, runClose);
+
+      try {
+        await _negotiationQueue;
+      } catch (e) {
+        console.error('[dotconf] _unsubscribeVideoForParticipant failed for', participantDisplayID, e);
+      }
   }
    
    
@@ -1283,7 +1677,7 @@
           var delta = Math.abs(size - prevW);
           if (delta < 1 && dot.dataset.morphed !== 'true' && dot.dataset.tier !== 'feedDot') return;
           _maxSizeDelta = Math.max(_maxSizeDelta, delta);
-          _morphToPresenceDot(dot, p.displayID, size, p.presenceState);
+          _morphToPresenceDot(dot, p.displayID, size, p.presenceState, false, orchestrator, p.name);
         }
     });
    
@@ -1451,12 +1845,22 @@
     var cameraBtn = _makeControlButton('camera', () => _toggleLocalVideo(orchestrator));
     var leaveBtn  = _makeControlButton('leave', () => _confirmAndLeave(orchestrator), true);
 
+    var shareBtn = _makeControlButton('share', () => _onShareButtonClick(orchestrator));
+    if (!_dotconfCanShareScreen()) shareBtn.style.display = 'none';   // e.g. iOS / most mobile browsers
+
     bar.appendChild(micBtn);
     bar.appendChild(cameraBtn);
+    bar.appendChild(shareBtn);
     bar.appendChild(leaveBtn);
 
+    _shareBtnEl = shareBtn;
+    _updateShareButton(orchestrator);
+    clearInterval(_shareBtnTimer);
+    _shareBtnTimer = setInterval(() => _updateShareButton(orchestrator), 1000);
+    
     document.body.appendChild(bar);
     _controlsBarEl = bar;
+    _dotconfAutoHideControls(bar);
     _micBtnEl      = micBtn;
     _cameraBtnEl   = cameraBtn;
 
@@ -1477,10 +1881,15 @@
 
   function _removeCallControls() {
     if (_controlsBarEl) {
+      _dotconfStopAutoHideControls();
       _controlsBarEl.remove();
       _controlsBarEl = null;
     }
     clearTimeout(_controlsHideTimer);
+    
+    clearInterval(_shareBtnTimer);
+    _shareBtnTimer = null;
+    _shareBtnEl = null;
   }
 
   function _showControls() {
@@ -1517,6 +1926,7 @@
 
   function _controlIconSvg(kind, isOff) {
     var icons = {
+      share: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/><path d="M12 13V8M9.5 10.5 12 8l2.5 2.5"/></svg>',
       mic:       '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>',
       'mic-off': '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>',
       camera:       '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>',
@@ -1524,6 +1934,575 @@
       leave:  '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a1.003 1.003 0 0 1 0-1.41C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.1-.7-.28-.79-.73-1.68-1.36-2.66-1.85a.996.996 0 0 1-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>'
     };
     return icons[isOff ? kind + '-off' : kind] || icons[kind] || '';
+  }
+  
+  var _ctrlAutoHide = null;
+
+  function _dotconfAutoHideControls(bar) {
+    _dotconfStopAutoHideControls();
+    if (!bar) return;
+    var base  = bar.style.transform || '';   // keep any existing centring transform
+    var state = { bar: bar, base: base, thin: false, timer: null };
+
+    bar.style.transformOrigin = 'center bottom';
+    bar.style.transition = (bar.style.transition ? bar.style.transition + ', ' : '') + 'transform .25s ease';
+
+    function expand() {
+      clearTimeout(state.timer); state.timer = null;
+      if (state.thin) { state.thin = false; bar.style.transform = base; }
+    }
+    function collapseSoon(ms) {
+      if (state.timer) return;
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        if (bar.matches(':hover')) return collapseSoon(1500);
+        state.thin = true;
+        bar.style.transform = base + ' scaleY(' + (3 / Math.max(bar.offsetHeight, 3)) + ')';
+      }, ms);
+    }
+    state.onMove = e => {
+      var r = bar.getBoundingClientRect();
+      var near = e.clientX >= r.left - 10 && e.clientX <= r.right + 10 &&
+                 e.clientY >= r.top - (state.thin ? 20 : 10) && e.clientY <= r.bottom + 10;
+      if (near) expand(); else if (!state.thin) collapseSoon(2500);
+    };
+    document.addEventListener('mousemove', state.onMove, { passive: true });
+    _ctrlAutoHide = state;
+    collapseSoon(4000);   // show fully on join, thin out after 4 s
+  }
+
+  function _dotconfStopAutoHideControls() {
+    if (!_ctrlAutoHide) return;
+    var s = _ctrlAutoHide;
+    clearTimeout(s.timer);
+    document.removeEventListener('mousemove', s.onMove);
+    s.bar.style.transform = s.base;
+    _ctrlAutoHide = null;
+  }
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Screen share — one sharer at a time. Published as extra sendonly
+  // transceivers on our existing peer connection; viewers pull it like any
+  // other track. All SDP work goes through _negotiationQueue.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  var SCREEN_STRIP_H = 150;       // "Full" layout: height of the participant strip under the screen
+  var _shareBtnEl        = null;
+  var _shareBtnTimer     = null;
+  var _myScreen          = null;  // { stream, videoTx, audioTx, layout } — while WE are sharing
+  var _activeShare       = null;  // { participantDisplayID, cfSessionId, screenTrackId, screenAudioTrackId, layout }
+  var _rosterShare       = null;  // share found in the roster snapshot (late join)
+  var _screenRecv        = null;  // { txs, stream, videoId, audioId } — what we pulled as a viewer
+  var _screenPullExpect  = null;  // set while a screen pull is negotiating (see ontrack guard)
+  var _stageEl           = null;
+  var _canvasSaved       = null;
+  var _floatPos          = null;
+  var _stageResizeTimer  = null;
+
+  function _dotconfCanShareScreen() {
+    return !!(navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function');
+  }
+
+  function _dotconfCanShareAudio() {
+    var ua = navigator.userAgent;
+    return /Chrome\/|Edg\//.test(ua) && !/Firefox\/|OPR\//.test(ua); // Chromium: tab audio (+ system audio on Windows)
+  }
+
+  function _dotconfNameOf(orchestrator, pid) {
+    var c = _getCurrentDotConf(orchestrator);
+    var p = (c?.participants || []).find(x => x.displayID === pid);
+    return (p && p.name) || 'Someone';
+  }
+
+  function _dotconfInCallCount(orchestrator) {
+    var c = _getCurrentDotConf(orchestrator);
+    return (c?.participants || []).filter(p =>
+      ['joining', 'live', 'audio_only', 'listening'].includes(p.presenceState)).length;
+  }
+
+  function _queueNegotiation(fn) {
+    _negotiationQueue = _negotiationQueue.then(fn, fn);
+    return _negotiationQueue;
+  }
+
+  // ── Share button ──────────────────────────────────────────────────────────────
+
+  function _updateShareButton(orchestrator) {
+    var btn = _shareBtnEl;
+    if (!btn) return;
+    var mine   = !!_myScreen;
+    var other  = !!(_activeShare && _activeShare.participantDisplayID !== _cachedMyId);
+    var enough = _dotconfInCallCount(orchestrator) >= 2;
+    var enabled = mine || (!other && enough);
+
+    var title = mine   ? 'Stop sharing'
+              : other  ? _dotconfNameOf(orchestrator, _activeShare.participantDisplayID) + ' is sharing'
+              : !enough ? 'Available once someone else joins'
+              : 'Share your screen';
+
+    btn.disabled = !enabled;
+    btn.title = title;
+    btn.setAttribute('aria-label', title);
+    btn.style.opacity    = enabled ? '1' : '0.4';
+    btn.style.cursor     = enabled ? 'pointer' : 'not-allowed';
+    btn.style.background = mine ? '#4c6ef5' : 'rgba(255,255,255,0.15)';
+  }
+
+  function _onShareButtonClick(orchestrator) {
+    if (_myScreen) { _stopScreenShare(orchestrator); return; }
+    if (_shareBtnEl && _shareBtnEl.disabled) return;
+    _openSharePicker(orchestrator);
+  }
+
+  // ── Layout picker (before sharing) ────────────────────────────────────────────
+
+  var DOTCONF_LAYOUT_ICONS = {
+    full:  '<rect x="1" y="1" width="46" height="30" rx="3" fill="#4c6ef5"/><rect x="1" y="26" width="46" height="5" rx="1" fill="#b2bec3"/>',
+    split: '<rect x="1" y="1" width="22" height="30" rx="3" fill="#b2bec3"/><rect x="25" y="1" width="22" height="30" rx="3" fill="#4c6ef5"/>',
+    float: '<rect x="1" y="1" width="46" height="30" rx="3" fill="#b2bec3"/><rect x="27" y="17" width="17" height="11" rx="2" fill="#4c6ef5"/>'
+  };
+  var DOTCONF_LAYOUT_LABELS = { full: 'Full', split: 'Split', float: 'Floating' };
+
+  function _openSharePicker(orchestrator) {
+    if (document.getElementById('dotconf-share-picker')) return;
+    var chosen = 'split';
+
+    var overlay = document.createElement('div');
+    overlay.id = 'dotconf-share-picker';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
+
+    var card = document.createElement('div');
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', 'Share your screen');
+    card.style.cssText = 'background:#fff;border-radius:12px;padding:20px;width:100%;max-width:380px;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+
+    var title = document.createElement('div');
+    title.textContent = 'Share your screen';
+    title.style.cssText = 'font-size:16px;font-weight:700;color:#2d3436;margin-bottom:4px;';
+    var sub = document.createElement('div');
+    sub.textContent = 'How should everyone see it?';
+    sub.style.cssText = 'font-size:13px;color:#636e72;margin-bottom:14px;';
+
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:10px;margin-bottom:14px;';
+    var cards = {};
+    Object.keys(DOTCONF_LAYOUT_ICONS).forEach(function(k) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.innerHTML = '<svg width="48" height="32" viewBox="0 0 48 32" aria-hidden="true">' + DOTCONF_LAYOUT_ICONS[k] + '</svg>' +
+                    '<div style="font-size:12px;font-weight:600;margin-top:6px;color:#2d3436;">' + DOTCONF_LAYOUT_LABELS[k] + '</div>';
+      b.style.cssText = 'flex:1;padding:10px 4px;border-radius:10px;background:#fff;cursor:pointer;display:flex;flex-direction:column;align-items:center;';
+      b.onclick = () => { chosen = k; paint(); };
+      cards[k] = b;
+      row.appendChild(b);
+    });
+    function paint() {
+      Object.keys(cards).forEach(k => {
+        cards[k].style.border = (k === chosen) ? '2px solid #4c6ef5' : '2px solid #dfe6e9';
+        cards[k].setAttribute('aria-pressed', k === chosen ? 'true' : 'false');
+      });
+    }
+    paint();
+
+    var audioWrap = null, audioBox = null;
+    if (_dotconfCanShareAudio()) {
+      audioWrap = document.createElement('label');
+      audioWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;color:#2d3436;margin-bottom:16px;cursor:pointer;';
+      audioBox = document.createElement('input');
+      audioBox.type = 'checkbox';
+      audioWrap.append(audioBox, document.createTextNode('Also share audio (tick "Share audio" in the next window)'));
+    }
+
+    var btns = document.createElement('div');
+    btns.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;';
+    var cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText = 'padding:8px 14px;border-radius:8px;border:1px solid #dfe6e9;background:#fff;color:#2d3436;font-weight:600;cursor:pointer;';
+    var go = document.createElement('button');
+    go.textContent = 'Choose what to share';
+    go.style.cssText = 'padding:8px 14px;border-radius:8px;border:none;background:#4c6ef5;color:#fff;font-weight:600;cursor:pointer;';
+
+    var close = () => overlay.remove();
+    cancel.onclick = close;
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    // getDisplayMedia must run inside this click — _startScreenShare calls it before any other await.
+    go.onclick = () => { close(); _startScreenShare(orchestrator, chosen, !!(audioBox && audioBox.checked)); };
+
+    btns.append(cancel, go);
+    card.append(title, sub, row);
+    if (audioWrap) card.appendChild(audioWrap);
+    card.appendChild(btns);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+  }
+
+  // ── Sharer side ───────────────────────────────────────────────────────────────
+
+  async function _startScreenShare(orchestrator, layout, wantAudio) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !_peerConnection || !_mySessionId) return;
+    var tenantId = _getTenantId(orchestrator);
+
+    var stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15, max: 30 } },
+        audio: wantAudio,
+        systemAudio: wantAudio ? 'include' : 'exclude'
+      });
+    } catch (e) {
+      if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') {
+        console.error('[dotconf] getDisplayMedia failed:', e);
+        _showError('Could not start screen sharing.');
+      }
+      return; // user cancelled the browser's picker — nothing to do
+    }
+
+    var vTrack = stream.getVideoTracks()[0];
+    var aTrack = stream.getAudioTracks()[0] || null;
+    if ('contentHint' in vTrack) vTrack.contentHint = 'detail'; // favour sharp text over smooth motion
+
+    try {
+      await _queueNegotiation(async function() {
+        var videoTx = _peerConnection.addTransceiver(vTrack, { direction: 'sendonly', streams: [stream] });
+        var audioTx = aTrack ? _peerConnection.addTransceiver(aTrack, { direction: 'sendonly', streams: [stream] }) : null;
+        var offer = await _peerConnection.createOffer();
+        await _peerConnection.setLocalDescription(offer);
+        try {
+          var resp = await _cfApi('POST /' + conf.displayID + '/screen/start?tenantId=' + tenantId, {
+            sessionId: _mySessionId,
+            offerSdp:  _peerConnection.localDescription.sdp,
+            videoMid:  videoTx.mid,
+            audioMid:  audioTx ? audioTx.mid : null,
+            layout:    layout
+          });
+          await _peerConnection.setRemoteDescription({ type: 'answer', sdp: resp.answerSdp });
+          _myScreen = { stream: stream, videoTx: videoTx, audioTx: audioTx, layout: layout };
+        } catch (err) {
+          try { await _peerConnection.setLocalDescription({ type: 'rollback' }); } catch (_) {}
+          [videoTx, audioTx].forEach(tx => { if (tx) { try { tx.stop(); } catch (_) {} } });
+          throw err;
+        }
+        // Bitrate/framerate cap — only valid once the sender has been negotiated.
+        try {
+          var p = videoTx.sender.getParameters();
+          if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+          p.encodings[0].maxBitrate   = 2500000;
+          p.encodings[0].maxFramerate = 15;
+          await videoTx.sender.setParameters(p);
+        } catch (_) { /* best effort */ }
+      });
+    } catch (e) {
+      stream.getTracks().forEach(t => t.stop());
+      var busy = /\b409\b/.test(String(e && e.message));
+      console.error('[dotconf] screen share failed:', e);
+      _showError(busy ? 'Someone else is already sharing.' : 'Could not start screen sharing — please try again.');
+      _updateShareButton(orchestrator);
+      return;
+    }
+
+    vTrack.onended = () => _stopScreenShare(orchestrator); // browser's own "Stop sharing" bar
+    _renderSharerBanner(orchestrator);
+    _updateShareButton(orchestrator);
+  }
+
+  async function _stopScreenShare(orchestrator) {
+    if (!_myScreen) return;
+    var mine = _myScreen;
+    _myScreen = null;
+    mine.stream.getTracks().forEach(t => { t.onended = null; t.stop(); });
+    _removeSharerBanner();
+    _updateShareButton(orchestrator);
+
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !_mySessionId) return;
+    var tenantId = _getTenantId(orchestrator);
+    await _queueNegotiation(async function() {
+      try {
+        await _cfApi('POST /' + conf.displayID + '/screen/stop?tenantId=' + tenantId, { sessionId: _mySessionId });
+      } catch (e) {
+        console.warn('[dotconf] screen/stop failed:', e);
+      }
+      [mine.videoTx, mine.audioTx].forEach(tx => { if (tx) { try { tx.stop(); } catch (_) {} } });
+    });
+  }
+
+  async function _setShareLayout(orchestrator, layout) {
+    if (!_myScreen || _myScreen.layout === layout) return;
+    var conf = _getCurrentDotConf(orchestrator);
+    try {
+      await _cfApi('POST /' + conf.displayID + '/screen/layout?tenantId=' + _getTenantId(orchestrator),
+        { sessionId: _mySessionId, layout: layout });
+      _myScreen.layout = layout;
+      _renderSharerBanner(orchestrator);
+    } catch (e) {
+      console.error('[dotconf] screen layout change failed:', e);
+      _showError('Could not change the layout.');
+    }
+  }
+
+  function _renderSharerBanner(orchestrator) {
+    if (!_myScreen) { _removeSharerBanner(); return; }
+    var bar = document.getElementById('dotconf-sharer-banner');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'dotconf-sharer-banner';
+      bar.setAttribute('role', 'status');
+      bar.style.cssText = 'position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:1100;display:flex;align-items:center;gap:10px;padding:6px 8px 6px 14px;background:#2d3436;color:#fff;border-radius:20px;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,0.25);max-width:calc(100vw - 32px);flex-wrap:wrap;';
+      document.body.appendChild(bar);
+    }
+    bar.innerHTML = '';
+    var label = document.createElement('span');
+    label.textContent = "You're sharing your screen";
+    bar.appendChild(label);
+
+    var seg = document.createElement('div');
+    seg.style.cssText = 'display:flex;background:rgba(255,255,255,0.12);border-radius:14px;padding:2px;';
+    Object.keys(DOTCONF_LAYOUT_LABELS).forEach(function(k) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = DOTCONF_LAYOUT_LABELS[k];
+      var on = _myScreen.layout === k;
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.style.cssText = 'border:none;border-radius:12px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;' +
+        (on ? 'background:#fff;color:#2d3436;' : 'background:transparent;color:#fff;');
+      b.onclick = () => _setShareLayout(orchestrator, k);
+      seg.appendChild(b);
+    });
+    bar.appendChild(seg);
+
+    var stop = document.createElement('button');
+    stop.type = 'button';
+    stop.textContent = 'Stop';
+    stop.style.cssText = 'border:none;border-radius:14px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;background:#e03131;color:#fff;';
+    stop.onclick = () => _stopScreenShare(orchestrator);
+    bar.appendChild(stop);
+  }
+
+  function _removeSharerBanner() {
+    document.getElementById('dotconf-sharer-banner')?.remove();
+  }
+
+  // ── Viewer side ───────────────────────────────────────────────────────────────
+
+  function _onScreenEvent(orchestrator, s) {
+    if (s.active) {
+      var trackChanged = !_activeShare || _activeShare.screenTrackId !== s.screenTrackId;
+      _activeShare = {
+        participantDisplayID: s.participantDisplayID, cfSessionId: s.cfSessionId,
+        screenTrackId: s.screenTrackId, screenAudioTrackId: s.screenAudioTrackId || null,
+        layout: s.layout || 'split'
+      };
+      if (s.participantDisplayID === _cachedMyId) {
+        if (_myScreen) { _myScreen.layout = _activeShare.layout; _renderSharerBanner(orchestrator); }
+      } else if (orchestrator._dotconfCallLive) {
+        if (trackChanged) { _dropScreenRecv(orchestrator); _pullScreen(orchestrator, _activeShare); }
+        else _renderScreenStage(orchestrator); // layout change only
+      }
+    } else {
+      if (_activeShare && _activeShare.participantDisplayID === s.participantDisplayID) {
+        _activeShare = null;
+        _dropScreenRecv(orchestrator);
+      }
+      if (s.participantDisplayID === _cachedMyId && _myScreen) {
+        // Server ended our share (e.g. after a long disconnect) — clean up locally.
+        var mine = _myScreen; _myScreen = null;
+        mine.stream.getTracks().forEach(t => { t.onended = null; t.stop(); });
+        _removeSharerBanner();
+      }
+    }
+    _rosterShare = null;
+    _updateShareButton(orchestrator);
+  }
+
+  function _dotconfResumeShare(orchestrator) {
+    if (_rosterShare && !_activeShare) _onScreenEvent(orchestrator, _rosterShare);
+  }
+
+  function _pullScreen(orchestrator, share) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !_peerConnection || !_mySessionId) return;
+    var tenantId = _getTenantId(orchestrator);
+    var tracks = [{ trackName: share.screenTrackId, sessionId: share.cfSessionId }];
+    if (share.screenAudioTrackId) tracks.push({ trackName: share.screenAudioTrackId, sessionId: share.cfSessionId });
+
+    _queueNegotiation(async function() {
+      if (!_activeShare || _activeShare.screenTrackId !== share.screenTrackId) return; // superseded meanwhile
+      var expect = { captured: [] };
+      _screenPullExpect = expect;
+      try {
+        var pullResp = await _cfApi('POST /' + conf.displayID + '/tracks/pull?tenantId=' + tenantId,
+          { sessionId: _mySessionId, tracks: tracks });
+        await _peerConnection.setRemoteDescription({ type: 'offer', sdp: pullResp.offerSdp });
+        var answer = await _peerConnection.createAnswer();
+        await _peerConnection.setLocalDescription(answer);
+        await _cfApi('PUT /' + conf.displayID + '/tracks/renegotiate?tenantId=' + tenantId,
+          { sessionId: _mySessionId, answerSdp: answer.sdp });
+      } catch (e) {
+        console.error('[dotconf] screen pull failed:', e);
+        return;
+      } finally {
+        _screenPullExpect = null;
+      }
+      if (!_activeShare || _activeShare.screenTrackId !== share.screenTrackId) return; // ended while negotiating
+      _screenRecv = {
+        txs:     expect.captured.map(ev => ev.transceiver),
+        stream:  new MediaStream(expect.captured.map(ev => ev.track)),
+        videoId: share.screenTrackId,
+        audioId: share.screenAudioTrackId
+      };
+      _renderScreenStage(orchestrator);
+    });
+  }
+
+  function _dropScreenRecv(orchestrator) {
+    _clearScreenStage(orchestrator);
+    var recv = _screenRecv;
+    _screenRecv = null;
+    if (!recv || !_peerConnection) return;
+
+    var conf = _getCurrentDotConf(orchestrator);
+    var closeList = recv.txs
+      .filter(tx => tx.mid && tx.receiver && tx.receiver.track)
+      .map(tx => ({ trackName: tx.receiver.track.kind === 'audio' ? recv.audioId : recv.videoId, mid: tx.mid }));
+    if (!conf || !closeList.length) return;
+
+    _queueNegotiation(async function() {
+      try {
+        // No speakingSec → never treated as a leave.
+        await _cfApi('PUT /' + conf.displayID + '/tracks/close?tenantId=' + _getTenantId(orchestrator),
+          { sessionId: _mySessionId, tracks: closeList });
+      } catch (e) {
+        console.warn('[dotconf] closing pulled screen tracks failed (harmless if the share already ended):', e);
+      }
+    });
+  }
+
+  // ── Stage: where viewers see the shared screen ────────────────────────────────
+  
+  var _relayoutTimer = null;
+  function _dotconfRelayout(orchestrator) {
+    if (!orchestrator || typeof orchestrator.render !== 'function') return;
+    clearTimeout(_relayoutTimer);
+    _relayoutTimer = setTimeout(() => orchestrator.render(), 100);
+  }
+
+  function _renderScreenStage(orchestrator) {
+    if (!_activeShare || !_screenRecv) { _clearScreenStage(); return; }
+    var canvas = document.getElementById('canvas-area');
+    if (!canvas) return;
+    var layout = _activeShare.layout || 'split';
+
+    _restoreCanvas(canvas);
+    var rect = canvas.getBoundingClientRect();
+    _canvasSaved = {
+      width: canvas.style.width, height: canvas.style.height,
+      marginTop: canvas.style.marginTop, overflow: canvas.style.overflow
+    };
+
+    if (!_stageEl) {
+      _stageEl = document.createElement('div');
+      _stageEl.id = 'dotconf-screen-stage';
+      _stageEl.innerHTML =
+        '<div class="dotconf-stage-head" style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;font-weight:600;color:#fff;background:rgba(0,0,0,0.55);"></div>' +
+        '<video autoplay playsinline style="flex:1;min-height:0;width:100%;object-fit:contain;background:#111;display:block;"></video>';
+      document.body.appendChild(_stageEl);
+      window.addEventListener('resize', _onStageResize);
+      _stageEl._orchestrator = orchestrator;
+    }
+    var video = _stageEl.querySelector('video');
+    if (video.srcObject !== _screenRecv.stream) video.srcObject = _screenRecv.stream; // carries screen audio too
+    _stageEl.querySelector('.dotconf-stage-head').textContent =
+      '🖥  ' + _dotconfNameOf(orchestrator, _activeShare.participantDisplayID) + ' is sharing';
+
+    var base = 'position:fixed;z-index:900;display:flex;flex-direction:column;background:#111;overflow:hidden;box-sizing:border-box;';
+    if (layout === 'full') {
+      var stageH = Math.max(120, rect.height - SCREEN_STRIP_H);
+      _stageEl.style.cssText = base + 'left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;height:' + stageH + 'px;';
+      canvas.style.marginTop = stageH + 'px';
+      canvas.style.height    = SCREEN_STRIP_H + 'px';
+      canvas.style.overflow  = 'hidden';
+    } else if (layout === 'split') {
+      _stageEl.style.cssText = base + 'left:' + (rect.left + rect.width / 2) + 'px;top:' + rect.top + 'px;width:' + (rect.width / 2) + 'px;height:' + rect.height + 'px;';
+      canvas.style.width    = '50%';
+      canvas.style.overflow = 'hidden';
+    } else { // float
+      var w = Math.min(420, rect.width * 0.4), h = Math.round(w * 9 / 16) + 28;
+      var pos = _floatPos || { left: rect.right - w - 24, top: rect.bottom - h - 96 };
+      _stageEl.style.cssText = base + 'left:' + pos.left + 'px;top:' + pos.top + 'px;width:' + w + 'px;height:' + h + 'px;' +
+        'border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,0.35);resize:both;min-width:200px;min-height:140px;';
+      _makeStageDraggable();
+    }
+    
+    if (_stageEl._lastLayout !== layout) { _stageEl._lastLayout = layout; _dotconfRelayout(orchestrator); }
+  }
+
+  function _makeStageDraggable() {
+    var head = _stageEl.querySelector('.dotconf-stage-head');
+    if (head.dataset.drag) return;
+    head.dataset.drag = '1';
+    head.style.cursor = 'move';
+    head.addEventListener('pointerdown', function(e) {
+      if (!_activeShare || _activeShare.layout !== 'float') return;
+      var startX = e.clientX, startY = e.clientY;
+      var r = _stageEl.getBoundingClientRect();
+      head.setPointerCapture(e.pointerId);
+      function move(ev) {
+        var left = Math.max(0, Math.min(window.innerWidth - 80,  r.left + ev.clientX - startX));
+        var top  = Math.max(0, Math.min(window.innerHeight - 40, r.top  + ev.clientY - startY));
+        _stageEl.style.left = left + 'px';
+        _stageEl.style.top  = top + 'px';
+        _floatPos = { left: left, top: top };
+      }
+      function up() { head.removeEventListener('pointermove', move); head.removeEventListener('pointerup', up); }
+      head.addEventListener('pointermove', move);
+      head.addEventListener('pointerup', up);
+    });
+  }
+
+  function _onStageResize() {
+    clearTimeout(_stageResizeTimer);
+    _stageResizeTimer = setTimeout(() => {
+      if (_stageEl && _stageEl._orchestrator) _renderScreenStage(_stageEl._orchestrator);
+    }, 150);
+  }
+
+  function _restoreCanvas(canvas) {
+    if (!_canvasSaved || !canvas) return;
+    canvas.style.width     = _canvasSaved.width;
+    canvas.style.height    = _canvasSaved.height;
+    canvas.style.marginTop = _canvasSaved.marginTop;
+    canvas.style.overflow  = _canvasSaved.overflow;
+    _canvasSaved = null;
+  }
+
+  function _clearScreenStage(orchestrator) {
+    var hadStage = !!_stageEl;
+    var orch = orchestrator || (_stageEl && _stageEl._orchestrator);
+    _restoreCanvas(document.getElementById('canvas-area'));
+    if (_stageEl) {
+      var v = _stageEl.querySelector('video');
+      if (v) v.srcObject = null;
+      _stageEl.remove();
+      _stageEl = null;
+      window.removeEventListener('resize', _onStageResize);
+    }
+    if (hadStage) _dotconfRelayout(orch);
+  }
+  
+  // ── Leave / call end ──────────────────────────────────────────────────────────
+
+  function _dotconfScreenTeardown() {
+    if (_myScreen) {
+      _myScreen.stream.getTracks().forEach(t => { t.onended = null; t.stop(); });
+      _myScreen = null;
+    }
+    _removeSharerBanner();
+    _activeShare = null;
+    _screenRecv = null;
+    _screenPullExpect = null;
+    _clearScreenStage();
+    document.getElementById('dotconf-share-picker')?.remove();
   }
 
   // ── Toggle handlers ─────────────────────────────────────────────────────────
@@ -1537,6 +2516,7 @@
     _localStream.getAudioTracks().forEach(t => t.enabled = !_micMuted);
     _updateMuteBadge(orchestrator);
     _setButtonState(_micBtnEl, 'mic', _micMuted);
+    _dotconfReportMedia(orchestrator);
   }
 
   function _toggleLocalVideo(orchestrator) {
@@ -1548,6 +2528,7 @@
       tile.style.filter = _cameraOff ? 'grayscale(40%) brightness(0.9)' : '';
     }
     _setButtonState(_cameraBtnEl, 'camera', _cameraOff);
+    _dotconfReportMedia(orchestrator);
   }
 
   function _setButtonState(btnEl, kind, isOff) {
@@ -1612,10 +2593,38 @@
       _leaveDotConf(orchestrator);
     });
 
-    btnRow.appendChild(cancelBtn);
-    btnRow.appendChild(leaveBtn);
     dialog.appendChild(title);
+
+    if (orchestrator.isDataOwner()) {
+      title.textContent = 'Leave or end the call?';
+      title.style.marginBottom = '8px';
+
+      var sub = document.createElement('div');
+      sub.textContent = 'Others can keep talking without you, or you can end the call for everyone.';
+      sub.style.cssText = 'font-size:13px;color:#636e72;margin-bottom:18px;line-height:1.4;';
+      dialog.appendChild(sub);
+
+      var endBtn = document.createElement('button');
+      endBtn.textContent = 'End for everyone';
+      endBtn.style.cssText = leaveBtn.style.cssText;   // copy the red style before Leave is restyled
+      endBtn.addEventListener('click', () => { overlay.remove(); _dotconfEndCall(orchestrator); });
+
+      leaveBtn.textContent = 'Just leave';
+      leaveBtn.style.background = '#495057';
+
+      btnRow.style.flexDirection = 'column';
+      [endBtn, leaveBtn, cancelBtn].forEach(b => {
+        b.style.flex = 'none';
+        b.style.width = '100%';
+        btnRow.appendChild(b);
+      });
+    } else {
+      btnRow.appendChild(cancelBtn);
+      btnRow.appendChild(leaveBtn);
+    }
+
     dialog.appendChild(btnRow);
+    
     overlay.appendChild(dialog);
 
     // Dismiss on backdrop click, same as Cancel
@@ -1624,6 +2633,133 @@
     });
 
     document.body.appendChild(overlay);
+  }
+  
+  // ── End call / auto-end ─────────────────────────────────────────────────────
+
+  var _dotconfEndingByMe = false;
+  var _autoEndTicker     = null;
+
+  async function _dotconfEndCall(orchestrator) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf) return;
+    _dotconfEndingByMe = true;
+    try {
+      await _cfApi('POST /' + conf.displayID + '/end?tenantId=' + _getTenantId(orchestrator), {});
+      conf.status = 'ended';
+      conf.autoEndAt = 0;
+      if (orchestrator._dotconfCallLive) await _leaveDotConf(orchestrator);
+      if (typeof orchestrator.showNotification === 'function') orchestrator.showNotification('Call ended for everyone.');
+      _dotconfRenderAutoEnd(orchestrator);
+      if (typeof orchestrator.refreshContextBar === 'function') orchestrator.refreshContextBar();
+    } catch (e) {
+      _dotconfEndingByMe = false;
+      console.error('[dotconf] end call failed:', e);
+      _showError('Could not end the call — please try again.');
+    }
+  }
+
+  function _dotconfConfirmEndCall(orchestrator) {
+    if (document.getElementById('dotconf-end-confirm-overlay')) return;
+
+    var conf   = _getCurrentDotConf(orchestrator);
+    var myId   = _getMyDotConfParticipantDisplayID(orchestrator);
+    var others = (conf?.participants || []).filter(p =>
+      p.displayID !== myId && ['joining', 'live', 'audio_only', 'listening'].includes(p.presenceState)
+    ).length;
+
+    var overlay = document.createElement('div');
+    overlay.id = 'dotconf-end-confirm-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000;padding:16px;';
+
+    var dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.style.cssText = 'background:#fff;border-radius:12px;padding:24px;width:100%;max-width:300px;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,0.25);';
+
+    var title = document.createElement('div');
+    title.textContent = 'End the call for everyone?';
+    title.style.cssText = 'font-size:16px;font-weight:600;margin-bottom:8px;color:#1a1a1a;';
+
+    var sub = document.createElement('div');
+    sub.textContent = others
+      ? others + (others === 1 ? ' participant' : ' participants') + ' will be disconnected.'
+      : 'Nobody else is in the call.';
+    sub.style.cssText = 'font-size:13px;color:#636e72;margin-bottom:20px;';
+
+    var btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:10px;';
+
+    var close = () => overlay.remove();
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.cssText = 'flex:1;padding:10px 0;border-radius:8px;border:1px solid #ddd;background:#fff;color:#333;cursor:pointer;font-size:14px;';
+    cancelBtn.onclick = close;
+
+    var endBtn = document.createElement('button');
+    endBtn.textContent = 'End call';
+    endBtn.style.cssText = 'flex:1;padding:10px 0;border-radius:8px;border:none;background:#e03131;color:#fff;cursor:pointer;font-size:14px;font-weight:600;';
+    endBtn.onclick = () => { close(); _dotconfEndCall(orchestrator); };
+
+    btnRow.append(cancelBtn, endBtn);
+    dialog.append(title, sub, btnRow);
+    overlay.appendChild(dialog);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.body.appendChild(overlay);
+  }
+
+  // Floating "No one in the call — ending in 1:45" pill, for people viewing the page.
+  function _dotconfRenderAutoEnd(orchestrator) {
+    var conf = _getCurrentDotConf(orchestrator);
+    var at   = conf && conf.status === 'live' ? (conf.autoEndAt || 0) : 0;
+    var pill = document.getElementById('dotconf-autoend-pill');
+
+    if (!at) {
+      clearInterval(_autoEndTicker);
+      _autoEndTicker = null;
+      pill?.remove();
+      return;
+    }
+
+    if (!pill) {
+      pill = document.createElement('div');
+      pill.id = 'dotconf-autoend-pill';
+      pill.setAttribute('role', 'status');
+      pill.style.cssText = 'position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:1600;display:flex;align-items:center;gap:10px;padding:8px 10px 8px 14px;background:#2d3436;color:#fff;border-radius:20px;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,0.25);max-width:calc(100vw - 32px);';
+
+      var text = document.createElement('span');
+      text.id = 'dotconf-autoend-text';
+      pill.appendChild(text);
+
+      var pillBtnCss = 'border:none;border-radius:14px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;';
+
+      if (!orchestrator._dotconfCallLive) {
+        var join = document.createElement('button');
+        join.textContent = 'Join';
+        join.style.cssText = pillBtnCss + 'background:#00b894;color:#fff;';
+        join.onclick = () => _startDotConfPreview(orchestrator);
+        pill.appendChild(join);
+      }
+      if (orchestrator.isDataOwner()) {
+        var endNow = document.createElement('button');
+        endNow.textContent = 'End now';
+        endNow.style.cssText = pillBtnCss + 'background:#fff;color:#2d3436;';
+        endNow.onclick = () => _dotconfEndCall(orchestrator);
+        pill.appendChild(endNow);
+      }
+      document.body.appendChild(pill);
+    }
+
+    var textEl = pill.querySelector('#dotconf-autoend-text');
+    function tick() {
+      var ms = at - Date.now();
+      if (ms <= 0) { textEl.textContent = 'No one in the call — ending…'; return; }
+      var s = Math.ceil(ms / 1000);
+      textEl.textContent = 'No one in the call — ending in ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    }
+    tick();
+    clearInterval(_autoEndTicker);
+    _autoEndTicker = setInterval(tick, 1000);
   }
 
   function _updateMuteBadge(orchestrator) {
@@ -1651,132 +2787,188 @@
     }
   }
   
-  var _previewAnalyser  = null;
-  var _previewLevelRaf  = null;
+  var _previewAnalyser    = null;
+  var _previewLevelRaf    = null;
+  var _previewSilentGain  = null;
 
   function _renderDotConfPreview(orchestrator, stream, name, onConfirm) {
-    document.getElementById('dotconf-preview-widget')?.remove();
+      document.getElementById('dotconf-preview-widget')?.remove();
 
-    var wrapper = document.createElement('div');
-    wrapper.id = 'dotconf-preview-widget';
-    wrapper.style.cssText = `
-      position: fixed;
-      bottom: ${SELF_VIEW_MARGIN}px;
-      right:  ${SELF_VIEW_MARGIN}px;
-      width: ${SELF_VIEW_EXPANDED_W}px;
-      z-index: 1500;
-      border-radius: 12px;
-      overflow: hidden;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.4);
-      background: #2d3436;
-    `;
+      var wrapper = document.createElement('div');
+      wrapper.id = 'dotconf-preview-widget';
+      wrapper.style.cssText = `
+        position: fixed;
+        bottom: ${SELF_VIEW_MARGIN}px;
+        right:  ${SELF_VIEW_MARGIN}px;
+        width: ${SELF_VIEW_EXPANDED_W}px;
+        z-index: 1500;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+        background: #2d3436;
+      `;
 
-    var videoWrap = document.createElement('div');
-    videoWrap.style.cssText = `
-      position: relative;
-      width: 100%;
-      aspect-ratio: 16 / 9;
-    `;
+      var videoWrap = document.createElement('div');
+      videoWrap.style.cssText = `
+        position: relative;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+      `;
 
-    var video = document.createElement('video');
-    video.autoplay    = true;
-    video.playsInline = true;
-    video.muted       = true;
-    video.srcObject   = stream;
-    video.style.cssText = `
-      width: 100%; height: 100%;
-      object-fit: cover;
-      display: block;
-      transform: scaleX(-1);
-    `;
+      var video = document.createElement('video');
+      video.autoplay    = true;
+      video.playsInline = true;
+      video.muted       = true;
+      video.srcObject   = stream;
+      video.style.cssText = `
+        width: 100%; height: 100%;
+        object-fit: cover;
+        display: block;
+        transform: scaleX(-1);
+      `;
 
-    var levelRing = document.createElement('div');
-    levelRing.style.cssText = `
-      position: absolute; inset: 0;
-      border: 3px solid rgba(255,255,255,0.15);
-      pointer-events: none;
-      transition: border-color 0.1s linear;
-      box-sizing: border-box;
-    `;
+      var barsContainer = document.createElement('div');
+      barsContainer.style.cssText = `
+        position: absolute; bottom: 10px; left: 0; right: 0;
+        display: flex; justify-content: center; align-items: flex-end;
+        gap: 4px; height: 24px; pointer-events: none;
+      `;
+      var BAR_COUNT = 4;
+      var bars = [];
+      for (var bi = 0; bi < BAR_COUNT; bi++) {
+        var bar = document.createElement('div');
+        bar.style.cssText = `
+          width: 4px; height: 4px; min-height: 4px;
+          background: rgba(255,255,255,0.9);
+          border-radius: 2px;
+          transition: height 0.05s linear;
+        `;
+        bars.push(bar);
+        barsContainer.appendChild(bar);
+      }
 
-    var hint = document.createElement('div');
-    hint.textContent = 'Say something';
-    hint.style.cssText = `
-        position: absolute; top: 6px; left: 0; right: 0;
-        text-align: center;
+      var hint = document.createElement('div');
+      hint.textContent = 'Say something';
+      hint.style.cssText = `
+          position: absolute; top: 6px; left: 0; right: 0;
+          text-align: center;
+          color: #fff; font-size: 13px; font-weight: 600;
+          text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+      `;
+
+      videoWrap.appendChild(video);
+      videoWrap.appendChild(barsContainer);
+      videoWrap.appendChild(hint);
+      
+      var closeBtn = document.createElement('button');
+      closeBtn.textContent = '✕';
+      closeBtn.setAttribute('aria-label', 'Cancel');
+      closeBtn.style.cssText = `
+        position: absolute; top: 6px; right: 8px;
+        width: 24px; height: 24px;
+        border: none; border-radius: 50%;
+        background: rgba(0,0,0,0.4);
+        color: #fff; font-size: 14px; line-height: 1;
+        cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        z-index: 13;
+      `;
+      closeBtn.addEventListener('click', () => {
+          _stopPreviewAudioMeter();
+          _stopPreviewRefreshTimer();
+          _teardownPreparedConnection();
+          _stopAllMedia();
+          wrapper.remove();
+      });
+      videoWrap.appendChild(closeBtn);
+
+      var ctaBtn = document.createElement('button');
+      ctaBtn.textContent = 'Looks good, take me to the call';
+      ctaBtn.style.cssText = `
+        display: block;
+        width: 100%;
+        padding: 10px 0;
+        border: none;
+        background: #4c6ef5;
         color: #fff; font-size: 13px; font-weight: 600;
-        text-shadow: 0 1px 4px rgba(0,0,0,0.8);
-    `;
+        cursor: pointer;
+      `;
+      ctaBtn.addEventListener('click', () => {
+          _pendingSnap = _dotconfCaptureFrame(video);
+          _stopPreviewAudioMeter();
+          _stopPreviewRefreshTimer();
+          ctaBtn.textContent = 'Connecting…';
+          ctaBtn.disabled = true;
+          ctaBtn.style.opacity = '0.7';
+          onConfirm();
+      });
 
-    videoWrap.appendChild(video);
-    videoWrap.appendChild(levelRing);
-    videoWrap.appendChild(hint);
+      wrapper.appendChild(videoWrap);
+      wrapper.appendChild(ctaBtn);
+      document.body.appendChild(wrapper);
 
-    var ctaBtn = document.createElement('button');
-    ctaBtn.textContent = 'Looks good, take me to the call';
-    ctaBtn.style.cssText = `
-      display: block;
-      width: 100%;
-      padding: 10px 0;
-      border: none;
-      background: #4c6ef5;
-      color: #fff; font-size: 13px; font-weight: 600;
-      cursor: pointer;
-    `;
-    ctaBtn.addEventListener('click', () => {
-        _stopPreviewAudioMeter();
-        _stopPreviewRefreshTimer();
-        ctaBtn.textContent = 'Connecting…';
-        ctaBtn.disabled = true;
-        ctaBtn.style.opacity = '0.7';
-        onConfirm();
-    });
-
-    wrapper.appendChild(videoWrap);
-    wrapper.appendChild(ctaBtn);
-    document.body.appendChild(wrapper);
-
-    _startPreviewAudioMeter(stream, levelRing);
+      _startPreviewAudioMeter(stream, bars);
   }
 
-  function _startPreviewAudioMeter(stream, levelRing) {
-    var audioTrack = stream.getAudioTracks()[0];
-    if (!audioTrack) return;
+  function _startPreviewAudioMeter(stream, bars) {
+      var audioTrack = stream.getAudioTracks()[0];
+      if (!audioTrack) return;
 
-    if (!_audioCtx) _audioCtx = new AudioContext();
-    var source   = _audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
-    var analyser = _audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
-    _previewAnalyser = analyser;
-
-    var buf = new Uint8Array(64);
-    function tick() {
-      analyser.getByteTimeDomainData(buf);
-      var sumSq = 0;
-      for (var i = 0; i < buf.length; i++) {
-        var v = (buf[i] - 128) / 128;
-        sumSq += v * v;
+      if (!_audioCtx || _audioCtx.state === 'closed') {
+        _audioCtx = new AudioContext();
       }
-      var rms = Math.sqrt(sumSq / buf.length);
-      var level = Math.min(1, rms * 5); // slightly hotter gain than before
+      if (_audioCtx.state === 'suspended') {
+        _audioCtx.resume().catch(function(e) {
+          console.warn('[dotconf] AudioContext resume failed:', e);
+        });
+      }
 
-      // More obvious: thicker border + brighter color + a visible glow,
-      // not just a subtle opacity shift.
-      var thickness = 3 + level * 9;         // 3px idle → up to 12px when loud
-      var glow      = level * 24;            // up to 24px glow radius
-      levelRing.style.borderWidth = thickness + 'px';
-      levelRing.style.borderColor = `rgba(64, 219, 110, ${0.3 + level * 0.7})`;
-      levelRing.style.boxShadow   = `0 0 ${glow}px rgba(64, 219, 110, ${level * 0.8})`;
+      var source   = _audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+      var analyser = _audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      source.connect(analyser);
 
-      _previewLevelRaf = requestAnimationFrame(tick);
-    }
-    tick();
+      // Analyser must have a path to destination or some browsers never
+      // actually pull audio through it — route through a silent gain node
+      // so we don't hear ourselves, but the graph still processes.
+      var silentGain = _audioCtx.createGain();
+      silentGain.gain.value = 0;
+      analyser.connect(silentGain);
+      silentGain.connect(_audioCtx.destination);
+
+      _previewAnalyser = analyser;
+      _previewSilentGain = silentGain; // stash so _stopPreviewAudioMeter can disconnect it
+
+      var freqData = new Uint8Array(analyser.frequencyBinCount);
+      var BAR_COUNT = bars.length;
+      var MAX_BAR_HEIGHT = 24;
+
+      function tick() {
+        analyser.getByteFrequencyData(freqData);
+       // console.log('[diag] audioCtx.state:', _audioCtx.state, 'freqData:', Array.from(freqData.slice(0, 8)));
+
+        var binsPerBar = Math.floor(freqData.length / BAR_COUNT);
+        for (var b = 0; b < BAR_COUNT; b++) {
+          var sum = 0;
+          for (var i = 0; i < binsPerBar; i++) {
+            sum += freqData[b * binsPerBar + i];
+          }
+          var avg = sum / binsPerBar;
+          var level = Math.min(1, (avg / 255) * 3);
+          var height = 4 + level * MAX_BAR_HEIGHT;
+          bars[b].style.height = height + 'px';
+          bars[b].style.opacity = (0.5 + level * 0.5).toFixed(2);
+        }
+
+        _previewLevelRaf = requestAnimationFrame(tick);
+      }
+      tick();
   }
 
   function _stopPreviewAudioMeter() {
-    if (_previewLevelRaf) { cancelAnimationFrame(_previewLevelRaf); _previewLevelRaf = null; }
-    _previewAnalyser = null;
+      if (_previewLevelRaf) { cancelAnimationFrame(_previewLevelRaf); _previewLevelRaf = null; }
+      if (_previewSilentGain) { _previewSilentGain.disconnect(); _previewSilentGain = null; }
+      _previewAnalyser = null;
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1879,11 +3071,11 @@
   // ─────────────────────────────────────────────────────────────────────────────
 
   function _getTenantId(orchestrator) {
-    // tenantId is currentPath[0].displayID — the host's displayID in the URL
-    // This is the raw (un-hashed) value the server needs to varruct paths
-    return orchestrator.currentPath?.[0]?.displayID || null;
-  }
-
+      // tenantId is currentPath[0].id — the host's real (un-hashed) UUID,
+      // which is what the server's NewAuthUtils.isRealUuid() check requires.
+      return orchestrator.currentPath?.[0]?.id || null;
+    }
+    
   function _getCurrentDotConf(orchestrator) {
       var path  = orchestrator.currentPath;
       var items = orchestrator.data && orchestrator.data.items;
@@ -2011,7 +3203,7 @@
         var origSubmit = form.onsubmit;
         form.onsubmit = async function(e) {
           if (origSubmit) await origSubmit.call(this, e);
-          await _sendParticipantInviteEmail(orchestrator);
+         // await _sendParticipantInviteEmail(orchestrator);
         };
       }, 150);
     });
@@ -2027,7 +3219,7 @@
 
       if (!newest?.contactemail) return;
 
-      var confUrl    = orchestrator.getAppUrl(orchestrator.currentPath);
+      var confUrl = _dotconfGuestUrl(orchestrator);
       var parentName = orchestrator.currentPath[0]?.shortName
         || orchestrator.currentPath[0]?.displayID
         || 'Conference host';
@@ -2197,7 +3389,8 @@
     // Only match against unjoined participants — already live/left are identified
     var candidates = conf.participants.filter(p =>
       p.presenceState === PRESENCE_STATE.INVITED ||
-      p.presenceState === PRESENCE_STATE.VIEWED
+      p.presenceState === PRESENCE_STATE.VIEWED ||
+      p.presenceState === PRESENCE_STATE.LEFT
     );
 
     return candidates
@@ -2640,8 +3833,8 @@
   var TILE_ASPECT        = 16 / 9;
   var NOISE_FLOOR        = 0.08;
   var MORPH_HYSTERESIS   = 0.38;
-  var HOST_CENTER_RADIUS = 80;
-  var HOST_MIN_RECT_W    = 0.15;
+  var HOST_CENTER_RADIUS = 135;
+  var HOST_MIN_RECT_W    = 0.35;
   var MAX_RECTS          = 4;
   var MAX_FEED_DOTS      = 2;
   var FEED_DOT_SIZE      = 0.22;
@@ -2810,22 +4003,7 @@
   // generateDotPositions override — conf depth 2
   // ─────────────────────────────────────────────────────────────────────────────
 
- function _dotconfGeneratePositions(items, entityType, margin, orchestrator, originalFn) {
-    // Host never gets a presence dot from the base renderer, live call or
-    // not — their own representation is handled entirely by _tickLayout's
-    // isHost branch once live (center tile). Strip them from items
-    // unconditionally, not just during the live-call override path below.
-    if (orchestrator.currentApp?.id === 'conf' &&
-        orchestrator.currentPath?.length === 2 &&
-        entityType === 'participant') {
-      var hostDisplayID = _getHostDisplayID(orchestrator);
-      items = items.filter(function(p) { return p.displayID !== hostDisplayID; });
-    }
-
-    if (!orchestrator._dotconfCallLive) {
-        return originalFn(items, entityType, margin);
-      }
-
+  function _dotconfGeneratePositions(items, entityType, margin, orchestrator, originalFn) {
     if (orchestrator.currentApp?.id !== 'conf' ||
         orchestrator.currentPath?.length !== 2 ||
         entityType !== 'participant') {
@@ -2833,56 +4011,74 @@
     }
 
     var canvas = document.getElementById('canvas-area');
-    if (!canvas) return originalFn(items, entityType, margin);
+    if (!canvas || !items || !items.length) return originalFn(items, entityType, margin);
 
-    var W = canvas.offsetWidth;
-    var H = canvas.offsetHeight;
+    var W  = canvas.offsetWidth  || 800;
+    var H  = canvas.offsetHeight || 600;
+    var cx = W / 2, cy = H / 2;
+    var m  = Math.max(margin || 0, 40);
 
     var hostDisplayID = _getHostDisplayID(orchestrator);
-    var hostIndex     = items.findIndex(p => p.displayID === hostDisplayID);
+    // Keep the centre clear: the host's tile during a call, the "+" button before one.
+    var hostP = items.find(it => it.displayID === hostDisplayID);
+    var hostPreview = !orchestrator._dotconfCallLive && hostP &&
+      (hostP.presenceState === 'live' || hostP.presenceState === 'audio_only') &&
+      _dotconfIsViewer(orchestrator) && hostDisplayID !== _getMyDotConfParticipantDisplayID(orchestrator);
+    var shorter = Math.min(W, H);
+    // Clear centre for: the host's tile in a call, the host's preview tile, or just the "+" button.
+    var keepOut = orchestrator._dotconfCallLive ? HOST_CENTER_RADIUS : (hostPreview ? shorter * 0.26 : 80);
+    var rx = Math.max(keepOut + 20, cx - m);
+    var ry = Math.max(keepOut + 20, cy - m);
 
-    // FNV32 — same as the original generateDotPositions for stable positions
-    var fnv32 = (str, seed = 0x811c9dc5) => {
-      let h = seed;
-      for (let i = 0; i < str.length; i++) {
-        h ^= str.charCodeAt(i);
-        h = (h * 0x01000193) >>> 0;
-      }
+
+    var hash = function(s) {
+      var h = 0x811c9dc5;
+      for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
       return h;
     };
+    var keyOf = (it, i) => String(it.displayID || it.ID || it.name || ('item_' + i));
 
-    var positions = items.map((item, i) => {
-      // Host → canvas center
-      if (i === hostIndex) {
-        return { x: W / 2, y: H / 2, _isHost: true };
-      }
-
-      // Everyone else → stable hash position, same as original
-      var seed     = item.ID || item.displayID || item.name || `item_${i}`;
-      var indexMix = (i * 2654435761) >>> 0;
-      var hx       = fnv32(seed, (0x811c9dc5 ^ indexMix) >>> 0);
-      var hy       = fnv32(seed, (0x33333333 ^ indexMix) >>> 0);
-
-      // Keep away from center — host is there
-      // Use the annular region: margin..edge but avoid center 150px
-      let x = margin + (hx / 0xFFFFFFFF) * (W - margin * 2);
-      let y = margin + (hy / 0xFFFFFFFF) * (H - margin * 2);
-
-      // Nudge away from center if too close
-      var dx   = x - W / 2;
-      var dy   = y - H / 2;
-      var dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < 150) {
-        var scale = 150 / (dist || 1);
-        x = W / 2 + dx * scale;
-        y = H / 2 + dy * scale;
-      }
-
-      return { x, y, _isHost: false };
+    // Inner band: everyone who isn't gone. Outer band: people who have left.
+    var inner = [], outer = [];
+    items.forEach((it, i) => {
+      if (it.displayID === hostDisplayID) return;
+      (it.presenceState === 'left' ? outer : inner).push(i);
     });
+    var byHash = (a, b) => hash(keyOf(items[a], a)) - hash(keyOf(items[b], b));
+    inner.sort(byHash);
+    outer.sort(byHash);
 
+    var positions = new Array(items.length);
+    var GOLDEN = Math.PI * (3 - Math.sqrt(5)); // ~137.5°: successive points never line up
+
+    // Sunflower spiral within the annulus band [t0, t1] (0 = edge of keep-out, 1 = canvas edge).
+    function place(list, t0, t1, rotation) {
+      var n = list.length;
+      list.forEach((idx, k) => {
+        var t = Math.sqrt(t0 * t0 + (t1 * t1 - t0 * t0) * (k + 0.5) / n); // area-uniform
+        var a = rotation + k * GOLDEN;
+        positions[idx] = {
+          x: cx + Math.cos(a) * (keepOut + t * (rx - keepOut)),
+          y: cy + Math.sin(a) * (keepOut + t * (ry - keepOut)),
+          _isHost: false
+        };
+      });
+    }
+
+    if (inner.length && outer.length) {
+      place(inner, 0,    0.6, 0);
+      place(outer, 0.75, 1,   Math.PI / 7); // offset so the two bands don't share spokes
+    } else {
+      place(inner.length ? inner : outer, 0, 1, 0);
+    }
+
+    // Host (and anything unplaced) → centre, keeping the array aligned with items.
+    items.forEach((it, i) => {
+      if (!positions[i]) positions[i] = { x: cx, y: cy, _isHost: it.displayID === hostDisplayID };
+    });
     return positions;
   }
+  
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Video tile helpers
@@ -2916,6 +4112,8 @@
         tileEl.setAttribute('data-displayid', displayID);
         tileEl.appendChild(video);
       }
+      
+      _dotconfEnsureTileLabel(tileEl, displayID, orchestrator);
 
       // Only touch srcObject if the underlying TRACK changed — not on every
       // resize tick. Comparing the track itself (not a freshly-wrapped
@@ -2933,6 +4131,586 @@
   function _removeTileVideo(tileEl) {
     var video = tileEl.querySelector('video.dotconf-tile-video');
     if (video) { video.srcObject = null; video.remove(); }
+    
+    tileEl.querySelector('.dotconf-tile-name')?.remove();
+    tileEl.querySelector('.dotconf-tile-actions')?.remove();
+  }
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Hover: info card on dots, name label + host actions on video tiles,
+  // and mic/camera state shared with everyone.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  var _mediaState      = {};   // participantDisplayID → { micMuted, cameraOff }
+  var _hoverCardEl     = null;
+  var _hoverCardPid    = null;
+  var _hoverHideTimer  = null;
+  var DOTCONF_IN_CALL  = ['joining', 'live', 'audio_only', 'listening'];
+
+  function _dotconfReportMedia(orchestrator) {
+    if (_cachedMyId) {
+      _mediaState[_cachedMyId] = { micMuted: !!_micMuted, cameraOff: !!_cameraOff };
+      _dotconfRefreshTileLabel(_cachedMyId);
+    }
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !_mySessionId) return;
+    _cfApi('POST /' + conf.displayID + '/participant/media?tenantId=' + _getTenantId(orchestrator),
+      { sessionId: _mySessionId, micMuted: !!_micMuted, cameraOff: !!_cameraOff })
+      .catch(e => console.warn('[dotconf] media state update failed:', e));
+      
+    _dotconfUploadSnapshot(orchestrator);     // fresh frame on camera-on, clears it on camera-off
+  }
+
+  // ── Status text ───────────────────────────────────────────────────────────────
+
+  function _dotconfAgo(ts) {
+    var s = Math.max(0, (Date.now() - ts) / 1000);
+    if (s < 60) return 'just now';
+    var m = Math.floor(s / 60); if (m < 60) return m + ' min ago';
+    var h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  }
+
+  function _dotconfDuration(ts) {
+    var m = Math.max(0, Math.floor((Date.now() - ts) / 60000));
+    return m < 60 ? m + ' min' : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  }
+
+  function _dotconfStatusText(p) {
+    switch (p.presenceState) {
+      case 'added':   return 'Not invited yet';
+      case 'invited': return 'Invited' + (p.invitedAt ? ' ' + _dotconfAgo(p.invitedAt) : '');
+      case 'viewed':  return 'Opened the link' + (p.viewedAt ? ' ' + _dotconfAgo(p.viewedAt) : '');
+      case 'joining': return 'Joining…';
+      case 'live': case 'audio_only': case 'listening':
+        return 'In the call' + (p.joinedAt ? ' · ' + _dotconfDuration(p.joinedAt) : '');
+      case 'left':
+        return 'Left' + (p.leftAt ? ' at ' + new Date(p.leftAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '');
+      default: return '';
+    }
+  }
+
+  // ── Entry point (called by the orchestrator's hover listener) ────────────────
+
+  function _dotconfOnDotHover(orchestrator, dot, item) {
+    if (!dot || !item || !item.displayID) return;
+    if (!dot.matches(':hover')) return; // pointer already left during the hover delay
+    var isTile = dot.dataset.morphed === 'true' || dot.dataset.tier === 'feedDot';
+    if (isTile) _dotconfShowTileActions(orchestrator, dot, item.displayID);
+    else        _dotconfShowCard(orchestrator, dot, item.displayID);
+  }
+
+  // ── Card on presence dots ─────────────────────────────────────────────────────
+
+  function _dotconfShowCard(orchestrator, dot, pid) {
+    var conf = _getCurrentDotConf(orchestrator);
+    var p = (conf?.participants || []).find(x => x.displayID === pid);
+    if (!p) return;
+    _dotconfHideCard();
+
+    var isMe   = pid === _getMyDotConfParticipantDisplayID(orchestrator);
+    var inCall = DOTCONF_IN_CALL.includes(p.presenceState);
+    var media  = _mediaState[pid] || {};
+
+    var card = document.createElement('div');
+    card.id = 'dotconf-hover-card';
+    card.setAttribute('role', 'tooltip');
+    card.style.cssText = 'position:fixed;z-index:1200;min-width:180px;max-width:260px;background:#fff;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,0.18);padding:10px 12px;font-size:13px;color:#2d3436;';
+
+    var head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:6px;';
+    var nameEl = document.createElement('div');
+    nameEl.textContent = (p.name || 'Unnamed') + (isMe ? ' (You)' : '');
+    nameEl.style.cssText = 'font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    head.appendChild(nameEl);
+    if (p.isHost) {
+      var chip = document.createElement('span');
+      chip.textContent = 'Host';
+      chip.style.cssText = 'font-size:10px;font-weight:700;padding:2px 6px;border-radius:8px;background:#eef2ff;color:#4c6ef5;';
+      head.appendChild(chip);
+    }
+    card.appendChild(head);
+
+    var status = document.createElement('div');
+    status.textContent = _dotconfStatusText(p);
+    status.style.cssText = 'margin-top:3px;font-size:12px;color:#636e72;';
+    card.appendChild(status);
+
+    if (inCall && (media.micMuted || media.cameraOff)) {
+      var m = document.createElement('div');
+      m.textContent = [media.micMuted ? '🔇 Muted' : '', media.cameraOff ? '📷 Camera off' : ''].filter(Boolean).join(' · ');
+      m.style.cssText = 'margin-top:4px;font-size:12px;color:#2d3436;';
+      card.appendChild(m);
+    }
+
+    if (orchestrator.isDataOwner() && !p.isHost && !isMe) {
+      var actions = document.createElement('div');
+      actions.style.cssText = 'display:flex;gap:6px;margin-top:10px;';
+      if (inCall && orchestrator._dotconfCallLive) {
+        actions.appendChild(_dotconfCardButton('Pin', false, () => {
+          _dotconfHideCard();
+          _dotconfPinParticipant(orchestrator, pid);
+        }));
+      }
+      actions.appendChild(_dotconfCardButton('Remove', true, () => {
+        _dotconfHideCard();
+        _dotconfConfirmRemove(orchestrator, p);
+      }));
+      card.appendChild(actions);
+    }
+
+    document.body.appendChild(card);
+    _dotconfPositionCard(card, dot);
+    _hoverCardEl = card;
+    _hoverCardPid = pid;
+
+    card.addEventListener('mouseenter', () => clearTimeout(_hoverHideTimer));
+    card.addEventListener('mouseleave', _dotconfScheduleHide);
+    if (!dot.dataset.dotconfHoverOut) {
+      dot.dataset.dotconfHoverOut = '1';
+      dot.addEventListener('mouseleave', _dotconfScheduleHide);
+    }
+    setTimeout(() => document.addEventListener('pointerdown', _dotconfOutsideTap), 0);
+  }
+
+  function _dotconfCardButton(label, danger, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.style.cssText = 'flex:1;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;' +
+      (danger ? 'border:1px solid #ffc9c9;background:#fff5f5;color:#e03131;'
+              : 'border:1px solid #dfe6e9;background:#fff;color:#2d3436;');
+    b.addEventListener('click', e => { e.stopPropagation(); onClick(); });
+    return b;
+  }
+
+  function _dotconfPositionCard(card, dot) {
+    var r = dot.getBoundingClientRect();
+    var cw = card.offsetWidth, ch = card.offsetHeight, pad = 8;
+    var left = r.right + 10;
+    if (left + cw > window.innerWidth - pad) left = r.left - cw - 10;
+    left = Math.max(pad, Math.min(window.innerWidth - cw - pad, left));
+    var top = r.top + r.height / 2 - ch / 2;
+    top = Math.max(pad, Math.min(window.innerHeight - ch - pad, top));
+    card.style.left = left + 'px';
+    card.style.top  = top + 'px';
+  }
+
+  function _dotconfScheduleHide() {
+    clearTimeout(_hoverHideTimer);
+    _hoverHideTimer = setTimeout(_dotconfHideCard, 200); // time to move the pointer into the card
+  }
+
+  function _dotconfOutsideTap(e) {
+    if (_hoverCardEl && !_hoverCardEl.contains(e.target)) _dotconfHideCard();
+  }
+
+  function _dotconfHideCard() {
+    clearTimeout(_hoverHideTimer);
+    document.removeEventListener('pointerdown', _dotconfOutsideTap);
+    if (_hoverCardEl) { _hoverCardEl.remove(); _hoverCardEl = null; _hoverCardPid = null; }
+  }
+
+  function _dotconfRefreshCard(orchestrator, pid) {
+    if (!_hoverCardEl || _hoverCardPid !== pid) return;
+    var dot = _getDotElement(pid);
+    if (dot && dot.matches(':hover')) _dotconfShowCard(orchestrator, dot, pid);
+  }
+
+  // ── Video tiles: name label + host actions ────────────────────────────────────
+
+  function _dotconfEnsureTileLabel(tileEl, pid, orchestrator) {
+    var label = tileEl.querySelector('.dotconf-tile-name');
+    if (!label) {
+      label = document.createElement('div');
+      label.className = 'dotconf-tile-name';
+      tileEl.appendChild(label);
+    }
+    var isFeedDot = tileEl.dataset.tier === 'feedDot';
+    label.style.cssText = 'position:absolute;bottom:6px;z-index:2;max-width:calc(100% - 12px);padding:2px 8px;border-radius:10px;background:rgba(0,0,0,0.55);color:#fff;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;' +
+      (isFeedDot ? 'left:50%;transform:translateX(-50%);' : 'left:6px;');
+    label.dataset.pid  = pid;
+    label.dataset.name = _dotconfNameOf(orchestrator, pid) +
+      (pid === _getMyDotConfParticipantDisplayID(orchestrator) ? ' (You)' : '');
+    _dotconfPaintLabel(label);
+  }
+
+  function _dotconfPaintLabel(label) {
+    var m = _mediaState[label.dataset.pid] || {};
+    label.textContent = (m.micMuted ? '🔇 ' : '') + label.dataset.name;
+  }
+
+  function _dotconfRefreshTileLabel(pid) {
+    if (!pid) return;
+    var tile = _getDotElement(pid);
+    var label = tile && tile.querySelector('.dotconf-tile-name');
+    if (label) _dotconfPaintLabel(label);
+  }
+
+  function _dotconfShowTileActions(orchestrator, tile, pid) {
+    if (!orchestrator.isDataOwner()) return;
+    if (pid === _getMyDotConfParticipantDisplayID(orchestrator)) return;
+    var conf = _getCurrentDotConf(orchestrator);
+    var p = (conf?.participants || []).find(x => x.displayID === pid);
+    if (!p || p.isHost || tile.querySelector('.dotconf-tile-actions')) return;
+
+    var box = document.createElement('div');
+    box.className = 'dotconf-tile-actions';
+    box.style.cssText = 'position:absolute;top:6px;right:6px;z-index:3;display:flex;gap:4px;';
+    box.appendChild(_dotconfTileIconBtn('Pin ' + (p.name || ''),
+      '<path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z"/>',
+      () => _dotconfPinParticipant(orchestrator, pid)));
+    box.appendChild(_dotconfTileIconBtn('Remove ' + (p.name || ''),
+      '<path d="M18 6 6 18M6 6l12 12"/>',
+      () => _dotconfConfirmRemove(orchestrator, p)));
+    tile.appendChild(box);
+
+    if (!tile.dataset.dotconfActionsOut) {
+      tile.dataset.dotconfActionsOut = '1';
+      tile.addEventListener('mouseleave', () => tile.querySelector('.dotconf-tile-actions')?.remove());
+    }
+  }
+
+  function _dotconfTileIconBtn(label, paths, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.title = label;
+    b.setAttribute('aria-label', label);
+    b.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + paths + '</svg>';
+    b.style.cssText = 'width:26px;height:26px;border-radius:50%;border:none;background:rgba(0,0,0,0.55);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;';
+    b.addEventListener('click', e => { e.stopPropagation(); onClick(); });
+    return b;
+  }
+
+  // ── Remove participant ────────────────────────────────────────────────────────
+
+  function _dotconfConfirmRemove(orchestrator, p) {
+    if (document.getElementById('dotconf-remove-confirm')) return;
+    var inCall = DOTCONF_IN_CALL.includes(p.presenceState);
+
+    var overlay = document.createElement('div');
+    overlay.id = 'dotconf-remove-confirm';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:2000;padding:16px;';
+    var dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.style.cssText = 'background:#fff;border-radius:12px;padding:24px;width:100%;max-width:300px;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,0.25);';
+
+    var title = document.createElement('div');
+    title.textContent = 'Remove ' + (p.name || 'this participant') + '?';
+    title.style.cssText = 'font-size:16px;font-weight:600;margin-bottom:8px;color:#1a1a1a;';
+    var sub = document.createElement('div');
+    sub.textContent = inCall
+      ? "They'll be disconnected from the call and removed from this conference."
+      : "They'll be removed from this conference and won't be able to join with this link.";
+    sub.style.cssText = 'font-size:13px;color:#636e72;margin-bottom:20px;line-height:1.4;';
+
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:10px;';
+    var close = () => overlay.remove();
+    var cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText = 'flex:1;padding:10px 0;border-radius:8px;border:1px solid #ddd;background:#fff;color:#333;cursor:pointer;font-size:14px;';
+    cancel.onclick = close;
+    var go = document.createElement('button');
+    go.textContent = 'Remove';
+    go.style.cssText = 'flex:1;padding:10px 0;border-radius:8px;border:none;background:#e03131;color:#fff;cursor:pointer;font-size:14px;font-weight:600;';
+    go.onclick = async () => {
+      go.disabled = true;
+      try {
+        var conf = _getCurrentDotConf(orchestrator);
+        await _cfApi('POST /' + conf.displayID + '/participant/remove?tenantId=' + _getTenantId(orchestrator),
+          { participantDisplayID: p.displayID });
+        close();
+        _dotconfHandleRemoved(orchestrator, p.displayID); // SSE echo will also arrive; handler is idempotent
+      } catch (e) {
+        console.error('[dotconf] remove participant failed:', e);
+        _showError('Could not remove participant — please try again.');
+        go.disabled = false;
+      }
+    };
+    row.append(cancel, go);
+    dialog.append(title, sub, row);
+    overlay.appendChild(dialog);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    document.body.appendChild(overlay);
+  }
+
+  function _dotconfHandleRemoved(orchestrator, pid) {
+    var conf = _getCurrentDotConf(orchestrator);
+    var isMe = pid === _getMyDotConfParticipantDisplayID(orchestrator);
+
+    if (conf && Array.isArray(conf.participants)) {
+      var i = conf.participants.findIndex(p => p.displayID === pid);
+      if (i !== -1) conf.participants.splice(i, 1);
+    }
+    delete _roster[pid];
+    delete _mediaState[pid];
+    if (_hoverCardPid === pid) _dotconfHideCard();
+    var dot = _getDotElement(pid);
+    if (dot) { dot.remove(); _dotElCache.delete(pid); }
+
+    if (isMe) {
+      if (orchestrator._dotconfCallLive) _leaveDotConf(orchestrator);
+      try {
+        var contexts = JSON.parse(localStorage.getItem('savedContexts') || '{}');
+        delete contexts['dotconf_participant_' + (conf && conf.displayID)];
+        localStorage.setItem('savedContexts', JSON.stringify(contexts));
+      } catch (_) {}
+      if (typeof orchestrator.showNotification === 'function') {
+        orchestrator.showNotification('The host removed you from this conference.');
+      }
+    }
+  }
+  
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Live preview for people viewing the page before joining: each person in the
+  // call uploads a tiny frame every 30s; viewers see it blurred under TV static.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  var SNAP_UPLOAD_MS     = 30000;
+  var SNAP_W = 96, SNAP_H = 54;            // privacy by resolution — can't be sharpened back
+  var _snapUploadTimer   = null;
+  var _snapInputHandler = null; // pointerdown listener that captures a snapshot during user input
+  var _lastSnapAt = 0;          // time of the last successful capture, for the 25 s cap
+  var _pendingSnap = null;      // frame captured in the Join click, uploaded once the call is live
+  var _snapCanvas        = null;
+  var _snapVideoEl       = null;
+  var _previewSnaps      = {};             // participantDisplayID → object URL
+  var _previewFetchedAt  = {};
+
+  // ── Upload side (people in the call) ──────────────────────────────────────────
+
+  function _dotconfStartSnapshotUploads(orchestrator) {
+    _dotconfStopSnapshotUploads();
+    if (_pendingSnap) {
+      _dotconfUploadSnapshot(orchestrator, _pendingSnap);
+      _pendingSnap = null;
+    } else {
+      setTimeout(() => _dotconfUploadSnapshot(orchestrator), 1500);
+    }
+    // Timer works in most browsers; strict canvas protection blocks it, so also capture on clicks.
+    _snapUploadTimer = setInterval(() => _dotconfUploadSnapshot(orchestrator), SNAP_UPLOAD_MS);
+    _snapInputHandler = () => {
+      if (Date.now() - _lastSnapAt > 25000) _dotconfUploadSnapshot(orchestrator);
+    };
+    document.addEventListener('pointerdown', _snapInputHandler, true);
+  }
+
+  function _dotconfStopSnapshotUploads() {
+    clearInterval(_snapUploadTimer);
+    _snapUploadTimer = null;
+    if (_snapVideoEl) { _snapVideoEl.srcObject = null; _snapVideoEl.remove(); _snapVideoEl = null; }
+    if (_snapInputHandler) { document.removeEventListener('pointerdown', _snapInputHandler, true); _snapInputHandler = null; }
+  }
+
+  function _dotconfSnapVideo() {
+    if (!_snapVideoEl) {
+      _snapVideoEl = document.createElement('video');
+      _snapVideoEl.muted = true;
+      _snapVideoEl.playsInline = true;
+      _snapVideoEl.autoplay = true;
+      _snapVideoEl.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;';
+      document.body.appendChild(_snapVideoEl); // attached, so every browser keeps decoding frames
+    }
+    if (_snapVideoEl.srcObject !== _localStream) {
+      _snapVideoEl.srcObject = _localStream;
+      _snapVideoEl.play().catch(() => {});
+    }
+    return _snapVideoEl;
+  }
+
+  var _pendingSnap = null; // captured during the Join click, uploaded once the call is up
+
+  // Returns a JPEG data URL, or null if the frame isn't ready or the canvas read was blocked.
+  function _dotconfCaptureFrame(videoEl) {
+    if (!videoEl || videoEl.readyState < 2) return null;
+    if (!_snapCanvas) {
+      _snapCanvas = document.createElement('canvas');
+      _snapCanvas.width = SNAP_W;
+      _snapCanvas.height = SNAP_H;
+    }
+    try {
+      _snapCanvas.getContext('2d').drawImage(videoEl, 0, 0, SNAP_W, SNAP_H);
+      var data = _snapCanvas.toDataURL('image/jpeg', 0.6);
+      return data && data.length >= 1500 ? data : null; // a blocked/blank canvas encodes to a tiny uniform JPEG
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function _dotconfUploadSnapshot(orchestrator, preCaptured) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !_mySessionId || !orchestrator._dotconfCallLive) return;
+    var url   = 'POST /' + conf.displayID + '/participant/snapshot?tenantId=' + _getTenantId(orchestrator);
+    var track = _localStream && _localStream.getVideoTracks()[0];
+
+    if (_cameraOff || !track || track.readyState !== 'live') {
+      _cfApi(url, { sessionId: _mySessionId, clear: true }).catch(() => {});
+      return;
+    }
+    var data = preCaptured || _dotconfCaptureFrame(_dotconfSnapVideo());
+    if (!data) return;
+    _lastSnapAt = Date.now();
+    _cfApi(url, { sessionId: _mySessionId, image: data })
+      .catch(e => console.warn('[dotconf] snapshot upload failed:', e));
+  }
+
+  // ── Viewer side (on the page, not in the call) ───────────────────────────────
+
+  function _dotconfIsViewer(orchestrator) {
+    if (orchestrator._dotconfCallLive) return false;
+    return orchestrator.isDataOwner() ||
+      (typeof orchestrator.dotconfIsIdentified === 'function' && orchestrator.dotconfIsIdentified(orchestrator));
+  }
+
+  async function _dotconfFetchSnapshot(orchestrator, pid) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf) return;
+    _previewFetchedAt[pid] = Date.now();
+    var myId = _getMyDotConfParticipantDisplayID(orchestrator);
+    var qs = 'tenantId=' + encodeURIComponent(_getTenantId(orchestrator)) +
+             (myId ? '&viewer=' + encodeURIComponent(myId) : '');
+    try {
+      var resp = await fetch('/newauth/api/conf/' + conf.displayID + '/participant/' + pid + '/snapshot?' + qs,
+                             { credentials: 'same-origin', cache: 'no-store' });
+      if (resp.status === 404) { _dotconfDropSnapshot(pid); _dotconfRenderPreviews(orchestrator); return; }
+      if (!resp.ok) return;
+      var blob = await resp.blob();
+      if (_previewSnaps[pid]) URL.revokeObjectURL(_previewSnaps[pid]);
+      _previewSnaps[pid] = URL.createObjectURL(blob);
+      _dotconfRenderPreviews(orchestrator);
+    } catch (e) {
+      console.warn('[dotconf] snapshot fetch failed for', pid, e);
+    }
+  }
+
+  function _dotconfDropSnapshot(pid) {
+    if (_previewSnaps[pid]) URL.revokeObjectURL(_previewSnaps[pid]);
+    delete _previewSnaps[pid];
+  }
+
+  function _dotconfRenderPreviews(orchestrator) {
+    if (orchestrator._dotconfCallLive || !_dotconfIsViewer(orchestrator)) { _dotconfClearAllPreviews(); return; }
+    _dotconfEnsureTvStyle();
+    var conf   = _getCurrentDotConf(orchestrator);
+    var canvas = document.getElementById('canvas-area');
+    if (!conf || !canvas) return;
+
+    var viewer  = _dotconfIsViewer(orchestrator);
+    var myId    = _getMyDotConfParticipantDisplayID(orchestrator);
+    var hostId  = _getHostDisplayID(orchestrator);
+    var shorter = Math.min(canvas.offsetWidth || 800, canvas.offsetHeight || 600);
+    
+    function _dotconfPlaceAt(dot, w, h, cx, cy) {
+      dot.style.width  = w + 'px';
+      dot.style.height = h + 'px';
+      dot.style.left   = (cx - w / 2) + 'px';
+      dot.style.top    = (cy - h / 2) + 'px';
+    }
+
+    (conf.participants || []).forEach(p => {
+      var dot = _getDotElement(p.displayID);
+      if (!dot) return;
+      var live = p.presenceState === 'live' || p.presenceState === 'audio_only';
+      if (!viewer || !live || p.displayID === myId) { _dotconfClearPreview(dot); return; }
+
+      // First look (page load, or just left the call): fetch, throttled.
+      if (!_previewSnaps[p.displayID] && Date.now() - (_previewFetchedAt[p.displayID] || 0) > 25000) {
+        _dotconfFetchSnapshot(orchestrator, p.displayID);
+      }
+
+      var isHost = p.displayID === hostId;
+      var w = Math.round(shorter * (isHost ? 0.42 : 0.13));
+      var h = isHost ? Math.round(w * 9 / 16) : w;
+      if (isHost) _dotconfPlaceAt(dot, w, h, canvas.offsetWidth / 2, canvas.offsetHeight / 2);
+      else        _dotconfResizeKeepCenter(dot, w, h);
+
+      dot.classList.add('dotconf-preview');
+      dot.style.setProperty('border-radius', isHost ? '14px' : '50%', 'important');
+      dot.style.setProperty('background', '#1e272e', 'important');
+      dot.style.setProperty('border', 'none', 'important');
+      dot.style.setProperty('opacity', '0.92', 'important');
+      dot.style.setProperty('color', '#fff', 'important');
+      dot.style.removeProperty('filter');
+      dot.querySelectorAll('.dot-label span').forEach(s => s.style.setProperty('color', '#fff', 'important'));
+
+      var tv = dot.querySelector(':scope > .dotconf-tv');
+      if (!tv) {
+        tv = document.createElement('div');
+        tv.className = 'dotconf-tv';
+        tv.innerHTML = '<div class="dotconf-tv-img"></div><div class="dotconf-tv-noise"></div><div class="dotconf-tv-lines"></div>';
+        dot.insertBefore(tv, dot.firstChild);
+      }
+      var src = _previewSnaps[p.displayID];
+      tv.querySelector('.dotconf-tv-img').style.backgroundImage = src ? 'url(' + src + ')' : 'none';
+      tv.classList.toggle('dotconf-tv-nosignal', !src || p.presenceState === 'audio_only');
+    });
+  }
+
+  function _dotconfResizeKeepCenter(dot, w, h) {
+    var cw = parseFloat(dot.style.width)  || dot.offsetWidth;
+    var ch = parseFloat(dot.style.height) || dot.offsetHeight;
+    if (Math.abs(cw - w) < 1 && Math.abs(ch - h) < 1) return;
+    var left = parseFloat(dot.style.left) || 0;
+    var top  = parseFloat(dot.style.top)  || 0;
+    dot.style.width  = w + 'px';
+    dot.style.height = h + 'px';
+    dot.style.left   = (left + cw / 2 - w / 2) + 'px';
+    dot.style.top    = (top  + ch / 2 - h / 2) + 'px';
+  }
+
+  function _dotconfClearPreview(dot) {
+    if (!dot.classList.contains('dotconf-preview')) return;
+    dot.classList.remove('dotconf-preview');
+    dot.querySelector(':scope > .dotconf-tv')?.remove();
+    ['width', 'height', 'left', 'top', 'border-radius', 'background',
+     'border', 'opacity', 'color', 'filter'].forEach(p => dot.style.removeProperty(p));
+    dot.querySelectorAll('.dot-label span').forEach(s => s.style.removeProperty('color'));
+  }
+
+  function _dotconfClearAllPreviews() {
+    document.querySelectorAll('.dotconf-preview').forEach(_dotconfClearPreview);
+  }
+
+
+  // ── The "weak broadcast" look — pure CSS; static drawn with an SVG noise filter ─
+
+  function _dotconfEnsureTvStyle() {
+    if (document.getElementById('dotconf-tv-style')) return;
+    var noise = "data:image/svg+xml;utf8," + encodeURIComponent(
+      "<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'>" +
+      "<filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='2' stitchTiles='stitch'/>" +
+      "<feColorMatrix type='saturate' values='0'/></filter>" +
+      "<rect width='100%' height='100%' filter='url(#n)'/></svg>");
+
+    var st = document.createElement('style');
+    st.id = 'dotconf-tv-style';
+    st.textContent = `
+      .dotconf-tv { position:absolute; inset:0; border-radius:inherit; overflow:hidden; z-index:0; pointer-events:none; background:#1e272e; }
+      .dotconf-preview .dot-label { position:relative; z-index:1; text-shadow:0 1px 3px rgba(0,0,0,0.8); }
+      .dotconf-tv-img { position:absolute; inset:-14px; background-size:cover; background-position:center;
+        filter:blur(7px) grayscale(35%) brightness(0.85); animation:dotconf-tv-jitter 6s steps(1) infinite; }
+      .dotconf-tv-noise { position:absolute; inset:-50%; background-image:url("${noise}"); opacity:0.32;
+        mix-blend-mode:screen; animation:dotconf-tv-snow 0.45s steps(1) infinite; }
+      .dotconf-tv-nosignal .dotconf-tv-noise { opacity:0.6; }
+      .dotconf-tv-lines { position:absolute; inset:0; opacity: 0.35;
+        background:repeating-linear-gradient(0deg, rgba(0,0,0,0.22) 0 1px, transparent 1px 3px);
+        animation:dotconf-tv-roll 7s linear infinite; }
+      .dotconf-preview { animation:dotconf-live-pulse 2.4s ease-in-out infinite; }
+      @keyframes dotconf-tv-snow {
+        0% { transform:translate(0,0); }        20% { transform:translate(-10%,6%); }
+        40% { transform:translate(6%,-10%); }   60% { transform:translate(-6%,-4%); }
+        80% { transform:translate(10%,8%); } }
+      @keyframes dotconf-tv-jitter {
+        0%, 95%, 100% { transform:translateX(0); }  96% { transform:translateX(-4px); }  97% { transform:translateX(3px); } }
+      @keyframes dotconf-tv-roll {
+        0%, 90%, 100% { transform:translateY(0); }  93% { transform:translateY(-3px); }  96% { transform:translateY(2px); } }
+      @keyframes dotconf-live-pulse {
+        0%, 100% { box-shadow:0 0 0 2px rgba(0,184,148,0.55); }  50% { box-shadow:0 0 0 7px rgba(0,184,148,0.12); } }
+      @media (prefers-reduced-motion: reduce) {
+        .dotconf-tv-img, .dotconf-tv-noise, .dotconf-tv-lines, .dotconf-preview { animation:none !important; } }
+    `;
+    document.head.appendChild(st);
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3015,10 +4793,26 @@
   function _clearPulse(dot) {
     dot.style.boxShadow = '';
   }
+  
+  // Presence-dot styling (joining border, state colours, faded opacity) is set with
+  // !important by _morphToPresenceDot. Clear it when a dot becomes a video tile so
+  // the tile starts clean; _morphToPresenceDot re-applies it on the way back.
+  function _clearPresenceStyling(dot) {
+    ['border', 'background', 'color', 'opacity'].forEach(p => dot.style.removeProperty(p));
+    dot.querySelectorAll('.dot-label span').forEach(span => {
+      span.style.removeProperty('color');
+      span.style.removeProperty('font-size');
+    });
+  }
 
   function _morphToRect(dot, displayID, w, h,  orchestrator) {
     _clearPulse(dot); // clear confirmation ring — morph is happening
+    _clearPresenceStyling(dot);
     dot.dataset.morphed = 'true';
+    dot.classList.remove('dot-fade-in');
+    dot.style.animation = 'none';
+    dot.style.setProperty('--dot-target-opacity', '1');
+    dot.style.setProperty('opacity', '1', 'important');
     Object.assign(dot.style, {
       width:        `${w}px`,
       height:       `${h}px`,
@@ -3046,6 +4840,9 @@
     if (dot.dataset.morphed === 'true') {
       _removeTileVideo(dot);
       dot.dataset.morphed = 'false';
+      dot.style.removeProperty('opacity');
+      dot.style.removeProperty('animation');
+      dot.style.removeProperty('--dot-target-opacity');
     }
     if (dot.dataset.tier === 'feedDot') {
       _removeTileVideo(dot);
@@ -3070,8 +4867,12 @@
   function _morphToFeedDot(dot, displayID, size, orchestrator) {
     // Large circle with live video playing inside.
     _clearPulse(dot); // clear confirmation ring
+    _clearPresenceStyling(dot);
     if (dot.dataset.morphed === 'true') {
       dot.dataset.morphed = 'false';
+      dot.style.removeProperty('opacity');
+      dot.style.removeProperty('animation');
+      dot.style.removeProperty('--dot-target-opacity');
     }
     dot.dataset.tier = 'feedDot';
 
@@ -3099,11 +4900,14 @@
     }
   }
 
-  function _morphToPresenceDot(dot, displayID, size, presenceState, instant, orchestrator) {
+  function _morphToPresenceDot(dot, displayID, size, presenceState, instant, orchestrator, name) {
     _clearPulse(dot);
     if (dot.dataset.morphed === 'true') _removeTileVideo(dot);
     if (dot.dataset.tier === 'feedDot') _removeTileVideo(dot);
     dot.dataset.morphed = 'false';
+    dot.style.removeProperty('opacity');
+    dot.style.removeProperty('animation');
+    dot.style.removeProperty('--dot-target-opacity');
     dot.dataset.tier    = 'presence';
    
     var currentLeft = parseFloat(dot.style.left) || 0;
@@ -3113,35 +4917,54 @@
     dot.style.left    = `${currentLeft - (size - prevW) / 2}px`;
     dot.style.top     = `${currentTop  - (size - prevH) / 2}px`;
    
-    var styleDef = DOTCONF_PRESENCE_STYLES[presenceState] || DOTCONF_PRESENCE_STYLES.invited;
-   
+    var styleDef   = DOTCONF_PRESENCE_STYLES[presenceState] || DOTCONF_PRESENCE_STYLES.invited;
+    var hashColor  = _dotconfNameColor(name);
+
     dot.classList.remove('dotconf-added');
     dot.style.backgroundImage = 'none';
     dot.style.filter = 'none';
-   
+
     if (presenceState === PRESENCE_STATE.ADDED) {
-      dot.classList.add('dotconf-added'); // kept for anything else the class might carry, border now set directly below
+      dot.classList.add('dotconf-added');
       dot.style.setProperty('background-color', 'transparent', 'important');
       dot.style.setProperty('background-image', 'none', 'important');
-      dot.style.setProperty('border', styleDef.border, 'important');
-      dot.style.color   = styleDef.color; // was missing — this is why text was invisible before (white text on transparent bg)
-      dot.style.opacity = styleDef.opacity;
+      dot.style.setProperty('border', '1px solid rgba(169,160,166,0.35)', 'important'); // lighter, less pronounced
+      dot.style.setProperty('color', hashColor || styleDef.color, 'important');
+      dot.style.setProperty('opacity', styleDef.opacity, 'important');
+
+    } else if (presenceState === PRESENCE_STATE.INVITED) {
+      dot.style.setProperty('background', hashColor || styleDef.background, 'important');
+      dot.style.setProperty('border', 'none', 'important');
+      dot.style.setProperty('color', '#fff', 'important');
+      dot.style.setProperty('opacity', styleDef.opacity, 'important');
+
     } else {
-      dot.style.background = styleDef.background;
-      dot.style.border     = styleDef.border;
-      dot.style.color      = styleDef.color;
-      dot.style.opacity    = styleDef.opacity;
-   
+      dot.style.setProperty('background', styleDef.background, 'important');
+      dot.style.setProperty('border', styleDef.border, 'important');
+      dot.style.setProperty('color', styleDef.color, 'important');
+      dot.style.setProperty('opacity', styleDef.opacity, 'important');
+
       if (styleDef.useFrozenFrame) {
         var frozen = _frozenFrames[displayID];
         if (frozen) {
-          dot.style.backgroundImage    = `url(${frozen})`;
+          dot.style.setProperty('background-image', `url(${frozen})`, 'important');
           dot.style.backgroundSize     = 'cover';
           dot.style.backgroundPosition = 'center';
           dot.style.filter = 'grayscale(40%) brightness(0.9)';
         }
       }
     }
+    
+    // .dot-label span hardcodes white text and shrinks each letter to
+    // 0.35em/0.4em of the dot's own font-size — both silently override
+    // whatever color/size we just set on the parent .dot, since a child's
+    // own matching rule always wins over an inherited value regardless of
+    // !important on the ancestor. Force both directly on the letter spans.
+    var labelColor = dot.style.getPropertyValue('color');
+    dot.querySelectorAll('.dot-label span').forEach(function(span) {
+      span.style.setProperty('color', labelColor, 'important');
+      span.style.setProperty('font-size', '1em', 'important');
+    });
    
     var finalStyles = {
       width:        `${size}px`,
@@ -3179,6 +5002,24 @@
    
     var shorter    = Math.min(canvas.offsetWidth || 800, canvas.offsetHeight || 600);
     var minDotSize = shorter * 0.06;
+    
+    // Host never shows as a small presence dot pre-call — it's only ever the
+    // center tile once live. The generic renderer still creates a normal dot
+    // for host (needed so repulsion math keeps other dots clear of that
+    // position), so remove it here rather than fighting positions/array
+    // alignment upstream.
+    var hostDisplayID = _getHostDisplayID(orchestrator);
+    var hostP = conf.participants.find(p => p.displayID === hostDisplayID);
+    var hostPreviewed = _dotconfIsViewer(orchestrator) && hostP &&
+      (hostP.presenceState === 'live' || hostP.presenceState === 'audio_only') &&
+      hostDisplayID !== _getMyDotConfParticipantDisplayID(orchestrator);
+    if (hostDisplayID && !hostPreviewed) {
+      var hostDot = _getDotElement(hostDisplayID);
+      if (hostDot) {
+        hostDot.remove();
+        if (typeof _dotElCache !== 'undefined') _dotElCache.delete(hostDisplayID);
+      }
+    }
    
     conf.participants.forEach(p => {
       var isLive = p.presenceState === 'live' || p.presenceState === 'audio_only';
@@ -3189,9 +5030,10 @@
         console.log('[diag] P7 — dot element:', dot, 'presenceState:', p.presenceState);
       }
       if (!dot) return;
-      _morphToPresenceDot(dot, p.displayID, minDotSize, p.presenceState, true);
+      _morphToPresenceDot(dot, p.displayID, minDotSize, p.presenceState, true, orchestrator, p.name);
     });
    
+    _dotconfRenderPreviews(orchestrator);
     console.log('[diag] finished loop');
   }
 
@@ -3350,6 +5192,8 @@
       // DotConf lifecycle — called from context bar buttons (Phase 2+)
       dotconfJoin:        (o)  => _startDotConfPreview(o || orchestrator),
       dotconfLeave:       (o)  => _leaveDotConf(o || orchestrator),
+      dotconfSyncAddButton: (o) => _dotconfSyncAddButton(o || orchestrator),
+      dotconfEndCall:     (o)  => _dotconfConfirmEndCall(o || orchestrator),
 
       // Recording — called from host context bar (Phase 4)
       dotconfStartRecord: (o)  => _startRecording(o || orchestrator),
@@ -3395,7 +5239,8 @@
       dotconfRenderSelfView:                 (stream, name) => _renderDotConfSelfView(stream, name),
       dotconfUpdateSelfViewStream:           (stream) => _updateDotConfSelfViewStream(stream),
       dotconfRemoveSelfView:                 () => _removeDotConfSelfView(),
-      _dotconfReady: true
+      _dotconfReady: true,
+      dotconfOnDotHover: (dot, item) => _dotconfOnDotHover(orchestrator, dot, item)
     });
 
     
@@ -3424,6 +5269,24 @@
           _dotconfInstallHostParticipantHook(e.detail || window.app);
       });
   }
+  
+  // TEMP diagnostic — remove after debugging
+  window.__dotconfDiag = function() {
+    var pc = _peerConnection;
+    return {
+      myId:       _cachedMyId,
+      mySession:  _mySessionId,
+      midMap:     Object.assign({}, _midToTrackName),
+      roster:     Object.fromEntries(Object.entries(_roster).map(([id, r]) =>
+                    [id, { audio: r.audioTrackId, video: r.videoTrackId, session: r.cfSessionId,
+                           videoSubscribed: !!r._videoSubscribed, videoMid: r._videoMid }])),
+      trackKeys:  Object.keys(_tracks),
+      transceivers: pc ? pc.getTransceivers().map(t => ({
+                    mid: t.mid, dir: t.currentDirection,
+                    kind: t.receiver.track && t.receiver.track.kind,
+                    recvTrackId: t.receiver.track && t.receiver.track.id })) : null
+    };
+  };
 
 })();
 
