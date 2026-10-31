@@ -316,10 +316,19 @@
          });
        }
 
+       if (payload.layout) {
+         _dotconfSetBubbleLayout({ shape: payload.layout.shape || null, topK: payload.layout.topK });
+       }
+
        _rosterShare = share;
        if (orchestrator._dotconfCallLive) _dotconfResumeShare(orchestrator);
      });
     
+    _sseSource.addEventListener("conference.layout", e => {
+      var d = JSON.parse(e.data);
+      _dotconfSetBubbleLayout({ shape: d.shape || null, topK: d.topK });
+    });
+
     _sseSource.addEventListener("participant.pinned", e => {
       var { participantDisplayID, pinned, expiresAt } = JSON.parse(e.data);
       if (pinned) {
@@ -431,21 +440,19 @@
     _videoSlots = new Set();
   }
   
+  // ── Invite ──────────────────────────────────────────────────────────────────
+  // Host only. Always available once the conference has participants: people
+  // not invited yet come first, people already invited can be sent it again.
+  // Emails/phones typed into the modal are saved back to the participant.
+
+  var DOTCONF_INVITABLE_STATES = ['added', 'invited', 'viewed', 'left'];
+
   function _dotconfShouldShowInviteButton(orchestrator) {
     if (!orchestrator.isDataOwner()) return false; // host only
-
     var conf = _getCurrentDotConf(orchestrator);
-    var hasAddedParticipants = !!(conf?.participants || [])
-      .some(p => !p.isHost && p.presenceState === PRESENCE_STATE.ADDED);
-
-    var contacts = orchestrator.dotconfGetContacts
-      ? orchestrator.dotconfGetContacts(orchestrator)
-      : [];
-    var hasContacts = Array.isArray(contacts) && contacts.length > 0;
-
-    return hasAddedParticipants || hasContacts;
+    return (conf?.participants || []).some(p => !p.isHost && !p.isProducer);
   }
-  
+
   function _dotconfHandleInviteClick(orchestrator) {
     _renderDotConfInviteModal(orchestrator);
   }
@@ -453,8 +460,15 @@
   function _dotconfPendingParticipants(orchestrator) {
     var conf = _getCurrentDotConf(orchestrator);
     return (conf?.participants || []).filter(
-      p => !p.isHost && p.presenceState === PRESENCE_STATE.ADDED
+      p => !p.isHost && !p.isProducer && p.presenceState === PRESENCE_STATE.ADDED
     );
+  }
+
+  // Everyone an invite makes sense for: not the host or producer, and not in the call right now.
+  function _dotconfInvitableParticipants(orchestrator) {
+    var conf = _getCurrentDotConf(orchestrator);
+    return (conf?.participants || []).filter(p =>
+      !p.isHost && !p.isProducer && DOTCONF_INVITABLE_STATES.includes(p.presenceState || 'added'));
   }
 
   async function _dotconfMarkInvited(orchestrator, ids) {
@@ -465,30 +479,96 @@
       'POST /' + conf.displayID + '/participant/invite?tenantId=' + tenantId,
       { participantDisplayIDs: ids }
     );
-    ids.forEach(id => _updateParticipantPresence(orchestrator, id, PRESENCE_STATE.INVITED));
+    // The server only moves "added" → "invited"; mirror that locally.
+    ids.forEach(id => {
+      var p = (conf.participants || []).find(x => x.displayID === id);
+      if (p && (p.presenceState || 'added') === PRESENCE_STATE.ADDED) {
+        _updateParticipantPresence(orchestrator, id, PRESENCE_STATE.INVITED);
+      }
+    });
     return (resp && resp.invited) || 0;
   }
-  
-  function _dotconfSetJoining(orchestrator, on) {
-    orchestrator._dotconfJoining = on;
-    document.querySelectorAll('[data-dotconf-join]').forEach(b => {
-      b.disabled = on;
-      b.style.opacity = on ? '0.5' : '';
-      b.style.cursor  = on ? 'default' : 'pointer';
-    });
+
+  // Save an email/phone typed in the modal back to the participant (host only, server-checked).
+  async function _dotconfSaveContact(orchestrator, p, email, phone) {
+    email = (email || '').trim();
+    phone = (phone || '').trim();
+    if (email === (p.contactemail || '') && phone === (p.contactphone || '')) return;
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf) return;
+    try {
+      await _cfApi(
+        'POST /' + conf.displayID + '/participant/contact?tenantId=' + _getTenantId(orchestrator),
+        { participantDisplayID: p.displayID, contactemail: email, contactphone: phone }
+      );
+      p.contactemail = email;
+      p.contactphone = phone;
+    } catch (e) {
+      console.error('[dotconf] save contact failed for', p.name, e);
+    }
   }
 
+  // Name to show as the inviter: the host's own name, never an ID.
+  function _dotconfHostName(orchestrator) {
+    var conf = _getCurrentDotConf(orchestrator);
+    var hostRow = (conf?.participants || []).find(p => p.isHost);
+    return (hostRow && hostRow.name) ||
+           orchestrator.data?.items?.[0]?.entityType === 'host' && orchestrator.data.items[0].name ||
+           orchestrator.currentPath?.[0]?.shortName ||
+           'Your host';
+  }
+
+  async function _dotconfEmailInvite(orchestrator, p, address, confUrl) {
+    var conf = _getCurrentDotConf(orchestrator);
+    // 4th argument: extra template variables (needs the orchestrator change that
+    // accepts it). {{participantName}} and {{conferenceName}} are used by
+    // dotconf-appschema.json's subtenantNotification.
+    return orchestrator.sendSubtenantNotificationEmail(
+      Object.assign({}, p, { contactemail: address }),
+      _dotconfHostName(orchestrator),
+      confUrl,
+      { participantName: p.name || '', conferenceName: (conf && conf.name) || 'a conference' }
+    );
+  }
+
+  // How invite emails are sent: 'newauth' (server sends) or 'mine' (opens the
+  // host's own mail app, so it comes from their address). Remembered per browser.
+  var INVITE_SENDER_KEY = 'dotconf_invite_sender';
+  function _dotconfInviteSender() {
+    try { return localStorage.getItem(INVITE_SENDER_KEY) === 'mine' ? 'mine' : 'newauth'; }
+    catch (e) { return 'newauth'; }
+  }
+  function _dotconfSetInviteSender(v) {
+    try { localStorage.setItem(INVITE_SENDER_KEY, v); } catch (e) { /* not remembered */ }
+  }
+
+  // Open the host's mail app with the invite written. One recipient → "To" and a
+  // personal greeting; several → everyone in BCC so addresses aren't shared.
+  function _dotconfMailFromMyAccount(orchestrator, recipients, confUrl) {
+    var conf  = _getCurrentDotConf(orchestrator);
+    var cname = (conf && conf.name) || 'a call';
+    var host  = _dotconfHostName(orchestrator);
+    var one   = recipients.length === 1;
+    var subject = "You're invited to " + cname;
+    var body = (one ? 'Hi ' + (recipients[0].name || 'there') + ',' : 'Hi,') + '\n\n' +
+      "You're invited to join " + cname + '. Open this link when you\'re ready — no account needed:\n' +
+      confUrl + '\n\n' + host;
+    var addrs = recipients.map(r => r.address).join(',');
+    var href = 'mailto:' + (one ? encodeURIComponent(addrs) + '?' : '?bcc=' + encodeURIComponent(addrs) + '&') +
+      'subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+    window.location.href = href;
+  }
 
   function _renderDotConfInviteModal(orchestrator) {
-    var pending = _dotconfPendingParticipants(orchestrator);
+    var people = _dotconfInvitableParticipants(orchestrator);
     var notify = msg => typeof orchestrator.showNotification === 'function' && orchestrator.showNotification(msg);
-    if (!pending.length) { notify('Everyone has already been invited.'); return; }
+    if (!people.length) { notify('Everyone is already in the call.'); return; }
 
-    var conf       = _getCurrentDotConf(orchestrator);
-    var confUrl = _dotconfGuestUrl(orchestrator);
-    var parentName = orchestrator.currentPath[0]?.shortName
-      || orchestrator.currentPath[0]?.displayID || 'Conference host';
-    var message    = "You're invited to " + (conf.name || 'a call') + ": " + confUrl;
+    var conf     = _getCurrentDotConf(orchestrator);
+    var confUrl  = _dotconfGuestUrl(orchestrator);
+    var message  = "You're invited to " + (conf.name || 'a call') + ": " + confUrl;
+    var notYet   = people.filter(p => (p.presenceState || 'added') === PRESENCE_STATE.ADDED);
+    var already  = people.filter(p => (p.presenceState || 'added') !== PRESENCE_STATE.ADDED);
 
     document.getElementById('dotconf-invite-modal')?.remove();
 
@@ -497,23 +577,181 @@
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
 
     var card = document.createElement('div');
-    card.style.cssText = 'background:#fff;border-radius:12px;width:100%;max-width:440px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+    card.style.cssText = 'background:#fff;border-radius:12px;width:100%;max-width:460px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
 
     var title = document.createElement('div');
     title.textContent = 'Invite participants';
     title.style.cssText = 'padding:16px 20px;font-size:16px;font-weight:700;color:#2d3436;border-bottom:1px solid #eee;';
 
     var sub = document.createElement('div');
-    sub.textContent = 'Add an email or phone if you have one, or just share the link yourself.';
+    sub.textContent = 'Add an email or phone if you have one, or just share the link yourself. Contact details are saved for next time.';
     sub.style.cssText = 'padding:10px 20px 0;font-size:12px;color:#636e72;';
+
+    // Email sender choice
+    var sender = _dotconfInviteSender();
+    var senderBar = document.createElement('div');
+    senderBar.style.cssText = 'padding:10px 20px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#636e72;';
+    var senderLabel = document.createElement('span');
+    senderLabel.textContent = 'Emails:';
+    var seg = document.createElement('div');
+    seg.setAttribute('role', 'radiogroup');
+    seg.setAttribute('aria-label', 'How invite emails are sent');
+    seg.style.cssText = 'display:inline-flex;padding:2px;border-radius:8px;background:#f1f3f5;';
+    var senderHint = document.createElement('span');
+    senderHint.style.cssText = 'flex-basis:100%;font-size:11px;color:#868e96;';
+    var SENDER_HINT = {
+      newauth: 'Sent for you from our address.',
+      mine: 'Opens your mail app, so invites come from you. Several people go in BCC.'
+    };
+    [['newauth', 'Let newauth send'], ['mine', 'Use my account']].forEach(([val, text]) => {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.dataset.val = val;
+      b.setAttribute('role', 'radio');
+      b.style.cssText = 'border:none;border-radius:6px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;';
+      b.onclick = () => { sender = val; _dotconfSetInviteSender(val); paintSender(); };
+      seg.appendChild(b);
+    });
+    function paintSender() {
+      seg.querySelectorAll('button').forEach(b => {
+        var on = b.dataset.val === sender;
+        b.setAttribute('aria-checked', on ? 'true' : 'false');
+        b.style.background = on ? '#fff' : 'transparent';
+        b.style.color      = on ? '#2d3436' : '#636e72';
+        b.style.boxShadow  = on ? '0 1px 2px rgba(0,0,0,0.12)' : 'none';
+      });
+      senderHint.textContent = SENDER_HINT[sender];
+    }
+    senderBar.append(senderLabel, seg, senderHint);
+    paintSender();
 
     var list = document.createElement('div');
     list.style.cssText = 'padding:4px 20px 10px;overflow-y:auto;';
 
     var inputCss = 'width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #dfe6e9;border-radius:8px;font-size:13px;';
-    var btnCss   = 'border:1px solid #b2bec3;background:#fff;color:#2d3436;border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600;cursor:pointer;';
+    var btnCss   = 'border:1px solid #b2bec3;background:#fff;color:#2d3436;border-radius:8px;padding:7px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;';
 
-    var rows = pending.map(function(p) {
+    function sectionHeading(text) {
+      var h = document.createElement('div');
+      h.textContent = text;
+      h.style.cssText = 'margin:14px 0 2px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#636e72;';
+      list.appendChild(h);
+    }
+
+
+    // Status chip colours for already-invited people.
+    var STATUS_CHIP = {
+      invited: { text: 'Invited',          bg: '#ffffff', fg: '#3b5bdb' },
+      viewed:  { text: 'Opened the link',  bg: '#ffffff', fg: '#087f5b' },
+      left:    { text: 'Was in the call',  bg: '#ffffff', fg: '#495057' }
+    };
+
+    function buildRow(p, isResend) {
+      return isResend ? buildInvitedRow(p) : buildNewRow(p);
+    }
+
+    function contactInputs(p) {
+      var email = document.createElement('input');
+      email.type = 'email'; email.placeholder = 'Email (optional)';
+      email.value = p.contactemail || ''; email.style.cssText = inputCss;
+      var phone = document.createElement('input');
+      phone.type = 'tel'; phone.placeholder = 'Phone (optional)';
+      phone.value = p.contactphone || ''; phone.style.cssText = inputCss;
+      var save = () => _dotconfSaveContact(orchestrator, p, email.value, phone.value);
+      email.addEventListener('change', save);
+      phone.addEventListener('change', save);
+      return { email: email, phone: phone, save: save };
+    }
+
+    // Send-by-phone actions, as icon buttons beside the phone field.
+    //   WhatsApp — every device (opens the app, or WhatsApp Web on a computer)
+    //   Text     — phones and tablets only (sms: links are unreliable on computers)
+    //   Telegram — every device; opens Telegram's share picker with the message
+    // Each one saves the contact and marks the person invited.
+    var IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+                    (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)); // iPadOS
+    var ICONS = {
+      whatsapp: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 20.5l1.3-4A8.5 8.5 0 1 1 8 19.6z"/><path d="M9 9.5c0 3 2.5 5.5 5.5 5.5l1-1.5-2-1-1 .8a4 4 0 0 1-1.8-1.8l.8-1-1-2z"/></svg>',
+      sms:      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/><path d="M8.5 10.5h.01M12 10.5h.01M15.5 10.5h.01"/></svg>',
+      telegram: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 4L3 11l6 2.5L20 6l-8.5 9 7 5z"/></svg>'
+    };
+
+    // Official brand logos, if present on the server. Download them from each
+    // company's brand page and place them at these paths; until then (or if one
+    // fails to load) the generic icon above is shown instead.
+    var BRAND_LOGOS = {
+      whatsapp: '/static/img/whatsapp.svg',
+      telegram: '/static/img/telegram.svg'
+    };
+
+    function iconButton(kind, label, colour) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      b.innerHTML = ICONS[kind];
+      if (BRAND_LOGOS[kind]) {
+        var img = new Image();
+        img.alt = '';
+        img.width = 20; img.height = 20;
+        img.onload = () => { b.innerHTML = ''; b.appendChild(img); };
+        img.src = BRAND_LOGOS[kind];   // on error the generic icon simply stays
+      }
+      b.style.cssText = 'flex:none;width:36px;height:34px;padding:0;display:inline-flex;align-items:center;justify-content:center;' +
+        'border:1px solid #dfe6e9;border-radius:8px;background:#fff;color:' + colour + ';cursor:pointer;';
+      return b;
+    }
+
+    function phoneActions(p, c) {
+      var wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;gap:4px;flex:none;';
+
+      async function sent(btn) {
+        c.save();
+        btn.style.background = '#ebfbee';
+        btn.style.borderColor = '#b2f2bb';
+        try { await _dotconfMarkInvited(orchestrator, [p.displayID]); }
+        catch (e) { console.error('[dotconf] mark invited failed:', e); _showError('Could not mark as invited.'); }
+      }
+      function digits() {
+        var d = c.phone.value.replace(/[^\d+]/g, '');
+        if (!d.replace('+', '')) { c.phone.focus(); return null; }
+        return d;
+      }
+
+      var wa = iconButton('whatsapp', 'Send on WhatsApp', '#25a244');
+      wa.onclick = function() {
+        var d = digits(); if (!d) return;
+        window.open('https://wa.me/' + d.replace('+', '') + '?text=' + encodeURIComponent(message), '_blank', 'noopener');
+        sent(wa);
+      };
+      wrap.appendChild(wa);
+
+      if (IS_MOBILE) {
+        var sms = iconButton('sms', 'Send as a text message', '#495057');
+        sms.onclick = function() {
+          var d = digits(); if (!d) return;
+          // "?&body=" is understood by both iOS and Android.
+          window.location.href = 'sms:' + d + '?&body=' + encodeURIComponent(message);
+          sent(sms);
+        };
+        wrap.appendChild(sms);
+      }
+
+      var tg = iconButton('telegram', 'Share on Telegram', '#229ed9');
+      tg.onclick = function() {
+        window.open('https://t.me/share/url?url=' + encodeURIComponent(confUrl) +
+                    '&text=' + encodeURIComponent("You're invited to " + (conf.name || 'a call')), '_blank', 'noopener');
+        sent(tg);
+      };
+      wrap.appendChild(tg);
+
+      return wrap;
+    }
+
+    // Not invited yet: full editable row, as before.
+    function buildNewRow(p) {
       var row = document.createElement('div');
       row.style.cssText = 'display:flex;flex-direction:column;gap:6px;padding:10px 0;border-bottom:1px solid #f1f2f6;';
 
@@ -521,47 +759,140 @@
       nameEl.textContent = p.name || 'Unnamed';          // textContent: names are user-supplied
       nameEl.style.cssText = 'font-size:14px;font-weight:600;color:#2d3436;';
 
-      var email = document.createElement('input');
-      email.type = 'email'; email.placeholder = 'Email (optional)';
-      email.value = p.contactemail || ''; email.style.cssText = inputCss;
-
+      var c = contactInputs(p);
       var phoneWrap = document.createElement('div');
       phoneWrap.style.cssText = 'display:flex;gap:6px;';
-      var phone = document.createElement('input');
-      phone.type = 'tel'; phone.placeholder = 'Phone for WhatsApp (optional)';
-      phone.value = p.contactphone || ''; phone.style.cssText = inputCss;
-      var wa = document.createElement('button');
-      wa.textContent = 'WhatsApp'; wa.style.cssText = btnCss + 'white-space:nowrap;';
-      wa.onclick = async function() {
-        var digits = phone.value.replace(/\D/g, '');
-        if (!digits) { phone.focus(); return; }
-        window.open('https://wa.me/' + digits + '?text=' + encodeURIComponent(message), '_blank', 'noopener');
-        try { await _dotconfMarkInvited(orchestrator, [p.displayID]); row.style.opacity = '0.5'; }
-        catch (e) { console.error('[dotconf] mark invited failed:', e); _showError('Could not mark as invited.'); }
-      };
-      phoneWrap.append(phone, wa);
+      phoneWrap.append(c.phone, phoneActions(p, c));
 
-      row.append(nameEl, email, phoneWrap);
+      row.append(nameEl, c.email, phoneWrap);
       list.appendChild(row);
-      return { p: p, email: email };
-    });
+      return { p: p, email: c.email, phone: c.phone };
+    }
+
+    // Already invited: a compact, muted one-line row — name, status chip, where it
+    // went, and Resend. "Edit" opens the contact fields when they're needed.
+    function buildInvitedRow(p) {
+      var row = document.createElement('div');
+      row.style.cssText = 'margin:6px 0;padding:8px 10px;border-radius:10px;background:#ebfbee;border:1px solid #d3f9d8;';
+
+      var line = document.createElement('div');
+      line.style.cssText = 'display:flex;align-items:center;gap:8px;min-width:0;';
+
+      var check = document.createElement('span');
+      check.textContent = '✓';
+      check.setAttribute('aria-hidden', 'true');
+      check.style.cssText = 'flex:none;width:20px;height:20px;border-radius:50%;background:#2f9e44;color:#ffffff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;';
+
+      var info = document.createElement('div');
+      info.style.cssText = 'flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;';
+      var top = document.createElement('div');
+      top.style.cssText = 'display:flex;align-items:center;gap:6px;min-width:0;';
+      var nameEl = document.createElement('span');
+      nameEl.textContent = p.name || 'Unnamed';
+      nameEl.style.cssText = 'font-size:13px;font-weight:600;color:#2b4a33;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+      var chipDef = STATUS_CHIP[p.presenceState] || STATUS_CHIP.invited;
+      var chip = document.createElement('span');
+      chip.textContent = chipDef.text;
+      chip.style.cssText = 'flex:none;font-size:10px;font-weight:600;padding:2px 7px;border-radius:999px;background:' + chipDef.bg + ';color:' + chipDef.fg + ';';
+      top.append(nameEl, chip);
+
+      var where = document.createElement('div');
+      where.style.cssText = 'font-size:11px;color:#5c7a64;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+      var c = contactInputs(p);
+      function paintWhere() {
+        var bits = [c.email.value.trim(), c.phone.value.trim()].filter(Boolean);
+        where.textContent = bits.length ? bits.join(' · ') : 'No contact details';
+      }
+      paintWhere();
+      info.append(top, where);
+
+      var editBtn = document.createElement('button');
+      editBtn.textContent = 'Edit';
+      editBtn.style.cssText = 'flex:none;border:none;background:none;color:#4c6ef5;font-size:12px;font-weight:600;cursor:pointer;padding:4px;';
+
+      var resend = document.createElement('button');
+      resend.textContent = 'Resend'; resend.style.cssText = btnCss + 'flex:none;';
+
+      line.append(check, info, editBtn, resend);
+
+      // Hidden editor: email + phone + WhatsApp.
+      var editor = document.createElement('div');
+      editor.hidden = true;
+      editor.style.cssText = 'display:flex;flex-direction:column;gap:6px;margin-top:8px;';
+      var phoneWrap = document.createElement('div');
+      phoneWrap.style.cssText = 'display:flex;gap:6px;';
+      phoneWrap.append(c.phone, phoneActions(p, c));
+      editor.append(c.email, phoneWrap);
+      function openEditor(focusEl) {
+        editor.hidden = false;
+        editor.style.display = 'flex';
+        editBtn.textContent = 'Done';
+        if (focusEl) focusEl.focus();
+      }
+      function closeEditor() {
+        editor.hidden = true;
+        editor.style.display = 'none';
+        editBtn.textContent = 'Edit';
+        paintWhere();
+      }
+      editor.style.display = 'none';
+      editBtn.onclick = () => (editor.hidden ? openEditor(c.email) : (c.save(), closeEditor()));
+
+      resend.onclick = async function() {
+        var addr = c.email.value.trim();
+        if (!addr) { openEditor(c.email); return; }   // nowhere to send yet
+        c.save();
+        if (sender === 'mine') {
+          _dotconfMailFromMyAccount(orchestrator, [{ name: p.name, address: addr }], confUrl);
+          resend.textContent = 'Opened ✓';
+          return;
+        }
+        resend.disabled = true; resend.textContent = 'Sending…';
+        try {
+          await _dotconfEmailInvite(orchestrator, p, addr, confUrl);
+          resend.textContent = 'Sent ✓';
+        } catch (e) {
+          console.error('[dotconf] resend failed for', p.name, e);
+          resend.disabled = false; resend.textContent = 'Resend';
+          _showError('Could not send the email.');
+        }
+      };
+
+      row.append(line, editor);
+      list.appendChild(row);
+      return { p: p, email: c.email, phone: c.phone };
+    }
+
+    var newRows = [];
+    if (notYet.length) {
+      if (already.length) sectionHeading('Not invited yet');
+      newRows = notYet.map(p => buildRow(p, false));
+    }
+    var oldRows = [];
+    if (already.length) {
+      sectionHeading('Already invited');
+      oldRows = already.map(p => buildRow(p, true));
+    }
 
     var footer = document.createElement('div');
     footer.style.cssText = 'padding:12px 20px;border-top:1px solid #eee;display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;';
 
-    var close = () => overlay.remove();
-    var allIds = pending.map(p => p.displayID);
+    var close = () => {
+      [...newRows, ...oldRows].forEach(r => _dotconfSaveContact(orchestrator, r.p, r.email.value, r.phone.value));
+      overlay.remove();
+    };
+    var newIds = notYet.map(p => p.displayID);
 
     var cancelBtn = document.createElement('button');
-    cancelBtn.textContent = 'Cancel'; cancelBtn.style.cssText = btnCss; cancelBtn.onclick = close;
+    cancelBtn.textContent = 'Close'; cancelBtn.style.cssText = btnCss; cancelBtn.onclick = close;
 
     var copyBtn = document.createElement('button');
     copyBtn.textContent = 'Copy link'; copyBtn.style.cssText = btnCss;
     copyBtn.onclick = async function() {
       try {
         await navigator.clipboard.writeText(confUrl);
-        await _dotconfMarkInvited(orchestrator, allIds);
-        notify('Link copied — participants marked as invited.');
+        if (newIds.length) await _dotconfMarkInvited(orchestrator, newIds);
+        notify(newIds.length ? 'Link copied — participants marked as invited.' : 'Link copied.');
         close();
       } catch (e) { console.error('[dotconf] copy link failed:', e); _showError('Could not copy the link.'); }
     };
@@ -573,47 +904,64 @@
       shareBtn.onclick = async function() {
         try {
           await navigator.share({ title: conf.name || 'Invitation', text: message, url: confUrl });
-          await _dotconfMarkInvited(orchestrator, allIds);
+          if (newIds.length) await _dotconfMarkInvited(orchestrator, newIds);
           close();
         } catch (e) { if (e.name !== 'AbortError') { console.error('[dotconf] share failed:', e); _showError('Could not share the link.'); } }
       };
     }
 
-    var sendBtn = document.createElement('button');
-    sendBtn.textContent = 'Send invites';
-    sendBtn.style.cssText = btnCss + 'background:#4c6ef5;border-color:#4c6ef5;color:#fff;';
-    sendBtn.onclick = async function() {
-      sendBtn.disabled = true; sendBtn.textContent = 'Sending…';
-      try {
-        await _dotconfMarkInvited(orchestrator, allIds);
-        var sent = 0, failed = 0;
-        for (var r of rows) {
-          var addr = r.email.value.trim();
-          if (!addr) continue;
-          try {
-            await orchestrator.sendSubtenantNotificationEmail(
-              Object.assign({}, r.p, { contactemail: addr }), parentName, confUrl);
-            sent++;
-          } catch (e) { failed++; console.error('[dotconf] invite email failed for', r.p.name, e); }
-        }
-        notify('✅ ' + allIds.length + ' invited' + (sent ? ', ' + sent + ' emailed' : '') +
-               (failed ? ' (' + failed + ' emails failed)' : ''));
-        close();
-      } catch (e) {
-        console.error('[dotconf] invite failed:', e);
-        _showError('Could not send invites — please try again.');
-        sendBtn.disabled = false; sendBtn.textContent = 'Send invites';
-      }
-    };
-
     footer.append(cancelBtn, copyBtn);
     if (shareBtn) footer.appendChild(shareBtn);
-    footer.appendChild(sendBtn);
 
-    card.append(title, sub, list, footer);
+    // "Send invites" covers the not-yet-invited section; resends are per person.
+    if (newRows.length) {
+      var sendBtn = document.createElement('button');
+      sendBtn.textContent = 'Send invites';
+      sendBtn.style.cssText = btnCss + 'background:#4c6ef5;border-color:#4c6ef5;color:#fff;';
+      sendBtn.onclick = async function() {
+        sendBtn.disabled = true; sendBtn.textContent = 'Sending…';
+        try {
+          await _dotconfMarkInvited(orchestrator, newIds);
+          if (sender === 'mine') {
+            var recips = newRows.map(r => ({ name: r.p.name, address: r.email.value.trim() })).filter(r => r.address);
+            if (recips.length) _dotconfMailFromMyAccount(orchestrator, recips, confUrl);
+            notify('✅ ' + newIds.length + ' invited' +
+                   (recips.length ? ' — finish sending in your mail app' : ''));
+            close();
+            return;
+          }
+          var sent = 0, failed = 0;
+          for (var r of newRows) {
+            var addr = r.email.value.trim();
+            if (!addr) continue;
+            try { await _dotconfEmailInvite(orchestrator, r.p, addr, confUrl); sent++; }
+            catch (e) { failed++; console.error('[dotconf] invite email failed for', r.p.name, e); }
+          }
+          notify('✅ ' + newIds.length + ' invited' + (sent ? ', ' + sent + ' emailed' : '') +
+                 (failed ? ' (' + failed + ' emails failed)' : ''));
+          close();
+        } catch (e) {
+          console.error('[dotconf] invite failed:', e);
+          _showError('Could not send invites — please try again.');
+          sendBtn.disabled = false; sendBtn.textContent = 'Send invites';
+        }
+      };
+      footer.appendChild(sendBtn);
+    }
+
+    card.append(title, sub, senderBar, list, footer);
     overlay.appendChild(card);
     overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
     document.body.appendChild(overlay);
+  }
+
+  function _dotconfSetJoining(orchestrator, on) {
+    orchestrator._dotconfJoining = on;
+    document.querySelectorAll('[data-dotconf-join]').forEach(b => {
+      b.disabled = on;
+      b.style.opacity = on ? '0.5' : '';
+      b.style.cursor  = on ? 'default' : 'pointer';
+    });
   }
   
   async function _cfApi(methodAndPath, body) {
@@ -646,7 +994,7 @@
       try {
         return await _cfApi('POST /' + confDisplayID + '/tracks/pull?tenantId=' + tenantId, body);
       } catch (e) {
-        var retryable = /not_found_track_error|empty_track_error/.test(String(err && err.message));
+        var retryable = /not_found_track_error|empty_track_error/.test(String(e && e.message));
         if (!retryable || i === delays.length - 1) throw e;
         console.log('[dotconf] track not ready yet, retrying pull in', delays[i + 1], 'ms');
       }
@@ -940,6 +1288,7 @@
           if (d.dataset.morphed === 'true' || d.dataset.tier === 'feedDot') _removeTileVideo(d);
         });
         _dotconfStopSnapshotUploads();            // the server clears your snapshot in markLeft
+        _dotconfAudioTeardown();
         _midToTrackName = {};
       } catch (e) {
         console.error('[dotconf] _leaveDotConf teardown failed partway:', e);
@@ -1009,6 +1358,10 @@
         if (tileEl && (tileEl.dataset.morphed === 'true' || tileEl.dataset.tier === 'feedDot')) {
           _attachVideoToTile(tileEl, ownerId, trackName, orchestrator);
         }
+      }
+      
+      if (track.kind === 'audio' && ownerId) {
+        _dotconfAttachAudio(ownerId, track);
       }
 
       if (ownerId && typeof _attachTrackEvents === 'function') {
@@ -1257,35 +1610,40 @@
    
   function _startCheapAudioLevelPolling() {
     if (_cheapLevelInterval) return;
-   
+
+    // getStats() levels for every audio track — remote (inbound-rtp) and my own
+    // mic (media-source). Stored as statsLevel, next to the analyser's audioLevel;
+    // _getAudioLevel uses whichever is higher.
     _cheapLevelInterval = setInterval(async () => {
       if (!_peerConnection) return;
       try {
         var stats = await _peerConnection.getStats();
+        var myAudioTrack = _localStream ? _localStream.getAudioTracks()[0] : null;
         stats.forEach(report => {
-          if (report.type !== 'inbound-rtp' || report.kind !== 'audio') return;
-          if (typeof report.audioLevel !== 'number') return; // not all browsers expose this
-   
-          var trackId = report.trackIdentifier || report.trackId;
-          if (!trackId || !_tracks[trackId]) return;
-   
-          if (!_tracks[trackId].analyser) { // skip if the fine-grained path already owns this track
-            var prev = _tracks[trackId].audioLevel || 0;
-            _tracks[trackId].audioLevel = prev * 0.7 + report.audioLevel * 0.3;
+          if (report.kind !== 'audio' || typeof report.audioLevel !== 'number') return;
+          var key = null;
+          if (report.type === 'inbound-rtp') key = report.trackIdentifier || report.trackId;
+          else if (report.type === 'media-source' && myAudioTrack) key = myAudioTrack.id;
+          if (!key) return;
+          var t = _tracks[key] || (_tracks[key] = {});
+          // No extra smoothing: Chrome's audioLevel is already smoothed, and a second
+          // layer stretches the tail of sharp sounds (snaps, knocks) into "speech".
+          t.statsLevel = report.audioLevel;
+          if (t.trackName && _tracks[t.trackName] && _tracks[t.trackName] !== t) {
+            _tracks[t.trackName].statsLevel = t.statsLevel; // copy under the Cloudflare name too
           }
         });
-   
+
         // Accumulate our own speaking time locally (written once on leave)
-        var myAudioTrack = _localStream ? _localStream.getAudioTracks()[0] : null;
-        if (myAudioTrack && _tracks[myAudioTrack.id] && _tracks[myAudioTrack.id].audioLevel > NOISE_FLOOR) {
-          _mySpeakingSec += 0.5; // this loop runs every 500ms
+        if (_cachedMyId && _isSpeechLevel(_cachedMyId, _getAudioLevel(_cachedMyId), !!_speakingStarted[_cachedMyId])) {
+          _mySpeakingSec += 0.25; // this loop runs every 250ms
         }
       } catch (e) {
         console.error('[dotconf] cheap audio level poll failed:', e);
       }
-    }, 500);
+    }, 250);
   }
-   
+
   function _stopCheapAudioLevelPolling() {
     if (_cheapLevelInterval) {
       clearInterval(_cheapLevelInterval);
@@ -1315,6 +1673,7 @@
    
   function dotconfStartLayout(orchestrator) {
     if (_layoutInterval) return;
+    _bubbleStart(orchestrator);
     _layoutInterval = setInterval(() => _tickLayout(orchestrator), 200);
   }
    
@@ -1323,6 +1682,7 @@
       clearInterval(_layoutInterval);
       _layoutInterval = null;
     }
+    _bubbleStop();
   }
    
    
@@ -1448,19 +1808,32 @@
     live.forEach(p => {
       var id    = p.displayID;
       var level = levels[id];
-   
-      if (level > NOISE_FLOOR) {
-        _slotLastActive[id] = now;
+
+      _updateNoiseFloor(id, level);
+      var heard = _isSpeechLevel(id, level, !!_speakingStarted[id]);
+      if (heard) _slotLastActive[id] = now;
+      // A short pause between words keeps the utterance going.
+      var active = heard ||
+        (!!_speakingStarted[id] && (now - (_slotLastActive[id] || 0)) < SPEECH_HANG_MS);
+
+      if (active) {
         if (!_speakingStarted[id]) {
           _speakingStarted[id] = now;
+          _speechHeardTicks[id] = 0;
         }
+        if (heard) _speechHeardTicks[id] = (_speechHeardTicks[id] || 0) + 1;
+        // Grow only for sustained sound: enough time AND enough readings that
+        // were actually heard. A snap or a knock fades out after 2–3 readings;
+        // pause tolerance alone would otherwise carry it past CONFIRM_MS.
         if (!_speakingConfirmed[id] &&
-            (now - _speakingStarted[id]) >= CONFIRM_MS) {
+            (now - _speakingStarted[id]) >= CONFIRM_MS &&
+            _speechHeardTicks[id] >= SPEECH_CONFIRM_TICKS) {
           _speakingConfirmed[id] = now;
         }
       } else {
         _speakingStarted[id]   = null;
         _speakingConfirmed[id] = null;
+        _speechHeardTicks[id]  = 0;
       }
     });
    
@@ -1534,44 +1907,64 @@
       }
     }
    
-    // ── Confirming set: above NOISE_FLOOR but not yet confirmed ──────────────
+    // ── Confirming set: speaking, but not yet for CONFIRM_MS ─────────────────
     var confirmingSet = new Set(
       live
         .filter(p => {
           var id = p.displayID;
-          return levels[id] > NOISE_FLOOR &&
-                 _speakingStarted[id] &&
+          return _speakingStarted[id] &&
                  !_speakingConfirmed[id] &&
                  !rectSet.has(id) &&
                  !feedDotSet.has(id);
         })
         .map(p => p.displayID)
     );
-   
+
     // ═══════════════════════════════════════════════════════════════════════
-    // BLOCK B — selective video subscription. Only rect/feed-dot tier
-    // (+ live host, from everyone else's perspective) gets a pulled video
-    // track. Diffed against last tick's set — only pulls/closes on actual
-    // tier changes.
+    // BUBBLE LAYOUT — hand the tier decisions to the bubble engine, which
+    // turns them into weights and shapes. Runs before video planning because
+    // the top speakers' tiles also want full-quality video.
     // ═══════════════════════════════════════════════════════════════════════
-   
-    var myId = _cachedMyId;
+
+    var myId     = _cachedMyId;
+    var hostLive = !!hostDisplayID && live.some(p => p.displayID === hostDisplayID);
+
+    var confirmedIds = new Set(
+      live.filter(p => _speakingConfirmed[p.displayID]).map(p => p.displayID)
+    );
+    var videoishIds = new Set([...rectSet, ...feedDotSet]);
+
+    var tileIds = _bubbleUpdate(orchestrator, conf, {
+      now:           now,
+      hostDisplayID: hostDisplayID,
+      hostLive:      hostLive,
+      confirmedIds:  confirmedIds,
+      confirmingSet: confirmingSet,
+      pinnedIds:     new Set(pinnedNonHostIds),
+      videoishIds:   videoishIds
+    });
+
+    // Everyone shown with live video — including me (my own tile uses my
+    // local stream, so I'm never pulled from the SFU).
+    var videoTierIds = new Set(videoishIds);
+    if (hostLive) videoTierIds.add(hostDisplayID);
+    tileIds.forEach(id => videoTierIds.add(id));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // BLOCK B — selective video subscription. Only participants shown with
+    // video get a pulled video track. Diffed against last tick's set — only
+    // pulls/closes on actual changes.
+    // ═══════════════════════════════════════════════════════════════════════
+
     var desiredVideoIds = new Set();
-   
-    var hostIsLiveAndNotMe = hostDisplayID && hostDisplayID !== myId &&
-      conf.participants.some(p => p.displayID === hostDisplayID &&
-        (p.presenceState === 'live' || p.presenceState === 'audio_only'));
-    if (hostIsLiveAndNotMe) desiredVideoIds.add(hostDisplayID);
-   
-    rectSet.forEach(id    => { if (id !== myId) desiredVideoIds.add(id); });
-    feedDotSet.forEach(id => { if (id !== myId) desiredVideoIds.add(id); });
-   
+    videoTierIds.forEach(id => { if (id !== myId) desiredVideoIds.add(id); });
+
     var tenantId      = _getTenantId(orchestrator);
     var confDisplayID = conf.displayID;
-   
+
     desiredVideoIds.forEach(id => {
       if (!_videoSubscribedTier.has(id)) {
-        var tier = (id === hostDisplayID || rectSet.has(id)) ? 'rect' : 'feedDot';
+        var tier = (id === hostDisplayID || rectSet.has(id) || tileIds.has(id)) ? 'rect' : 'feedDot';
         _subscribeVideoForParticipant(orchestrator, tenantId, confDisplayID, id, tier)
           .catch(e => console.error('[dotconf] tier-driven subscribe failed for', id, e));
       }
@@ -1583,109 +1976,11 @@
       }
     });
     _videoSubscribedTier = desiredVideoIds; // set synchronously — don't wait for async completion
-   
-    // ── Step 3: apply sizes ───────────────────────────────────────────────────
-    _maxSizeDelta = 0;
-   
-    conf.participants.forEach(p => {
-      var isHost = p.displayID === hostDisplayID;
-      var isLive = p.presenceState === 'live' || p.presenceState === 'audio_only';
 
-      var dot;
-      if (isHost) {
-        dot = _getDotElement(p.displayID);
-        if (!dot && isLive) {
-          // Host has no base-renderer dot at all (filtered out of items) —
-          // create its one tile ourselves, only once, right when first live.
-          dot = _createHostCenterTile(p.displayID, p.dotLabel, p.metadata?.displayConfig?.color);
-        }
-        if (!dot) return; // not live yet, nothing to create or show
-      } else {
-        dot = _getDotElement(p.displayID);
-        if (!dot) return;
-      }
+    // ── Look of each bubble (video / initials / presence colours) ────────────
+    // Sizes and positions are animated by the bubble engine, not here.
+    _bubbleApplyLooks(orchestrator, conf, videoTierIds, tileIds, myId);
 
-      var level  = levels[p.displayID] || 0;
-
-      if (isHost && isLive) {
-        dot.style.display = '';
-
-        // Hold-then-decay envelope — grow instantly on rising level, but hold
-        // the peak for HOLD_MS after speech stops before slowly shrinking back
-        // down. Prevents the rect visibly shrinking during normal speech pauses.
-        var HOLD_MS     = 1500; // how long to hold the peak size after last loud moment
-        var DECAY_ALPHA = 0.25; // smaller = slower shrink once decay starts
-
-        if (level > _hostDisplayLevel) {
-          _hostDisplayLevel = level;       // rise immediately — stay responsive to onset
-          _hostLastPeakTime = now;
-        } else if (now - _hostLastPeakTime > HOLD_MS) {
-          _hostDisplayLevel = _hostDisplayLevel * (1 - DECAY_ALPHA) + level * DECAY_ALPHA;
-        }
-        // else: within hold window — leave _hostDisplayLevel untouched, don't shrink yet
-
-        var ALONE_MAX_W       = shorter * 0.80;
-        var ALONE_TAPER_COUNT = 4;
-        var aloneFactor       = Math.max(0, 1 - (nonHost.length / ALONE_TAPER_COUNT));
-        var effectiveMaxRectW = maxRectW + (ALONE_MAX_W - maxRectW) * aloneFactor;
-
-        var rW = hostMinRectW + (effectiveMaxRectW - hostMinRectW) * Math.pow(_hostDisplayLevel, 0.5);
-        
-        var rH = rW / TILE_ASPECT;
-
-        var curW = parseFloat(dot.style.width)  || rW;
-        var curH = parseFloat(dot.style.height) || rH;
-        dot.style.left = `${W / 2 - curW / 2}px`;
-        dot.style.top  = `${H / 2 - curH / 2}px`;
-
-        var prevW = parseFloat(dot.dataset.prevW) || 0;
-        var delta = Math.abs(rW - prevW);
-        if (delta < 1) return;
-        _maxSizeDelta = Math.max(_maxSizeDelta, delta);
-        _morphToRect(dot, p.displayID, rW, rH, orchestrator);
-      } else if (rectSet.has(p.displayID)) {
-        var minRW = hostMinRectW * 0.9;
-        var rW    = minRW + (maxRectW - minRW) * Math.pow(level, 0.5);
-        var rH    = rW / TILE_ASPECT;
-        var prevW = parseFloat(dot.dataset.prevW) || 0;
-        var delta = Math.abs(rW - prevW);
-        if (delta < 1) return;
-        _maxSizeDelta = Math.max(_maxSizeDelta, delta);
-        _morphToRect(dot, p.displayID, rW, rH, orchestrator);
-   
-      } else if (feedDotSet.has(p.displayID)) {
-        var size  = feedDotSize * (0.85 + 0.15 * Math.pow(level, 0.5));
-        var prevW = parseFloat(dot.dataset.prevW) || 0;
-        var delta = Math.abs(size - prevW);
-        if (delta < 1 && dot.dataset.tier === 'feedDot') return;
-        _maxSizeDelta = Math.max(_maxSizeDelta, delta);
-        _morphToFeedDot(dot, p.displayID, size, orchestrator);
-   
-      } else if (confirmingSet.has(p.displayID)) {
-        var progress = Math.min(1,
-          (now - (_speakingStarted[p.displayID] || now)) / CONFIRM_MS
-        );
-        _pulseConfirming(dot, p.displayID, minDotSize, progress, level);
-   
-        } else {
-          // isHost case removed — host never reaches this branch now;
-          // handled entirely by the early return above when not live.
-          var size  = isLive
-            ? minDotSize * (1 + 0.2 * Math.pow(level, 0.6))
-            : minDotSize;
-          var prevW = parseFloat(dot.dataset.prevW) || 0;
-          var delta = Math.abs(size - prevW);
-          if (delta < 1 && dot.dataset.morphed !== 'true' && dot.dataset.tier !== 'feedDot') return;
-          _maxSizeDelta = Math.max(_maxSizeDelta, delta);
-          _morphToPresenceDot(dot, p.displayID, size, p.presenceState, false, orchestrator, p.name);
-        }
-    });
-   
-    // ── Step 4: repulsion only when meaningful growth occurred ────────────────
-    if (_maxSizeDelta >= 3) {
-      _repelIfNeeded(orchestrator, canvas, W, H);
-    }
-   
     _tickPinRings(orchestrator);
   }
    
@@ -2907,10 +3202,25 @@
       wrapper.appendChild(ctaBtn);
       document.body.appendChild(wrapper);
 
-      _startPreviewAudioMeter(stream, bars);
+      _startPreviewAudioMeter(stream, bars, hint);
   }
 
-  function _startPreviewAudioMeter(stream, bars) {
+  // Preview meter on the call's own scale: bars show how far above YOUR
+  // background you are, using the same detector the call uses — so a dryer or
+  // a fan stays dark, and the third bar is exactly the "start speaking" level.
+  // The history it builds is handed to the call on join, so the background is
+  // already known the moment you're in.
+  var PREVIEW_ID       = '__preview';
+  var PREVIEW_NOISY_DB = -46;   // background louder than this → "Noisy background" hint
+  // Three phases, so people see the filtering happen instead of a meter that
+  // just seems quiet:  1. raw level while the room is learned,
+  //                    2. bars ease down to the filtered level,
+  //                    3. filtered meter.
+  var PREVIEW_RAW_MS    = 2500;
+  var PREVIEW_FILTER_MS = 900;
+  var PREVIEW_RAW_STEPS = [-52, -44, -36, -28]; // raw meter: absolute dB per bar
+
+  function _startPreviewAudioMeter(stream, bars, hintEl) {
       var audioTrack = stream.getAudioTracks()[0];
       if (!audioTrack) return;
 
@@ -2925,7 +3235,7 @@
 
       var source   = _audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
       var analyser = _audioCtx.createAnalyser();
-      analyser.fftSize = 64;
+      analyser.fftSize = 2048;          // ~43 ms of samples per reading
       source.connect(analyser);
 
       // Analyser must have a path to destination or some browsers never
@@ -2939,34 +3249,97 @@
       _previewAnalyser = analyser;
       _previewSilentGain = silentGain; // stash so _stopPreviewAudioMeter can disconnect it
 
-      var freqData = new Uint8Array(analyser.frequencyBinCount);
-      var BAR_COUNT = bars.length;
-      var MAX_BAR_HEIGHT = 24;
+      delete _levelHist[PREVIEW_ID];
+      delete _noiseFloorDb[PREVIEW_ID];
 
-      function tick() {
-        analyser.getByteFrequencyData(freqData);
-       // console.log('[diag] audioCtx.state:', _audioCtx.state, 'freqData:', Array.from(freqData.slice(0, 8)));
+      var samples   = new Float32Array(analyser.fftSize);
+      var STEPS_DB  = [6, 12, SPEECH_START_DB, SPEECH_START_DB + 7]; // bar thresholds, dB above background
+      var HEIGHTS   = [8, 13, 18, 24];
+      var peakWin   = 0;       // loudest reading in the current 200 ms window
+      var lastStep  = 0;
+      var shownDb   = 0;       // what the bars display; falls back gently
+      var inSpeech  = false;
+      var hintDefault = hintEl ? hintEl.textContent : '';
+      var hintNow     = hintDefault;
+      var t0          = 0;
+      var phase       = 0;
+      var shownRaw    = -90;
+      var barColour   = bars[0] ? bars[0].style.background : '';
+      var barMotion   = bars[0] ? bars[0].style.transition : '';
 
-        var binsPerBar = Math.floor(freqData.length / BAR_COUNT);
-        for (var b = 0; b < BAR_COUNT; b++) {
-          var sum = 0;
-          for (var i = 0; i < binsPerBar; i++) {
-            sum += freqData[b * binsPerBar + i];
-          }
-          var avg = sum / binsPerBar;
-          var level = Math.min(1, (avg / 255) * 3);
-          var height = 4 + level * MAX_BAR_HEIGHT;
-          bars[b].style.height = height + 'px';
-          bars[b].style.opacity = (0.5 + level * 0.5).toFixed(2);
+      function enterPhase(n) {
+        phase = n;
+        bars.forEach(function(bar) {
+          if (n === 1) bar.style.background = 'rgba(255,255,255,0.5)';             // raw: dimmer
+          if (n === 2) { bar.style.background = barColour;
+                         bar.style.transition = 'height 0.45s ease, opacity 0.45s ease'; }
+          if (n === 3) bar.style.transition = barMotion;
+        });
+      }
+
+      function setHint(text) {
+        if (!hintEl || text === hintNow) return;
+        hintNow = text;
+        hintEl.textContent = text;
+      }
+
+      function tick(ts) {
+        analyser.getFloatTimeDomainData(samples);
+        var peak = 0;
+        for (var i = 0; i < samples.length; i++) {
+          var v = Math.abs(samples[i]);
+          if (v > peak) peak = v;
         }
+        if (!audioTrack.enabled || audioTrack.muted) peak = 0;
+        if (peak > peakWin) peakWin = peak;
+
+        // Feed the detector at the call's rate (one reading per 200 ms).
+        if (!lastStep || ts - lastStep >= 200) {
+          lastStep = ts;
+          _updateNoiseFloor(PREVIEW_ID, peakWin);
+          inSpeech = _isSpeechLevel(PREVIEW_ID, peakWin, inSpeech);
+          peakWin = 0;
+        }
+
+        if (!t0) { t0 = ts; enterPhase(1); }
+        var elapsed = ts - t0;
+        if (phase === 1 && elapsed >= PREVIEW_RAW_MS)                     enterPhase(2);
+        if (phase === 2 && elapsed >= PREVIEW_RAW_MS + PREVIEW_FILTER_MS) enterPhase(3);
+
+        var floor = _noiseFloorDb[PREVIEW_ID];
+        var above = Math.max(0, _levelDb(peak) - (floor === undefined ? -50 : floor));
+        if (peak < SPEECH_MIN_LEVEL) above = Math.min(above, STEPS_DB[1] - 0.1); // never past bar 2 when faint
+        shownDb = above > shownDb ? above : Math.max(above, shownDb - 0.6);      // rise fast, fall gently
+        var raw = _levelDb(peak);
+        shownRaw = raw > shownRaw ? raw : Math.max(raw, shownRaw - 0.6);
+
+        for (var b = 0; b < bars.length; b++) {
+          var k   = Math.min(b, STEPS_DB.length - 1);
+          var lit = phase === 1 ? shownRaw >= PREVIEW_RAW_STEPS[k] : shownDb >= STEPS_DB[k];
+          bars[b].style.height  = (lit ? HEIGHTS[Math.min(b, HEIGHTS.length - 1)] : 4) + 'px';
+          bars[b].style.opacity = lit ? '1' : '0.35';
+        }
+
+        if (phase === 1)                                            setHint('Hearing your room…');
+        else if (phase === 2)                                       setHint('Filtering out background…');
+        else if (shownDb >= STEPS_DB[2])                            setHint('We can hear you');
+        else if (floor !== undefined && floor > PREVIEW_NOISY_DB &&
+                 (_levelHist[PREVIEW_ID] || []).length >= 10)       setHint('Noisy background');
+        else                                                        setHint(hintDefault);
 
         _previewLevelRaf = requestAnimationFrame(tick);
       }
-      tick();
+      _previewLevelRaf = requestAnimationFrame(tick);
   }
 
   function _stopPreviewAudioMeter() {
       if (_previewLevelRaf) { cancelAnimationFrame(_previewLevelRaf); _previewLevelRaf = null; }
+      // Hand the background learned during preview to the call, so speech
+      // detection doesn't start from the "quiet room" guess.
+      if (_cachedMyId && _levelHist[PREVIEW_ID] && !_levelHist[_cachedMyId]) {
+        _levelHist[_cachedMyId]   = _levelHist[PREVIEW_ID].slice();
+        _noiseFloorDb[_cachedMyId] = _noiseFloorDb[PREVIEW_ID];
+      }
       if (_previewSilentGain) { _previewSilentGain.disconnect(); _previewSilentGain = null; }
       _previewAnalyser = null;
   }
@@ -2977,6 +3350,7 @@
 
   function _attachAudioAnalyser(trackId, mediaStreamTrack) {
     if (!_audioCtx) _audioCtx = new AudioContext();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume().catch(() => {}); // a suspended context reads silence
     var stream   = new MediaStream([mediaStreamTrack]);
     var source   = _audioCtx.createMediaStreamSource(stream);
     var analyser = _audioCtx.createAnalyser();
@@ -3516,8 +3890,8 @@
       setTimeout(() => {
         // Check the overlay is still showing (user hasn't typed more)
         if (document.getElementById('dotconf-identify-overlay')) {
-          chip = matchList.querySelector('div');
-          if (chip) chip.style.background = '#00cec9'; // visual hint
+          var firstChip = matchList.querySelector('div');
+          if (firstChip) firstChip.style.background = '#00cec9'; // visual hint
           // Don't auto-confirm — let user click. Just highlight.
         }
       }, 400);
@@ -3596,7 +3970,7 @@
 
       try {
         var conf = _getCurrentDotConf(orchestrator);
-        await _sendDotConfKnock(tenantId, conf.displayID, typedName, msg);
+        await _sendDotConfKnock(_getTenantId(orchestrator), conf.displayID, typedName, msg);
         status.style.display  = 'block';
         status.style.color    = '#00b894';
         status.textContent    = '✓ Message sent — the organiser will add you shortly.';
@@ -3831,7 +4205,73 @@
   // ─────────────────────────────────────────────────────────────────────────────
 
   var TILE_ASPECT        = 16 / 9;
-  var NOISE_FLOOR        = 0.08;
+  var NOISE_FLOOR        = 0.08;    // legacy — speech detection now uses the settings below
+
+  // ── Speech detection ─────────────────────────────────────────────────────────
+  // Levels are linear (0..1) but loudness is logarithmic, so work in dB.
+  //  • Background = the quietest moment in the last ~6 s. Speech always has gaps,
+  //    so this tracks the real background; a steady machine (a dryer, a fan)
+  //    becomes "background" within a few seconds.
+  //  • Speech fluctuates syllable to syllable; machine noise is steady. A sound
+  //    must swing by SPEECH_MIN_SWING dB within ~1.6 s to count as speech.
+  //  • Two bars above that background: a high one to START speaking (voices
+  //    open well above the room; clunks and distant sounds don't), and a lower
+  //    one to KEEP speaking (between words a voice drops much closer to the
+  //    background). Plus an absolute minimum. Short pauses don't end an utterance.
+  //    Tuned on a real recording: a dryer peaked ~15 dB above background,
+  //    speech onsets were 17–25 dB above it.
+  // Tunable live:  window.app.dotconfSetSensitivity({ minLevel, startDb, aboveFloorDb, minSwingDb, hangMs })
+  var SPEECH_MIN_LEVEL    = 0.012;  // ≈ −38 dBFS: anything quieter is never speech
+  var SPEECH_START_DB     = 18;     // dB above background to START an utterance
+  var SPEECH_ABOVE_FLOOR  = 8;      // dB above background to KEEP an utterance going
+  var SPEECH_MIN_SWING    = 6;      // dB of rise-and-fall within the swing window
+  var SPEECH_HANG_MS      = 450;    // pauses shorter than this don't end an utterance
+  var SPEECH_CONFIRM_TICKS = 5;     // heard readings (200 ms each, ≈1 s) needed before a bubble grows
+  var _speechHeardTicks   = {};     // displayID → heard readings in the current utterance
+  var SPEECH_FLOOR_TICKS  = 30;     // background window: 30 × 200 ms ≈ 6 s
+  var SPEECH_SWING_TICKS  = 8;      // swing window: 8 × 200 ms ≈ 1.6 s
+  var _levelHist          = {};     // displayID → recent levels in dB, one per layout tick
+  var _noiseFloorDb       = {};     // displayID → background estimate in dB
+
+  function _levelDb(level) { return 20 * Math.log10(Math.max(level, 1e-5)); }
+
+  // Called once per layout tick per person.
+  function _updateNoiseFloor(id, level) {
+    var h = _levelHist[id] || (_levelHist[id] = []);
+    h.push(_levelDb(level));
+    if (h.length > SPEECH_FLOOR_TICKS) h.shift();
+    // Until there's ~1 s of history, assume a quiet room rather than trusting a few samples.
+    _noiseFloorDb[id] = h.length >= 5 ? Math.min.apply(null, h) : Math.min(-50, Math.min.apply(null, h));
+  }
+
+  function _levelSwingDb(id) {
+    var h = _levelHist[id];
+    if (!h || h.length < 2) return 99; // no history yet: don't block on swing
+    var recent = h.slice(-SPEECH_SWING_TICKS);
+    return Math.max.apply(null, recent) - Math.min.apply(null, recent);
+  }
+
+  // inUtterance: already speaking → the lower "keep going" bar applies.
+  function _isSpeechLevel(id, level, inUtterance) {
+    if (level < SPEECH_MIN_LEVEL) return false;
+    var f = _noiseFloorDb[id];
+    var bar = inUtterance ? SPEECH_ABOVE_FLOOR : SPEECH_START_DB;
+    if (_levelDb(level) < (f === undefined ? -50 : f) + bar) return false;
+    return _levelSwingDb(id) >= SPEECH_MIN_SWING;
+  }
+
+  function _dotconfSetSensitivity(opts) {
+    opts = opts || {};
+    if (typeof opts.minLevel === 'number')     SPEECH_MIN_LEVEL   = Math.max(0.001, opts.minLevel);
+    if (typeof opts.aboveFloorDb === 'number') SPEECH_ABOVE_FLOOR = Math.max(0, opts.aboveFloorDb);
+    if (typeof opts.hangMs === 'number')       SPEECH_HANG_MS     = Math.max(0, opts.hangMs);
+    if (typeof opts.minSwingDb === 'number')   SPEECH_MIN_SWING   = Math.max(0, opts.minSwingDb);
+    if (typeof opts.startDb === 'number')      SPEECH_START_DB    = Math.max(0, opts.startDb);
+    if (typeof opts.confirmTicks === 'number') SPEECH_CONFIRM_TICKS = Math.max(1, Math.round(opts.confirmTicks));
+    return { minLevel: SPEECH_MIN_LEVEL, startDb: SPEECH_START_DB, aboveFloorDb: SPEECH_ABOVE_FLOOR,
+             confirmTicks: SPEECH_CONFIRM_TICKS,
+             minSwingDb: SPEECH_MIN_SWING, hangMs: SPEECH_HANG_MS };
+  }
   var MORPH_HYSTERESIS   = 0.38;
   var HOST_CENTER_RADIUS = 135;
   var HOST_MIN_RECT_W    = 0.35;
@@ -3875,7 +4315,6 @@
       var { canvas, ctx } = _getSnapshotCanvas();
       ctx.drawImage(videoEl, 0, 0, SNAPSHOT_W, SNAPSHOT_H);
       _frozenFrames[displayID] = canvas.toDataURL('image/jpeg', 0.7);
-      logger.debug('[dotconf] frame captured for', displayID);
     } catch (e) {
       // Cross-origin or security error — silently skip
     }
@@ -3985,23 +4424,45 @@
 
 
 
+  // Audio level 0..1. Takes the higher of the Web Audio analyser (fine-grained,
+  // but can read silence: suspended AudioContext, or Chrome feeding silence from
+  // remote WebRTC tracks into Web Audio) and getStats() (always works). A track
+  // can sit under two keys in _tracks (browser id and Cloudflare trackName),
+  // so check both.
+  function _levelOf(t) { return t ? Math.max(t.audioLevel || 0, t.statsLevel || 0) : 0; }
+
   function _getAudioLevel(displayID) {
-      var isLocal = displayID === _cachedMyId; // see note below
-      if (isLocal) {
+      if (displayID === _cachedMyId) {
         var myAudioTrack = _localStream ? _localStream.getAudioTracks()[0] : null;
-        if (!myAudioTrack) return 0;
-        var track = _tracks[myAudioTrack.id];
-        return track?.audioLevel || 0;
+        if (!myAudioTrack || !myAudioTrack.enabled) return 0;
+        return _levelOf(_tracks[myAudioTrack.id]);
       }
       var rosterEntry = _roster[displayID];
       if (!rosterEntry) return 0;
-      var track = _tracks[rosterEntry.audioTrackId];
-      return track?.audioLevel || 0;
+      var t = _tracks[rosterEntry.audioTrackId];
+      var browserId = t && t.mediaStreamTrack && t.mediaStreamTrack.id;
+      return Math.max(_levelOf(t), browserId ? _levelOf(_tracks[browserId]) : 0);
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // generateDotPositions override — conf depth 2
   // ─────────────────────────────────────────────────────────────────────────────
+
+  // One home angle per participant, shared by the pre-call layout and the
+  // in-call bubble engine, so a dot keeps its direction from the centre when
+  // the call starts. Golden-angle steps over the hash-sorted list: evenly
+  // spread, and identical on every screen (same participants → same angles).
+  var DOTCONF_GOLDEN = Math.PI * (3 - Math.sqrt(5));
+
+  function _dotconfHomeAngles(participants, hostDisplayID) {
+    var ids = (participants || [])
+      .map(p => p && p.displayID)
+      .filter(id => id && id !== hostDisplayID);
+    ids.sort((a, b) => _bubbleHash(a) - _bubbleHash(b) || (a < b ? -1 : a > b ? 1 : 0));
+    var angles = new Map();
+    ids.forEach((id, k) => angles.set(id, k * DOTCONF_GOLDEN));
+    return angles;
+  }
 
   function _dotconfGeneratePositions(items, entityType, margin, orchestrator, originalFn) {
     if (orchestrator.currentApp?.id !== 'conf' ||
@@ -4049,14 +4510,16 @@
     outer.sort(byHash);
 
     var positions = new Array(items.length);
-    var GOLDEN = Math.PI * (3 - Math.sqrt(5)); // ~137.5°: successive points never line up
+    var GOLDEN = DOTCONF_GOLDEN; // ~137.5°: successive points never line up
+    var homeAngles = _dotconfHomeAngles(items, hostDisplayID); // same angles the call uses
 
     // Sunflower spiral within the annulus band [t0, t1] (0 = edge of keep-out, 1 = canvas edge).
     function place(list, t0, t1, rotation) {
       var n = list.length;
       list.forEach((idx, k) => {
         var t = Math.sqrt(t0 * t0 + (t1 * t1 - t0 * t0) * (k + 0.5) / n); // area-uniform
-        var a = rotation + k * GOLDEN;
+        var hid = items[idx] && items[idx].displayID;
+        var a = homeAngles.has(hid) ? homeAngles.get(hid) : rotation + k * GOLDEN;
         positions[idx] = {
           x: cx + Math.cos(a) * (keepOut + t * (rx - keepOut)),
           y: cy + Math.sin(a) * (keepOut + t * (ry - keepOut)),
@@ -4354,9 +4817,19 @@
     var p = (conf?.participants || []).find(x => x.displayID === pid);
     if (!p || p.isHost || tile.querySelector('.dotconf-tile-actions')) return;
 
+    // Place the buttons where the shape has room. A round bubble clips its
+    // corners, so top-right would be cut off: centre them near the top instead.
+    // Too small for two buttons inside → use the hover card (it has Pin/Remove too).
+    var w = tile.offsetWidth, h = tile.offsetHeight, shorter = Math.min(w, h);
+    if (shorter < 76) { _dotconfShowCard(orchestrator, tile, pid); return; }
+    var radius = parseFloat(tile.style.borderRadius) || 0;
+    var isRound = radius >= shorter * 0.4;
+
     var box = document.createElement('div');
     box.className = 'dotconf-tile-actions';
-    box.style.cssText = 'position:absolute;top:6px;right:6px;z-index:3;display:flex;gap:4px;';
+    box.style.cssText = 'position:absolute;z-index:3;display:flex;gap:4px;' + (isRound
+      ? 'top:' + Math.max(6, Math.round(shorter * 0.08)) + 'px;left:50%;transform:translateX(-50%);'
+      : 'top:8px;right:8px;');
     box.appendChild(_dotconfTileIconBtn('Pin ' + (p.name || ''),
       '<path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z"/>',
       () => _dotconfPinParticipant(orchestrator, pid)));
@@ -4989,16 +5462,13 @@
 
 
   function _dotconfApplyStaticPresenceStyles(orchestrator) {
-    console.log('[diag] entered, _dotconfCallLive:', orchestrator._dotconfCallLive);
-    if (orchestrator._dotconfCallLive) { console.log('[diag] bailed — call is live'); return; }
+    if (orchestrator._dotconfCallLive) return;
    
     var conf = _getCurrentDotConf(orchestrator);
-    console.log('[diag] conf:', conf, 'participants:', conf?.participants?.length);
-    if (!conf?.participants) { console.log('[diag] bailed — no conf/participants'); return; }
+    if (!conf?.participants) return;
    
     var canvas = document.getElementById('canvas-area');
-    console.log('[diag] canvas element:', canvas);
-    if (!canvas) { console.log('[diag] bailed — no canvas-area element found'); return; }
+    if (!canvas) return;
    
     var shorter    = Math.min(canvas.offsetWidth || 800, canvas.offsetHeight || 600);
     var minDotSize = shorter * 0.06;
@@ -5026,15 +5496,11 @@
       if (isLive) return;
    
       var dot = _getDotElement(p.displayID);
-      if (p.displayID === '1an9ww2piuo46') { // P7 — swap in the real value if it changed
-        console.log('[diag] P7 — dot element:', dot, 'presenceState:', p.presenceState);
-      }
       if (!dot) return;
       _morphToPresenceDot(dot, p.displayID, minDotSize, p.presenceState, true, orchestrator, p.name);
     });
    
     _dotconfRenderPreviews(orchestrator);
-    console.log('[diag] finished loop');
   }
 
 
@@ -5090,11 +5556,11 @@
     if (!conf?.participants) return null;
     // Host participant has presenceState that was set first, or we can match
     // against the tenantId (host displayID) stored in currentPath[0]
+    var flagged = conf.participants.find(p =>
+      p.isHost === true || (_roster[p.displayID] && _roster[p.displayID].isHost === true));
+    if (flagged) return flagged.displayID;
     var tenantDisplayID = orchestrator.currentPath?.[0]?.displayID;
-    return conf.participants.find(p =>
-      p.displayID === tenantDisplayID ||
-      p.isHost === true
-    )?.displayID || null;
+    return conf.participants.find(p => p.displayID === tenantDisplayID)?.displayID || null;
   }
   
   function _createHostCenterTile(hostDisplayID, hostLabel, hostColor) {
@@ -5135,6 +5601,790 @@
     return dot;
   }
   
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Bubble layout engine (in-call)
+  //
+  // _tickLayout (200 ms) decides who matters: confirmed speakers, pins, who gets
+  // video. This engine turns those decisions into a weight and a shape per
+  // participant and animates the canvas with requestAnimationFrame:
+  //   • bubble area ∝ weight, total area normalised to ~half the canvas
+  //   • host fixed at the centre; everyone else has a home angle (from their
+  //     ID hash) and springs back to it after being pushed aside
+  //   • the top K speakers morph from circle to tile (16:9 or square)
+  //   • people not in the call sit as small dots around the edge
+  // Elements are moved with transform only; width/height change only while a
+  // bubble is actually resizing. The loop sleeps once everything is at rest
+  // and is woken by _tickLayout, a canvas resize, or a re-render.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  var BUBBLE_FILL_LANDSCAPE = 0.46;  // fraction of canvas area the pack aims to cover
+  var BUBBLE_FILL_PORTRAIT  = 0.42;
+  var BUBBLE_TILE_CORNER    = 14;    // px corner radius of rect/square tiles
+  var BUBBLE_GLOW_RGB       = '0,184,148'; // "about to grow" glow (#00b894)
+  var BUBBLE_SHRINK_HOLD_MS = 1200;    // a speaker keeps full size this long after they stop
+  var BUBBLE_SHRINK_EASE    = 0.025;   // per-frame ease when shrinking (growing uses 0.06)
+  var BUBBLE_HOME_PULL      = 0.035;   // spring back to the home angle — strong enough that every
+                                       // screen settles the same way, whatever the starting positions
+  var BUBBLE_WEIGHT = {
+    solo: 9, duo: 5.5, trio: 3.8,    // confirmed speaker(s), by how many are talking
+    recent: 1.4,                     // extra weight for a recent speaker, decays (half-life 2.5 s)
+    host: 2.2,                       // host floor
+    video: 1.6,                      // shown with video (feed tier)
+    pinned: 3,                       // host-pinned participant
+    live: 1, joining: 0.8
+  };
+
+  // shape: 'rect' | 'square' | 'circle' | null (auto: rect on landscape canvas,
+  // square on portrait). topK: how many of the largest bubbles become tiles.
+  // Exposed as orchestrator.dotconfSetBubbleLayout — the admin control later.
+  // Conference-wide: set by the host (later also the producer), stored on the
+  // conference record and pushed to everyone. shape null = automatic
+  // (wide tiles on a landscape screen, square on portrait).
+  var _bubbleOpts = { shape: null, topK: 2 };
+  try { localStorage.removeItem('dotconf_bubble_shape'); } catch (e) { /* old per-viewer setting */ }
+
+  var _bubbles       = new Map();  // displayID → bubble state
+  var _bubbleActive  = false;
+  var _bubbleRaf     = null;
+  var _bubbleCanvas  = null;
+  var _bubbleW = 0, _bubbleH = 0;
+  var _bubbleRO      = null;       // ResizeObserver on the canvas
+  var _bubbleMO      = null;       // MutationObserver: re-render replaced the dots
+  var _bubbleFill    = BUBBLE_FILL_LANDSCAPE;
+  var _bubbleCalm    = 0;
+  var _bubbleLastT   = 0;
+  var _bubbleOrch    = null;
+  var _bubbleLooksArgs = null;     // last args to _bubbleApplyLooks, reused after a re-render
+  var _bubbleRebindPending = false;
+
+  function _bubbleHash(s) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    return h;
+  }
+  function _lerp(a, b, t) { return a + (b - a) * t; }
+  function _clampN(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function _bubbleShape() {
+    if (_bubbleOpts.shape) return _bubbleOpts.shape;
+    return _bubbleW && _bubbleW < _bubbleH ? 'square' : 'rect';
+  }
+  // Tile half-extents per unit radius, at equal area to the circle (≈ π r²).
+  function _bubbleTileF(shape) {
+    if (shape === 'rect')   return [1.18, 0.665];
+    if (shape === 'square') return [0.9, 0.9];
+    return [1, 1];
+  }
+
+  function _bubbleMeasure() {
+    if (!_bubbleCanvas) return;
+    _bubbleW = _bubbleCanvas.offsetWidth  || 0;
+    _bubbleH = _bubbleCanvas.offsetHeight || 0;
+  }
+
+  function _bubbleEnsureCanvas() {
+    var canvas = document.getElementById('canvas-area');
+    if (!canvas || canvas === _bubbleCanvas) return;
+    if (_bubbleRO) _bubbleRO.disconnect();
+    if (_bubbleMO) _bubbleMO.disconnect();
+    _bubbleCanvas = canvas;
+    _bubbleMeasure();
+    if (typeof ResizeObserver === 'function') {
+      _bubbleRO = new ResizeObserver(() => { _bubbleMeasure(); _bubbleWake(); });
+      _bubbleRO.observe(canvas);
+    }
+    if (typeof MutationObserver === 'function') {
+      _bubbleMO = new MutationObserver(() => _bubbleRebindSoon());
+      _bubbleMO.observe(canvas, { childList: true });
+    }
+  }
+
+  function _bubbleCreate(id) {
+    var home = (_bubbleHash(id) % 3600) / 3600 * Math.PI * 2;
+    var W = _bubbleW || 800, H = _bubbleH || 600;
+    return {
+      id: id, home: home,
+      x: W / 2 + Math.cos(home) * W * 0.3, y: H / 2 + Math.sin(home) * H * 0.3,
+      vx: 0, vy: 0, hw: 10, hh: 10,
+      w: 1, tw: 1, m: 0, tm: 0, cf: 0, tcf: 0, recent: 0, lastUpd: 0,
+      spk: 0, tspk: 0, lastSpoke: 0,
+      host: false, outer: false, el: null, placed: false,
+      look: null, kind: null, pw: -1, ph: -1, prad: -1, pcf: -1
+    };
+  }
+
+  function _bubbleBind(b, el) {
+    if (!b.placed && _bubbleCanvas) {
+      // First time we see this person: start from wherever the pre-call layout
+      // put their dot, so joining doesn't make everything jump.
+      var cr = _bubbleCanvas.getBoundingClientRect(), er = el.getBoundingClientRect();
+      if (er.width > 0) {
+        b.x = er.left - cr.left + er.width / 2;
+        b.y = er.top  - cr.top  + er.height / 2;
+        b.hw = er.width / 2; b.hh = er.height / 2;
+      }
+    }
+    b.placed = true;
+    b.el = el;
+    b.look = null;
+    b.pw = b.ph = b.prad = b.pcf = -1;
+    el.dataset.dcBubble = '1';
+    // The platform's dot-fade-in animation holds its end values and beats inline
+    // styles — it would override our transform and park the dot at (0,0).
+    el.classList.remove('dot-fade-in');
+    el.style.animation = 'none';
+    el.style.transition = 'none';
+    el.style.left = '0px';
+    el.style.top  = '0px';
+    el.style.margin = '0';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translate3d(' + (b.x - b.hw) + 'px,' + (b.y - b.hh) + 'px,0)';
+    el.style.width  = (2 * b.hw) + 'px';
+    el.style.height = (2 * b.hh) + 'px';
+  }
+
+  function _bubbleRelease(b) {
+    var el = b.el;
+    if (!el || !el.isConnected) return;
+    ['transform', 'will-change', 'box-shadow', 'z-index'].forEach(p => el.style.removeProperty(p));
+    delete el.dataset.dcBubble;
+  }
+
+  // Attach every bubble to its current DOM element. render() can replace the
+  // dots at any time (SSE updates, screen-share relayout); physics state lives
+  // here, keyed by displayID, so new elements just pick up where the old left off.
+  function _bubbleBindAll(orchestrator, conf, hostDisplayID, hostLive) {
+    if (!_bubbleCanvas || !conf || !conf.participants) return false;
+    var stale = false;
+    _bubbles.forEach(b => { if (!b.el || !b.el.isConnected) stale = true; });
+    if (stale) _rebuildDotCache();
+
+    var rebound = false;
+    conf.participants.forEach(p => {
+      var b = _bubbles.get(p.displayID);
+      if (!b) return;
+      var el = _getDotElement(p.displayID);
+      if (el && !el.isConnected) el = null;
+      if (!el && p.displayID === hostDisplayID) {
+        // Pre-call styling removes the host's dot; in a call the host always has
+        // one at the centre — video when they're in, a small presence dot when not.
+        el = _createHostCenterTile(p.displayID, p.dotLabel, p.metadata?.displayConfig?.color);
+      }
+      if (el && el !== b.el) { _bubbleBind(b, el); rebound = true; }
+      if (!el) b.el = null;
+    });
+    return rebound;
+  }
+
+  function _bubbleRebindSoon() {
+    if (!_bubbleActive || _bubbleRebindPending) return;
+    _bubbleRebindPending = true;
+    requestAnimationFrame(() => {
+      _bubbleRebindPending = false;
+      if (!_bubbleActive || !_bubbleOrch) return;
+      var conf = _getCurrentDotConf(_bubbleOrch);
+      var hostId = _getHostDisplayID(_bubbleOrch);
+      var hostB  = hostId ? _bubbles.get(hostId) : null;
+      if (_bubbleBindAll(_bubbleOrch, conf, hostId, !!(hostB && hostB.host)) && _bubbleLooksArgs) {
+        var a = _bubbleLooksArgs;
+        _bubbleApplyLooks(_bubbleOrch, conf, a.videoTierIds, a.tileIds, a.myId);
+      }
+      _bubbleWake();
+    });
+  }
+
+  // Called from _tickLayout. Sets each bubble's target weight / glow, picks
+  // the tiles, and returns the set of displayIDs shown as tiles.
+  function _bubbleUpdate(orchestrator, conf, s) {
+    _bubbleOrch = orchestrator;
+    _bubbleEnsureCanvas();
+
+    var homes = _dotconfHomeAngles(conf.participants, s.hostDisplayID);
+    var active = s.confirmedIds.size;
+    var big = active <= 1 ? BUBBLE_WEIGHT.solo : active === 2 ? BUBBLE_WEIGHT.duo : BUBBLE_WEIGHT.trio;
+    var seen = new Set();
+    var changed = false;
+
+    conf.participants.forEach(p => {
+      var id = p.displayID;
+      if (!id) return;
+      seen.add(id);
+      var st = p.presenceState;
+      var inPack = st === 'live' || st === 'audio_only' || st === 'joining';
+
+      var b = _bubbles.get(id);
+      if (!b) { b = _bubbleCreate(id); _bubbles.set(id, b); changed = true; }
+      var hm = homes.get(id);
+      if (hm !== undefined && hm !== b.home) { b.home = hm; b.side = null; changed = true; }
+
+      var wasOuter = b.outer, wasSlot = b.hostSlot;
+      var isHostRow = id === s.hostDisplayID;
+      b.host     = isHostRow && s.hostLive;
+      b.hostSlot = isHostRow && !s.hostLive;   // host not in the call: a small dot holds the centre
+      b.outer    = !inPack && !isHostRow;
+      if (wasSlot !== b.hostSlot) changed = true;
+      if (wasOuter !== b.outer) changed = true;
+
+      var dtu = b.lastUpd ? s.now - b.lastUpd : 0;
+      b.lastUpd = s.now;
+      var confirmed = s.confirmedIds.has(id);
+      b.recent = confirmed ? 1 : b.recent * Math.pow(0.5, dtu / 2500);
+      if (confirmed) b.lastSpoke = s.now;
+      var holding = b.lastSpoke && (s.now - b.lastSpoke) < BUBBLE_SHRINK_HOLD_MS;
+      b.speaking = confirmed || holding || b.recent > 0.5;   // only speakers may outgrow the host
+      b.tspk = b.speaking ? 1 : 0;                           // eased in the frame loop
+
+      var tw = st === 'joining' ? BUBBLE_WEIGHT.joining
+                                : BUBBLE_WEIGHT.live + b.recent * BUBBLE_WEIGHT.recent;
+      if (s.videoishIds.has(id)) tw = Math.max(tw, BUBBLE_WEIGHT.video);
+      if (s.pinnedIds.has(id))   tw = Math.max(tw, BUBBLE_WEIGHT.pinned);
+      if (confirmed || holding)  tw = big;
+      if (b.host)                tw = Math.max(tw, BUBBLE_WEIGHT.host);
+      b.tw = tw;
+
+      b.tcf = s.confirmingSet.has(id)
+        ? Math.min(1, (s.now - (_speakingStarted[id] || s.now)) / CONFIRM_MS,
+                      (_speechHeardTicks[id] || 0) / SPEECH_CONFIRM_TICKS)
+        : 0;
+
+      if (Math.abs(b.tw - b.w) > 0.01 || Math.abs(b.tcf - b.cf) > 0.01 ||
+          Math.abs(b.tspk - b.spk) > 0.01) changed = true;
+    });
+
+    _bubbles.forEach((b, id) => {
+      if (!seen.has(id)) { _bubbleRelease(b); _bubbles.delete(id); changed = true; }
+    });
+
+    if (_bubbleBindAll(orchestrator, conf, s.hostDisplayID, s.hostLive)) changed = true;
+
+    // Tiles: the top K bubbles by current weight (the host counts, so there is
+    // always at least one tile), with hysteresis so a tile doesn't flicker back
+    // to a circle during a short pause. Bubbles at plain live weight never qualify.
+    var K = _bubbleShape() === 'circle' ? 0 : _bubbleOpts.topK;
+    var tileIds = new Set();
+    var ranked = [];
+    _bubbles.forEach(b => { if (b.outer || b.hostSlot) b.tm = 0; else ranked.push(b); });
+    ranked.sort((a, c) => c.w - a.w);
+    ranked.forEach((b, rank) => {
+      var on = K > 0 && (b.m > 0.5 ? (rank < K + 1 && b.w > 1.15)   // keep: may slip one place
+                                   : (rank < K && b.w > 1.3));       // become
+      b.tm = on ? 1 : 0;
+      if (on) tileIds.add(b.id);
+      if (Math.abs(b.tm - b.m) > 0.01) changed = true;
+    });
+
+    if (changed) _bubbleWake();
+    return tileIds;
+  }
+
+  // What each bubble shows. Applied only when it changes (or after a re-render),
+  // never per frame.
+  function _bubbleApplyLooks(orchestrator, conf, videoTierIds, tileIds, myId) {
+    _bubbleLooksArgs = { videoTierIds: videoTierIds, tileIds: tileIds, myId: myId };
+    if (!conf || !conf.participants) return;
+
+    conf.participants.forEach(p => {
+      var id = p.displayID;
+      var b  = _bubbles.get(id);
+      if (!b || !b.el) return;
+      var st = p.presenceState;
+
+      var hasVid;
+      if (id === myId) {
+        hasVid = !!(_localStream && _localStream.getVideoTracks()[0]) && !_cameraOff;
+      } else {
+        var r = _roster[id];
+        hasVid = !!(r && r.videoTrackId) && !(_mediaState[id] || {}).cameraOff && st !== 'audio_only';
+      }
+      var kind = (!b.outer && hasVid && videoTierIds.has(id))
+        ? (tileIds.has(id) ? 'tile' : 'feed')
+        : 'presence';
+      var look = kind + ':' + (kind === 'presence' ? st : '');
+      if (look === b.look) return;
+
+      var el = b.el;
+      b.look = look;
+      b.kind = kind;
+
+      if (kind === 'presence') {
+        var d = Math.max(8, Math.round(2 * Math.min(b.hw, b.hh))) || 20;
+        _morphToPresenceDot(el, id, d, st, true, orchestrator, p.name);
+        // _morphToPresenceDot sets left/top/size/transition for the old
+        // layout and clears the inline animation — put the engine's back.
+        el.classList.remove('dot-fade-in');
+        el.style.animation = 'none';
+        if (!el.style.getPropertyValue('opacity')) el.style.setProperty('opacity', '1', 'important');
+        el.style.transition = 'none';
+        el.style.left = '0px';
+        el.style.top  = '0px';
+      } else {
+        _clearPulse(el);
+        _clearPresenceStyling(el);
+        el.classList.remove('dot-fade-in', 'dotconf-added');
+        el.style.animation = 'none';
+        el.style.setProperty('--dot-target-opacity', '1');
+        el.style.setProperty('opacity', '1', 'important');
+        el.style.setProperty('background', '#1b2033', 'important'); // dark until the first frame arrives
+        el.style.filter   = 'none';
+        el.style.overflow = 'hidden';
+        el.dataset.morphed = kind === 'tile' ? 'true' : 'false';
+        el.dataset.tier    = kind === 'tile' ? 'rect' : 'feedDot';
+        var rr = _roster[id];
+        _attachVideoToTile(el, id, rr ? rr.videoTrackId : null, orchestrator);
+        if (el.querySelector('video.dotconf-tile-video')) _dotconfEnsureTileLabel(el, id, orchestrator);
+      }
+      el.style.zIndex = (b.host || b.hostSlot) ? '8' : kind === 'tile' ? '7' : b.outer ? '4' : '5';
+      b.pw = b.ph = b.prad = b.pcf = -1; // force a geometry repaint
+      _bubbleWake();
+    });
+  }
+
+  function _bubbleWake() {
+    _bubbleCalm = 0;
+    if (!_bubbleActive || _bubbleRaf) return;
+    _bubbleLastT = 0;
+    _bubbleRaf = requestAnimationFrame(_bubbleFrame);
+  }
+
+  // Push A and B apart if they overlap. Circles below m=0.5, rects above.
+  function _bubbleCollide(A, B, G, dry) {
+    var ar = A.m > 0.5, br = B.m > 0.5;
+    var dx = B.x - A.x, dy = B.y - A.y;
+    var nx = 0, ny = 0, o = 0;
+    if (!ar && !br) {
+      var ra = Math.max(A.hw, A.hh), rb = Math.max(B.hw, B.hh), d = Math.hypot(dx, dy) || 0.01;
+      o = ra + rb + G - d; nx = dx / d; ny = dy / d;
+    } else if (ar && br) {
+      var ox = A.hw + B.hw + G - Math.abs(dx), oy = A.hh + B.hh + G - Math.abs(dy);
+      if (ox <= 0 || oy <= 0) return 0;
+      if (ox < oy) { o = ox; nx = Math.sign(dx) || 1; ny = 0; }
+      else         { o = oy; nx = 0; ny = Math.sign(dy) || 1; }
+    } else {
+      var R = ar ? A : B, C = ar ? B : A, cr = Math.max(C.hw, C.hh);
+      var qx = _clampN(C.x, R.x - R.hw, R.x + R.hw), qy = _clampN(C.y, R.y - R.hh, R.y + R.hh);
+      var ex = C.x - qx, ey = C.y - qy, dd = Math.hypot(ex, ey), ux, uy;
+      if (dd < 0.01) {
+        var px = R.hw - Math.abs(C.x - R.x), py = R.hh - Math.abs(C.y - R.y);
+        if (px < py) { ux = Math.sign(C.x - R.x) || 1; uy = 0; o = px + cr + G; }
+        else         { ux = 0; uy = Math.sign(C.y - R.y) || 1; o = py + cr + G; }
+      } else { ux = ex / dd; uy = ey / dd; o = cr + G - dd; }
+      nx = ar ? ux : -ux; ny = ar ? uy : -uy;
+    }
+    if (o <= 0) return 0;
+    if (dry) return o;
+    var sa = Math.max(A.hw, A.hh), sb = Math.max(B.hw, B.hh);
+    var wa = sb / (sa + sb), wb = sa / (sa + sb);
+    if (A.host || A.hostSlot) { wa = 0; wb = 1; } else if (B.host || B.hostSlot) { wa = 1; wb = 0; }
+    if (A.outer) { wa *= 0.2; wb = 1 - wa; }
+    if (B.outer) { wb *= 0.2; wa = 1 - wb; }
+    A.x -= nx * o * wa; A.y -= ny * o * wa;
+    B.x += nx * o * wb; B.y += ny * o * wb;
+    return o;
+  }
+
+  // Move b out of the fixed centre bubble C along the axis with room. Boxes are
+  // used when either is a tile (rect/square); round pairs are left to the
+  // circular collision, which can already slide around.
+  function _bubbleSeparateFromCentre(b, C, G, inset, W, H) {
+    if (b.m <= 0.5 && C.m <= 0.5) return;
+    var bw = b.m > 0.5 ? b.hw : Math.max(b.hw, b.hh);
+    var bh = b.m > 0.5 ? b.hh : Math.max(b.hw, b.hh);
+    var gx = C.hw + bw + G, gy = C.hh + bh + G;
+    if (Math.abs(b.x - C.x) >= gx || Math.abs(b.y - C.y) >= gy) return; // already clear
+    var minX = b.hw + inset, maxX = W - b.hw - inset;
+    var minY = b.hh + inset, maxY = H - b.hh - inset;
+    // Left, right, above, below — with the direction each side faces.
+    var options = [
+      { side: 0, x: C.x - gx, y: b.y, dir: Math.PI },
+      { side: 1, x: C.x + gx, y: b.y, dir: 0 },
+      { side: 2, x: b.x, y: C.y - gy, dir: -Math.PI / 2 },
+      { side: 3, x: b.x, y: C.y + gy, dir: Math.PI / 2 }
+    ].filter(o => o.x >= minX - 0.5 && o.x <= maxX + 0.5 && o.y >= minY - 0.5 && o.y <= maxY + 0.5);
+    if (!options.length) return; // no side has room yet — auto-fit will shrink things
+
+    // Stay on the side already chosen (no flip-flopping); otherwise take the
+    // side that faces this person's home angle, so every screen agrees.
+    var best = options.find(o => o.side === b.side);
+    if (!best) {
+      var angDist = a => { var d = Math.abs(a - b.home) % (2 * Math.PI); return d > Math.PI ? 2 * Math.PI - d : d; };
+      best = options.reduce((m, o) => (angDist(o.dir) < angDist(m.dir) ? o : m));
+    }
+    b.side = best.side;
+    b.x = _clampN(best.x, minX, maxX);
+    b.y = _clampN(best.y, minY, maxY);
+    b.vx = b.vy = 0;
+  }
+
+  function _bubbleFrame(t) {
+    _bubbleRaf = null;
+    if (!_bubbleActive) return;
+    var dt = _bubbleLastT ? Math.min(50, t - _bubbleLastT) : 16.7;
+    _bubbleLastT = t;
+
+    if (!_bubbleW || !_bubbleH) _bubbleMeasure();
+    var W = _bubbleW, H = _bubbleH;
+    if (!W || !H) return;
+
+    var f   = dt / 16.7;
+    var cx  = W / 2, cy = H / 2;
+    var G   = Math.max(12, Math.min(W, H) * 0.026); // gap between bubbles
+    var pad = 10;
+    var ease  = 1 - Math.pow(0.94, f);
+    var sEase = 1 - Math.pow(1 - BUBBLE_SHRINK_EASE, f);
+    var mEase = 1 - Math.pow(0.91, f);
+    var cEase = 1 - Math.pow(0.80, f);
+    var tf  = _bubbleTileF(_bubbleShape());
+
+    var pack = [], outer = [], host = null, slot = null, moved = 0;
+    _bubbles.forEach(b => {
+      var hasEl = b.el && b.el.isConnected;
+      if (!hasEl && !b.host && !b.hostSlot) return; // the centre is held even without an element
+      var dw = (b.tw - b.w) * (b.tw < b.w ? sEase : ease);   // grow briskly, shrink gently
+      var dm = (b.tm - b.m) * mEase, dc = (b.tcf - b.cf) * cEase;
+      var ds = (b.tspk - (b.spk || 0)) * (b.tspk < b.spk ? sEase : ease);
+      b.w += dw; b.m += dm; b.cf += dc; b.spk = (b.spk || 0) + ds;
+      moved = Math.max(moved, Math.abs(ds) * 40);
+      moved = Math.max(moved, Math.abs(dw) * 20, Math.abs(dm) * 40, Math.abs(dc) * 40);
+      if (b.outer) outer.push(b);
+      else if (b.hostSlot) slot = b;
+      else pack.push(b);
+      if (b.host) host = b;
+    });
+    // Same order on every screen, so collisions resolve the same way everywhere.
+    var byId = (a, c) => (a.id < c.id ? -1 : a.id > c.id ? 1 : 0);
+    pack.sort(byId); outer.sort(byId);
+    var all = pack.concat(outer);
+    if (slot) all.push(slot);
+    if (!all.length) return;
+
+    var prev = all.map(b => [b.x, b.y, b.hw, b.hh]);
+
+    // People not in the call sit in a ring along the canvas edge. Keep that
+    // ring free: the pack (host included) is sized and clamped inside it.
+    var or   = Math.max(8, Math.min(W, H) * 0.028);
+    var band = outer.length ? 2 * or + 16 : 0;
+    var iw = W - 2 * band, ih = H - 2 * band;
+
+    // Radii: total pack area ≈ _bubbleFill of the inner area.
+    var sum = pack.reduce((a, b) => a + Math.PI * b.w, 0) || 1;
+    var k = Math.sqrt(_bubbleFill * iw * ih / sum);
+    var ext = b => [_lerp(1, tf[0], b.m), _lerp(1, tf[1], b.m)];
+
+    // Host size caps: a quiet host leaves room for everyone; a speaking host
+    // may grow like any other speaker. All caps shrink with auto-fit (fitScale),
+    // so a layout that can't resolve always gets smaller until it does.
+    var target    = W / H < 0.8 ? BUBBLE_FILL_PORTRAIT : BUBBLE_FILL_LANDSCAPE;
+    var fitScale  = Math.min(1, Math.sqrt(_bubbleFill / target));
+    var silentCap = (pack.length === 1 ? 0.36 : 0.3) * Math.min(iw, ih) * fitScale;
+    var talkCap   = 0.42 * Math.min(iw, ih) * fitScale;
+
+    var hostHW = 0, hostHH = 0;
+    if (host) {
+      var he = ext(host);
+      var hostCap = Math.min(
+        _lerp(silentCap, talkCap, host.spk || 0) / Math.max(he[0], he[1]),
+        (iw / 2 - G) / he[0],
+        (ih / 2 - G) / he[1]);
+      var hr = Math.min(k * Math.sqrt(host.w), hostCap);
+      host.hw = hr * he[0]; host.hh = hr * he[1];
+      host.x = cx; host.y = cy; host.vx = host.vy = 0;
+      hostHW = host.hw; hostHH = host.hh;
+    } else if (slot) {
+      // Host hasn't joined: keep the centre for them with a small fixed dot,
+      // so nobody else (including me) settles in the middle.
+      slot.hw = slot.hh = or * 1.6;
+      slot.x = cx; slot.y = cy; slot.vx = slot.vy = 0;
+      hostHW = slot.hw; hostHH = slot.hh;
+    }
+
+    // The host's quiet size (equal-area radius) is the ceiling for everyone who
+    // isn't speaking — also while the host speaks, so the others don't grow with
+    // them, and before the host has joined. Measured in the host's current shape:
+    // a 16:9 tile has to be smaller than its circle to fit the same space.
+    var qe = host ? ext(host) : [1, 1];
+    var hostRef = Math.min(k * Math.sqrt(BUBBLE_WEIGHT.host),
+                           silentCap / Math.max(qe[0], qe[1]),
+                           (iw / 2 - G) / qe[0],
+                           (ih / 2 - G) / qe[1]);
+
+    var portraitPull  = H / W > 1 ? 1.6 : 1;
+    var landscapePull = W / H > 1 ? 1.6 : 1;
+    pack.forEach(b => {
+      if (b.host) return;
+      var e = ext(b);
+      // A bubble must fit either beside the host or above/below it.
+      var beside = Math.min((iw / 2 - hostHW - G - pad) / (2 * e[0]), (ih - 2 * pad) / (2 * e[1]));
+      var above  = Math.min((iw - 2 * pad) / (2 * e[0]), (ih / 2 - hostHH - G - pad) / (2 * e[1]));
+      var r = Math.min(k * Math.sqrt(b.w), Math.max(beside, above, 10) * fitScale);
+      // Non-speakers stay below the host; blend the limit in as speech fades.
+      var quietCap = hostRef * 0.85;
+      if (r > quietCap) r = quietCap + (r - quietCap) * (b.spk || 0);
+      b.hw = r * e[0]; b.hh = r * e[1];
+
+      // Pull toward the host, plus a spring back to this person's home angle.
+      var g = 0.0018;
+      b.vx += (cx - b.x) * g * f * portraitPull;
+      b.vy += (cy - b.y) * g * f * landscapePull;
+      var nx = (b.x - cx) / W, ny = (b.y - cy) / H, nd = Math.hypot(nx, ny);
+      var tx = cx + Math.cos(b.home) * nd * W, ty = cy + Math.sin(b.home) * nd * H;
+      b.vx += (tx - b.x) * BUBBLE_HOME_PULL * f;
+      b.vy += (ty - b.y) * BUBBLE_HOME_PULL * f;
+      b.vx *= 0.84; b.vy *= 0.84;
+      b.x += b.vx * f; b.y += b.vy * f;
+    });
+
+    outer.forEach(b => {
+      b.hw = b.hh = or;
+      var ax = cx + Math.cos(b.home) * (W / 2 - or - 14);
+      var ay = cy + Math.sin(b.home) * (H / 2 - or - 14);
+      b.x += (ax - b.x) * 0.08 * f; b.y += (ay - b.y) * 0.08 * f;
+    });
+
+    var centre = host || slot;
+    var resid = 0, L = all.length;
+    for (var it = 0; it < 6; it++) {
+      resid = 0;
+      // Alternate pass direction so resolution order adds no rotational drift.
+      for (var a = 0; a < L; a++) for (var c = a + 1; c < L; c++) {
+        resid += it % 2 ? _bubbleCollide(all[L - 1 - a], all[L - 1 - c], G)
+                        : _bubbleCollide(all[a], all[c], G);
+      }
+      all.forEach(b => {
+        if (b.host || b.hostSlot) return;
+        var inset = b.outer ? pad : band + pad; // pack stays inside the edge ring
+        b.x = _clampN(b.x, b.hw + inset, W - b.hw - inset);
+        b.y = _clampN(b.y, b.hh + inset, H - b.hh - inset);
+        // The centre bubble never moves, and clamping can push a bubble back
+        // into it: move it out on a side that has room. Done inside the loop
+        // so neighbours get to respond on the next pass.
+        if (centre && b !== centre) _bubbleSeparateFromCentre(b, centre, G, inset, W, H);
+      });
+    }
+
+    // Measure what overlap is left (without moving anything).
+    resid = 0;
+    for (var a2 = 0; a2 < L; a2++) for (var c2 = a2 + 1; c2 < L; c2++) {
+      resid += _bubbleCollide(all[a2], all[c2], G * 0.5, true);
+    }
+
+    // Auto-fit: shrink everything while anything still overlaps, grow back when it can.
+    if (resid > 1) { _bubbleFill = Math.max(0.22, _bubbleFill - 0.004 * f); moved = Math.max(moved, 1); }
+    else if (_bubbleFill < target) { _bubbleFill = Math.min(target, _bubbleFill + 0.0012 * f); moved = Math.max(moved, 1); }
+
+    all.forEach((b, i) => {
+      var p = prev[i];
+      moved = Math.max(moved, Math.abs(b.x - p[0]), Math.abs(b.y - p[1]), Math.abs(b.hw - p[2]), Math.abs(b.hh - p[3]));
+      if (b.el && b.el.isConnected) _bubblePaint(b);
+    });
+
+    _bubbleCalm = moved < 0.08 ? _bubbleCalm + 1 : 0;
+    if (_bubbleCalm < 20) _bubbleRaf = requestAnimationFrame(_bubbleFrame);
+  }
+
+  function _bubblePaint(b) {
+    var el = b.el, s = el.style;
+    var w = 2 * b.hw, h = 2 * b.hh;
+    if (Math.abs(w - b.pw) > 0.4 || Math.abs(h - b.ph) > 0.4) {
+      s.width = w + 'px'; s.height = h + 'px';
+      b.pw = w; b.ph = h;
+      if (b.kind === 'presence') s.fontSize = Math.max(10, Math.min(w, h) * 0.32) + 'px';
+    }
+    var rad = _lerp(Math.min(b.hw, b.hh), BUBBLE_TILE_CORNER, b.m);
+    if (Math.abs(rad - b.prad) > 0.4) { s.borderRadius = rad + 'px'; b.prad = rad; }
+    s.transform = 'translate3d(' + (b.x - b.hw).toFixed(1) + 'px,' + (b.y - b.hh).toFixed(1) + 'px,0)';
+    if (Math.abs(b.cf - b.pcf) > 0.01) {
+      b.pcf = b.cf;
+      s.boxShadow = b.cf > 0.01
+        ? '0 0 ' + (8 + b.cf * 28).toFixed(1) + 'px ' + (b.cf * 4).toFixed(1) + 'px rgba(' + BUBBLE_GLOW_RGB + ',' + (b.cf * 0.75).toFixed(2) + ')'
+        : '';
+    }
+  }
+
+  function _bubbleStart(orchestrator) {
+    _bubbleOrch = orchestrator;
+    _bubbleActive = true;
+    _bubbleFill = BUBBLE_FILL_LANDSCAPE;
+    _bubbleEnsureCanvas();
+    _bubbleWake();
+  }
+
+  function _bubbleStop() {
+    _bubbleActive = false;
+    if (_bubbleRaf) { cancelAnimationFrame(_bubbleRaf); _bubbleRaf = null; }
+    if (_bubbleRO) { _bubbleRO.disconnect(); _bubbleRO = null; }
+    if (_bubbleMO) { _bubbleMO.disconnect(); _bubbleMO = null; }
+    _bubbles.forEach(b => _bubbleRelease(b));
+    _bubbles.clear();
+    _bubbleCanvas = null;
+    _bubbleW = _bubbleH = 0;
+    _bubbleLooksArgs = null;
+  }
+
+  // Apply a layout on this screen only. Called for the conference layout (roster,
+  // SSE) and optimistically when the host changes it.
+  function _dotconfSetBubbleLayout(opts) {
+    opts = opts || {};
+    if ('shape' in opts) _bubbleOpts.shape = ['rect', 'square', 'circle'].includes(opts.shape) ? opts.shape : null;
+    if ('topK'  in opts && opts.topK != null) _bubbleOpts.topK = _clampN(parseInt(opts.topK, 10) || 2, 2, 3);
+    _syncLayoutToggle();
+    _bubbleWake();
+    if (_bubbleOrch && _layoutInterval) _tickLayout(_bubbleOrch); // re-pick tiles now, not on the next tick
+    return Object.assign({}, _bubbleOpts);
+  }
+
+  // Host changes the layout for everyone: show it here at once, then save; the
+  // server broadcasts it to every screen (including this one).
+  async function _dotconfRequestLayout(orchestrator, opts) {
+    var conf = _getCurrentDotConf(orchestrator);
+    if (!conf || !orchestrator.isDataOwner()) return;
+    var before = Object.assign({}, _bubbleOpts);
+    var next   = Object.assign({}, before, opts);
+    _dotconfSetBubbleLayout(next);
+    try {
+      await _cfApi('POST /' + conf.displayID + '/layout?tenantId=' + _getTenantId(orchestrator),
+                   { shape: next.shape, topK: next.topK });
+    } catch (e) {
+      console.error('[dotconf] layout change failed:', e);
+      _dotconfSetBubbleLayout(before);
+      _showError('Could not change the layout — please try again.');
+    }
+  }
+
+
+  // ── Layout switch for the context bar ────────────────────────────────────────
+  // Three icon buttons: bubbles / wide tiles / square tiles. Built by the
+  // extension, inserted by renderContextBar via window.app.dotconfBuildLayoutToggle().
+  // Per-viewer for now (remembered in localStorage); becomes the host/admin's
+  // conference-wide control when that lands.
+
+  var DOTCONF_SHAPE_CHOICES = [
+    { shape: 'circle', label: 'Bubbles',      svg: '<circle cx="12" cy="12" r="7"/>' },
+    { shape: 'rect',   label: 'Wide tiles',   svg: '<rect x="3" y="7" width="18" height="10" rx="2"/>' },
+    { shape: 'square', label: 'Square tiles', svg: '<rect x="5" y="5" width="14" height="14" rx="2.5"/>' }
+  ];
+
+  function _dotconfBuildLayoutToggle(orchestrator) {
+    if (!orchestrator || !orchestrator.isDataOwner()) return null; // participants follow the host's layout
+    var group = document.createElement('div');
+    group.className = 'dotconf-layout-toggle';
+    group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', 'Call layout');
+    group.style.cssText = 'display:inline-flex;align-items:center;gap:2px;padding:2px;border-radius:10px;' +
+      'background:rgba(0,0,0,0.06);vertical-align:middle;';
+
+    DOTCONF_SHAPE_CHOICES.forEach(c => {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.dataset.shape = c.shape;
+      b.title = c.label;
+      b.setAttribute('aria-label', c.label);
+      b.style.cssText = 'all:unset;box-sizing:border-box;width:30px;height:28px;display:inline-flex;' +
+        'align-items:center;justify-content:center;border-radius:8px;cursor:pointer;color:#636e72;';
+      b.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" aria-hidden="true">' + c.svg + '</svg>';
+      b.onclick = function(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        _dotconfRequestLayout(orchestrator, { shape: c.shape });
+      };
+      b.addEventListener('focus',   () => { b.style.outline = '2px solid #00b894'; b.style.outlineOffset = '1px'; });
+      b.addEventListener('blur',    () => { b.style.outline = ''; });
+      group.appendChild(b);
+    });
+
+    // How many speakers become tiles. Not used in bubble (circle) mode.
+    var sep = document.createElement('span');
+    sep.style.cssText = 'width:1px;height:18px;background:rgba(0,0,0,0.12);margin:0 3px;';
+    group.appendChild(sep);
+    [2, 3].forEach(k => {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.dataset.topk = String(k);
+      b.textContent = String(k);
+      b.title = 'Top ' + k + ' speakers become tiles';
+      b.setAttribute('aria-label', b.title);
+      b.style.cssText = 'all:unset;box-sizing:border-box;width:24px;height:28px;display:inline-flex;' +
+        'align-items:center;justify-content:center;border-radius:8px;cursor:pointer;font-size:12px;font-weight:700;color:#636e72;';
+      b.onclick = function(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        if (_bubbleShape() === 'circle') return;
+        _dotconfRequestLayout(orchestrator, { topK: k });
+      };
+      b.addEventListener('focus', () => { b.style.outline = '2px solid #00b894'; b.style.outlineOffset = '1px'; });
+      b.addEventListener('blur',  () => { b.style.outline = ''; });
+      group.appendChild(b);
+    });
+
+    _syncLayoutToggle(group);
+    return group;
+  }
+
+  // Highlight the active shape. With no explicit choice, show what "auto" resolves to.
+  function _syncLayoutToggle(root) {
+    var groups = root ? [root] : document.querySelectorAll('.dotconf-layout-toggle');
+    var active = _bubbleShape();
+    var circle = active === 'circle';
+    groups.forEach(g => g.querySelectorAll('button').forEach(b => {
+      var isK = b.dataset.topk !== undefined;
+      var on  = isK ? (!circle && Number(b.dataset.topk) === _bubbleOpts.topK) : b.dataset.shape === active;
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.style.background = on ? '#fff' : 'transparent';
+      b.style.color      = on ? '#2d3436' : '#636e72';
+      b.style.boxShadow  = on ? '0 1px 3px rgba(0,0,0,0.15)' : 'none';
+      if (isK) {
+        b.style.opacity = circle ? '0.35' : '1';
+        b.style.cursor  = circle ? 'default' : 'pointer';
+        b.setAttribute('aria-disabled', circle ? 'true' : 'false');
+      }
+    }));
+  }
+  
+  var _audioEls = new Map();   // participantDisplayID → <audio>
+  var _audioBox = null;
+
+   // Each remote voice plays through its own hidden <audio> element. A WebRTC
+   // track that isn't attached to an element (or a Web Audio graph routed to the
+   // speakers) is never heard — which is why remote audio was silent.
+   function _dotconfAttachAudio(pid, track) {
+     if (!pid || !track || pid === _cachedMyId) return;
+     if (!_audioBox) {
+       _audioBox = document.createElement('div');
+       _audioBox.id = 'dotconf-audio';
+       _audioBox.hidden = true;
+       document.body.appendChild(_audioBox);
+     }
+     var el = _audioEls.get(pid);
+     if (!el) {
+       el = document.createElement('audio');
+       el.autoplay = true;
+       el.setAttribute('playsinline', '');
+       _audioBox.appendChild(el);
+       _audioEls.set(pid, el);
+     }
+     var cur = el.srcObject && el.srcObject.getAudioTracks()[0];
+     if (cur !== track) el.srcObject = new MediaStream([track]);
+     track.addEventListener('ended', () => _dotconfDropAudio(pid, track));
+     var p = el.play();
+     if (p && p.catch) p.catch(e => console.warn('[dotconf] audio play blocked for', pid, e && e.name));
+   }
+
+   function _dotconfDropAudio(pid, track) {
+     var el = _audioEls.get(pid);
+     if (!el) return;
+     var cur = el.srcObject && el.srcObject.getAudioTracks()[0];
+     if (track && cur && cur !== track) return; // a newer track replaced it
+     el.srcObject = null;
+     el.remove();
+     _audioEls.delete(pid);
+   }
+
+   function _dotconfAudioTeardown() {
+     _audioEls.forEach(el => { el.srcObject = null; el.remove(); });
+     _audioEls.clear();
+   }
+
+
   // ─────────────────────────────────────────────────────────────────────────────
   // Install
   // ─────────────────────────────────────────────────────────────────────────────
@@ -5230,6 +6480,9 @@
       // CLoudflare-PIN
       dotconfStartLayout:    (o) => dotconfStartLayout(o || orchestrator),
       dotconfStopLayout:     ()  => dotconfStopLayout(),
+      dotconfSetBubbleLayout: (opts) => _dotconfSetBubbleLayout(opts),   // this screen only; host changes go through the server
+      dotconfSetSensitivity:  (opts) => _dotconfSetSensitivity(opts),   // { minLevel, startDb, aboveFloorDb, minSwingDb, hangMs, confirmTicks }
+      dotconfBuildLayoutToggle: () => _dotconfBuildLayoutToggle(orchestrator),   // null for participants   // { shape: 'rect'|'square'|'circle'|null, topK: 0-4 }
       dotconfPinParticipant: (o, participantDisplayID) => _dotconfPinParticipant(o || orchestrator, participantDisplayID),
       dotconfHandleInviteClick: (o) => _dotconfHandleInviteClick(o || orchestrator),
       dotconfShouldShowInviteButton: (o) => _dotconfShouldShowInviteButton(o || orchestrator),
@@ -5270,6 +6523,25 @@
       });
   }
   
+  // Diagnostic: current audio level per participant, e.g. setInterval(() => console.table(__dotconfLevels()), 1000)
+  window.__dotconfLevels = function() {
+    var conf = window.app && _getCurrentDotConf(window.app);
+    var out = {};
+    (conf && conf.participants || []).forEach(p => {
+      var lvl = _getAudioLevel(p.displayID);
+      var floor = _noiseFloorDb[p.displayID];
+      out[p.name || p.displayID] = {
+        level: +lvl.toFixed(3),
+        dB: +_levelDb(lvl).toFixed(1),
+        backgroundDb: floor === undefined ? null : +floor.toFixed(1),
+        swingDb: +Math.min(99, _levelSwingDb(p.displayID)).toFixed(1),
+        speaking: _isSpeechLevel(p.displayID, lvl, !!_speakingStarted[p.displayID]),
+        confirmed: !!_speakingConfirmed[p.displayID]
+      };
+    });
+    return out;
+  };
+
   // TEMP diagnostic — remove after debugging
   window.__dotconfDiag = function() {
     var pc = _peerConnection;
@@ -5289,5 +6561,3 @@
   };
 
 })();
-
-

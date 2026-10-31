@@ -4523,22 +4523,23 @@ class SchemaOrchestrator {
 	/**
 	 * Send notification email to new subtenant
 	 */
-	async sendSubtenantNotificationEmail(subtenantData, parentTenantName, appUrl) {
-		const emailConfig = this.currentApp.emailConfig?.subtenantNotification;
-		if (!emailConfig) {
-			console.error('[EMAIL] No subtenant notification email config found');
-			return;
-		}
+   async sendSubtenantNotificationEmail(subtenantData, parentTenantName, appUrl, extraTemplateData) {
+       const emailConfig = this.currentApp.emailConfig?.subtenantNotification;
+       if (!emailConfig) {
+           console.error('[EMAIL] No subtenant notification email config found');
+           return;
+       }
 
-		const templateData = {
-			appName: this.currentApp.name,
-			pageName: 'Feedback Page',
-			platformName: 'newauth',
-			year: new Date().getFullYear(),
-			parentName: parentTenantName,
-			subtenantName: subtenantData.name,
-			appUrl: appUrl
-		};
+       const templateData = Object.assign({
+           appName: this.currentApp.name,
+           pageName: 'Feedback Page',
+           platformName: 'newauth',
+           year: new Date().getFullYear(),
+           parentName: parentTenantName,
+           subtenantName: subtenantData.name,
+           appUrl: appUrl
+       }, extraTemplateData || {});
+
 
 		const emailData = {
 			to: subtenantData.contactemail,
@@ -4554,11 +4555,13 @@ class SchemaOrchestrator {
 	/**
 	 * Replace template variables in strings
 	 */
-	replaceTemplateVariables(template, data) {
-		return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
-			return data[key] !== undefined ? data[key] : match;
-		});
-	}
+    replaceTemplateVariables(template, data) {
+        if (template === undefined || template === null) return '';
+        return String(template).replace(/\{\{(\w+)\}\}/g, (match, key) => {
+            return data[key] !== undefined ? data[key] : match;
+        });
+    }
+
 
 	/**
 	 * Generate tenant welcome email HTML template
@@ -7616,111 +7619,120 @@ class SchemaOrchestrator {
                 
                 console.log('[dotconf] renderContextBar firing, isDataOwner:', this.isDataOwner(), 
                                                                'confItem:', confItem, 'confStatus:', confStatus);
-   
-                                      if (this.isDataOwner()) {
-                                          var inCall   = window.app._dotconfCallLive === true;
-                                          var confLive = confStatus === 'live' || inCall;
-                                          var mkBtn = function(label, hoverColor, hoverBg, onClick) {
-                                              var b = document.createElement('button');
-                                              b.textContent = label;
-                                              b.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                                              b.onmouseenter = function() { if (b.disabled) return; b.style.background = hoverBg; b.style.borderColor = hoverColor; b.style.color = hoverColor; };
-                                              b.onmouseleave = function() { b.style.background = 'none'; b.style.borderColor = '#b2bec3'; b.style.color = '#636e72'; };
-                                              b.onclick = onClick;
-                                              return b;
-                                          };
+                                                               
+               if (this.isDataOwner()) {
+                   var inCall   = window.app._dotconfCallLive === true;
+                   var confLive = confStatus === 'live' || inCall;
+                   var mkBtn = function(label, hoverColor, hoverBg, onClick) {
+                       var b = document.createElement('button');
+                       b.textContent = label;
+                       b.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                       b.onmouseenter = function() { if (b.disabled) return; b.style.background = hoverBg; b.style.borderColor = hoverColor; b.style.color = hoverColor; };
+                       b.onmouseleave = function() { b.style.background = 'none'; b.style.borderColor = '#b2bec3'; b.style.color = '#636e72'; };
+                       b.onclick = onClick;
+                       return b;
+                   };
 
-                                          // Not in the call: Start it, or rejoin one that's still running.
-                                          if (!inCall) {
-                                              var startBtn = mkBtn(confLive ? '📞 Join Call' : '📞 Start Call', '#00b894', '#f0fff4', function() {
-                                                  if (typeof window.app.dotconfJoin === 'function') window.app.dotconfJoin(window.app);
-                                              });
-                                              startBtn.setAttribute('data-dotconf-join', '');
-                                              if (window.app._dotconfJoining) {
-                                                  startBtn.disabled = true;
-                                                  startBtn.style.opacity = '0.5';
-                                                  startBtn.style.cursor = 'default';
-                                              }
-                                              bar.appendChild(startBtn);
-                                          }
-                                          // Call running (whether or not the host is in it): End for everyone.
-                                          if (confLive) {
-                                              bar.appendChild(mkBtn('📵 End call', '#e17055', '#fff0f0', function() {
-                                                  if (typeof window.app.dotconfEndCall === 'function') window.app.dotconfEndCall(window.app);
-                                              }));
-                                          }
+                   // Not in the call: Start it, or rejoin one that's still running.
+                   if (!inCall) {
+                       var startBtn = mkBtn(confLive ? '📞 Join Call' : '📞 Start Call', '#00b894', '#f0fff4', function() {
+                           if (typeof window.app.dotconfJoin === 'function') window.app.dotconfJoin(window.app);
+                       });
+                       startBtn.setAttribute('data-dotconf-join', '');
+                       if (window.app._dotconfJoining) {
+                           startBtn.disabled = true;
+                           startBtn.style.opacity = '0.5';
+                           startBtn.style.cursor = 'default';
+                       }
+                       bar.appendChild(startBtn);
+                   }
+                   // In the call: the host sets the layout for everyone.
+                   if (inCall && typeof window.app.dotconfBuildLayoutToggle === 'function') {
+                       var hostLayoutToggle = window.app.dotconfBuildLayoutToggle();
+                       if (hostLayoutToggle) {
+                           hostLayoutToggle.style.marginLeft = '8px';
+                           bar.appendChild(hostLayoutToggle);
+                       }
+                   }
+                   // Call running (whether or not the host is in it): End for everyone.
+                   if (confLive) {
+                       bar.appendChild(mkBtn('📵 End call', '#e17055', '#fff0f0', function() {
+                           if (typeof window.app.dotconfEndCall === 'function') window.app.dotconfEndCall(window.app);
+                       }));
+                   }
 
-                                       if (window.app.dotconfShouldShowInviteButton(this)) {
-                                           var inviteBtn = document.createElement('button');
-                                           inviteBtn.textContent = '✉️ Invite';
-                                           inviteBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                                           inviteBtn.onmouseenter = function() {
-                                               inviteBtn.style.background  = '#eef6ff';
-                                               inviteBtn.style.borderColor = '#0984e3';
-                                               inviteBtn.style.color       = '#0984e3';
-                                           };
-                                           inviteBtn.onclick = function() {
-                                               if (typeof window.app.dotconfHandleInviteClick === 'function') {
-                                                   window.app.dotconfHandleInviteClick(window.app);
-                                               }
-                                           };
+                   if (window.app.dotconfShouldShowInviteButton(this)) {
+                       var inviteBtn = document.createElement('button');
+                       inviteBtn.textContent = '✉️ Invite';
+                       inviteBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                       inviteBtn.onmouseenter = function() {
+                           inviteBtn.style.background  = '#eef6ff';
+                           inviteBtn.style.borderColor = '#0984e3';
+                           inviteBtn.style.color       = '#0984e3';
+                       };
+                       inviteBtn.onclick = function() {
+                           if (typeof window.app.dotconfHandleInviteClick === 'function') {
+                               window.app.dotconfHandleInviteClick(window.app);
+                           }
+                       };
 
-                                           bar.appendChild(inviteBtn);
-                                       }
+                       bar.appendChild(inviteBtn);
+                   }
 
-                                   } else {
-                                       if (!window.app._dotconfCallLive) {
-                                           var joinBtn = document.createElement('button');
-                                           joinBtn.textContent = '📞 Join Call';
-                                           joinBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                                           joinBtn.onmouseenter = function() {
-                                               if (joinBtn.disabled) return;
-                                               joinBtn.style.background  = '#f0fff4';
-                                               joinBtn.style.borderColor = '#00b894';
-                                               joinBtn.style.color       = '#00b894';
-                                           };
-                                           joinBtn.onmouseleave = function() {
-                                               joinBtn.style.background  = 'none';
-                                               joinBtn.style.borderColor = '#b2bec3';
-                                               joinBtn.style.color       = '#636e72';
-                                           };
-                                           joinBtn.onclick = function() {
-                                               if (typeof window.app.dotconfJoin === 'function') {
-                                                   window.app.dotconfJoin(window.app);
-                                               }
-                                           };
-                                           joinBtn.setAttribute('data-dotconf-join', '');
-                                           if (window.app._dotconfJoining) {
-                                               joinBtn.disabled = true;
-                                               joinBtn.style.opacity = '0.5';
-                                               joinBtn.style.cursor = 'default';
-                                           }
-                                           bar.appendChild(joinBtn);
-                                       }
+               } else {
+                   if (!window.app._dotconfCallLive) {
+                       var joinBtn = document.createElement('button');
+                       joinBtn.textContent = '📞 Join Call';
+                       joinBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                       joinBtn.onmouseenter = function() {
+                           if (joinBtn.disabled) return;
+                           joinBtn.style.background  = '#f0fff4';
+                           joinBtn.style.borderColor = '#00b894';
+                           joinBtn.style.color       = '#00b894';
+                       };
+                       joinBtn.onmouseleave = function() {
+                           joinBtn.style.background  = 'none';
+                           joinBtn.style.borderColor = '#b2bec3';
+                           joinBtn.style.color       = '#636e72';
+                       };
+                       joinBtn.onclick = function() {
+                           if (typeof window.app.dotconfJoin === 'function') {
+                               window.app.dotconfJoin(window.app);
+                           }
+                       };
+                       joinBtn.setAttribute('data-dotconf-join', '');
+                       if (window.app._dotconfJoining) {
+                           joinBtn.disabled = true;
+                           joinBtn.style.opacity = '0.5';
+                           joinBtn.style.cursor = 'default';
+                       }
+                       bar.appendChild(joinBtn);
+                   }
 
-                                       if (window.app._dotconfCallLive) {
-                                           var leaveBtn = document.createElement('button');
-                                           leaveBtn.textContent = '📵 Leave Call';
-                                           leaveBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
-                                           leaveBtn.onmouseenter = function() {
-                                               leaveBtn.style.background  = '#fff0f0';
-                                               leaveBtn.style.borderColor = '#e17055';
-                                               leaveBtn.style.color       = '#e17055';
-                                           };
-                                           leaveBtn.onmouseleave = function() {
-                                               leaveBtn.style.background  = 'none';
-                                               leaveBtn.style.borderColor = '#b2bec3';
-                                               leaveBtn.style.color       = '#636e72';
-                                           };
-                                           leaveBtn.onclick = function() {
-                                               if (typeof window.app.dotconfLeave === 'function') {
-                                                   window.app.dotconfLeave(window.app);
-                                               }
-                                           };
-                                           bar.appendChild(leaveBtn);
-                                       }
-                                   }
+                   if (window.app._dotconfCallLive) {
+                       var leaveBtn = document.createElement('button');
+                       leaveBtn.textContent = '📵 Leave Call';
+                       leaveBtn.style.cssText = 'background:none;border:1px solid #b2bec3;border-radius:12px;padding:3px 10px;font-size:12px;color:#636e72;cursor:pointer;font-weight:600;margin-left:8px;';
+                       leaveBtn.onmouseenter = function() {
+                           leaveBtn.style.background  = '#fff0f0';
+                           leaveBtn.style.borderColor = '#e17055';
+                           leaveBtn.style.color       = '#e17055';
+                       };
+                       leaveBtn.onmouseleave = function() {
+                           leaveBtn.style.background  = 'none';
+                           leaveBtn.style.borderColor = '#b2bec3';
+                           leaveBtn.style.color       = '#636e72';
+                       };
+                       leaveBtn.onclick = function() {
+                           if (typeof window.app.dotconfLeave === 'function') {
+                               window.app.dotconfLeave(window.app);
+                           }
+                       };
+                       bar.appendChild(leaveBtn);
+                   }
+               }                                                               
             }
+        
 
 			const canvas = document.getElementById('canvas-area');
 			canvas.insertBefore(bar, canvas.firstChild);
